@@ -433,9 +433,16 @@ tabs_hit_test :: proc(app: ^App, win: ^plat.Window, t: ^plat.Text) -> bool {
 		win.mouse_down = false
 		return true
 	}
-	if mx < MENU_W { // menu -> command palette
-		palette_open(app)
-		palette_input_rune(app, '>')
+	if mx < MENU_W {
+		if MENU_BAR_SHOWN {
+			palette_open(app)
+			palette_input_rune(app, '>')
+		} else {
+			// The hamburger opens the SAME menus, not a copy of them: menu_open_at
+			// is the one entry point, and the dropdown draws over the document
+			// without the bar coming back (menu_draw handles that case).
+			if menu_is_active(app) {menu_close(app)} else {menu_open_at(app, 0)}
+		}
 	} else {
 		hit_slot := -1
 		hit_close := false
@@ -721,7 +728,14 @@ tabs_draw :: proc(gfx: ^plat.Gfx, quad_pipe: ^plat.Quad_Pipeline, text: ^plat.Te
 	// reads as "search your files", which is the wrong promise -- this opens the
 	// COMMAND palette. Showing the same prompt the palette itself shows makes the
 	// button and the thing it opens look like each other.
-	plat.text_draw(gfx, text, ">_", MENU_W / 2 - sx(9), base_y, UI_PX, g_theme[.Text_Secondary])
+	//
+	// It becomes a hamburger while the menu bar is hidden (UI spec 11: "☰ opens
+	// the same menus"). ONE slot, not two: Wyatt's call, on the grounds that a
+	// second permanent button spends tab width to duplicate a route Ctrl+P still
+	// has. The glyph names whichever route is currently NOT otherwise reachable.
+	glyph := ">_" if MENU_BAR_SHOWN else "☰"
+	gw := plat.text_char_width(text, UI_PX) * f32(1 if !MENU_BAR_SHOWN else 2)
+	plat.text_draw(gfx, text, glyph, MENU_W / 2 - gw * 0.5, base_y, UI_PX, g_theme[.Text_Secondary])
 
 	// tabs
 	// Nothing past `limit` may be drawn: the caption buttons are non-client and

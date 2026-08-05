@@ -99,11 +99,29 @@ RADIUS_TAB := RADIUS_TAB_96
 RADIUS_PANEL := RADIUS_PANEL_96
 RADIUS_CARD := RADIUS_CARD_96
 
+// Does the menu bar occupy a row right now? Settings can hide it (UI spec 11's
+// `Show menu bar`), and Alt reveals it temporarily.
+//
+// A FLAG, and chrome_apply below is the only thing that turns it into a
+// coordinate. `CHROME_TOP = TAB_STRIP_H + MENU_BAR_H` used to be written out at
+// seven sites — metrics_recompute plus six test modes — which is exactly the
+// shape every seam bug in HANDOFF §6j has: a formula with more than one author.
+// Adding a term to it in one place and not the other six would have left the
+// headless modes laying the window out as though the bar were always there.
+MENU_BAR_SHOWN := true
+
 // Bottom edge of the chrome: below the tab strip AND the menu bar. Anything
 // positioned against the top of the content area (the scrollbar, its drag
 // mapping) must use this, not TAB_STRIP_H — using the strip alone let the
 // scrollbar gutter extend up into the menu row and swallow clicks meant for it.
 CHROME_TOP := TAB_STRIP_H_96 + MENU_BAR_H_96
+
+// THE ONE PRODUCER of both. Call it after anything that changes the DPI metrics
+// or the bar's visibility; everything below the chrome reads the globals.
+chrome_apply :: proc() {
+	CHROME_TOP = TAB_STRIP_H + (MENU_BAR_H if MENU_BAR_SHOWN else 0)
+	CONTENT_TOP = CHROME_TOP + TEXT_MARGIN_Y
+}
 
 // Content-area top edge. Derived, so it is recomputed with the rest; the
 // initialiser here must stay in step with metrics_recompute, since the headless

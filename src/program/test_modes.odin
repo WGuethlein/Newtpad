@@ -12602,8 +12602,7 @@ when NEWTPAD_TESTS {
 			g_theme, UI_SCALE = theme_dark(), 1
 			defer {g_theme, UI_SCALE = saved_theme, saved_scale}
 			TEXT_MARGIN_Y, TAB_STRIP_H, MENU_BAR_H = TEXT_MARGIN_Y_96, TAB_STRIP_H_96, MENU_BAR_H_96
-			CHROME_TOP = TAB_STRIP_H + MENU_BAR_H
-			CONTENT_TOP = CHROME_TOP + TEXT_MARGIN_Y
+			chrome_apply()
 			STATUS_BAR_H, SCROLLBAR_W = STATUS_BAR_H_96, SCROLLBAR_W_96
 			px_ := f32(24)
 
@@ -16936,8 +16935,7 @@ when NEWTPAD_TESTS {
 					TEXT_MARGIN_Y = sx(TEXT_MARGIN_Y_96)
 					TAB_STRIP_H = sx(TAB_STRIP_H_96)
 					MENU_BAR_H = sx(MENU_BAR_H_96)
-					CHROME_TOP = TAB_STRIP_H + MENU_BAR_H
-					CONTENT_TOP = CHROME_TOP + TEXT_MARGIN_Y
+					chrome_apply()
 					STATUS_BAR_H = sx(STATUS_BAR_H_96)
 					SCROLLBAR_W = sx(SCROLLBAR_W_96)
 					TABLE_HEADER_H = sx(TABLE_HEADER_H_96)
@@ -17099,8 +17097,7 @@ when NEWTPAD_TESTS {
 				// --- the rest is scale-independent; pin 100% ----------------
 				UI_SCALE = 1
 				TEXT_MARGIN_Y, TAB_STRIP_H, MENU_BAR_H = TEXT_MARGIN_Y_96, TAB_STRIP_H_96, MENU_BAR_H_96
-				CHROME_TOP = TAB_STRIP_H + MENU_BAR_H
-				CONTENT_TOP = CHROME_TOP + TEXT_MARGIN_Y
+				chrome_apply()
 				STATUS_BAR_H, SCROLLBAR_W = STATUS_BAR_H_96, SCROLLBAR_W_96
 				TABLE_HEADER_H, TABLE_ROW_H, TABLE_CELL_PAD_X = TABLE_HEADER_H_96, TABLE_ROW_H_96, TABLE_CELL_PAD_X_96
 				TABLE_GUTTER_W = TABLE_GUTTER_W_96
@@ -17370,8 +17367,7 @@ when NEWTPAD_TESTS {
 				}
 				UI_SCALE = 1
 				TEXT_MARGIN_Y, TAB_STRIP_H, MENU_BAR_H = TEXT_MARGIN_Y_96, TAB_STRIP_H_96, MENU_BAR_H_96
-				CHROME_TOP = TAB_STRIP_H + MENU_BAR_H
-				CONTENT_TOP = CHROME_TOP + TEXT_MARGIN_Y
+				chrome_apply()
 				STATUS_BAR_H, SCROLLBAR_W = STATUS_BAR_H_96, SCROLLBAR_W_96
 				TABLE_HEADER_H, TABLE_ROW_H, TABLE_CELL_PAD_X = TABLE_HEADER_H_96, TABLE_ROW_H_96, TABLE_CELL_PAD_X_96
 				TABLE_GUTTER_W = TABLE_GUTTER_W_96
@@ -17473,8 +17469,7 @@ when NEWTPAD_TESTS {
 				}
 				UI_SCALE = 1
 				TEXT_MARGIN_Y, TAB_STRIP_H, MENU_BAR_H = TEXT_MARGIN_Y_96, TAB_STRIP_H_96, MENU_BAR_H_96
-				CHROME_TOP = TAB_STRIP_H + MENU_BAR_H
-				CONTENT_TOP = CHROME_TOP + TEXT_MARGIN_Y
+				chrome_apply()
 				STATUS_BAR_H, SCROLLBAR_W = STATUS_BAR_H_96, SCROLLBAR_W_96
 				TABLE_HEADER_H, TABLE_ROW_H, TABLE_CELL_PAD_X = TABLE_HEADER_H_96, TABLE_ROW_H_96, TABLE_CELL_PAD_X_96
 				TABLE_GUTTER_W = TABLE_GUTTER_W_96
@@ -17657,8 +17652,7 @@ when NEWTPAD_TESTS {
 				}
 				UI_SCALE = 1
 				TEXT_MARGIN_Y, TAB_STRIP_H, MENU_BAR_H = TEXT_MARGIN_Y_96, TAB_STRIP_H_96, MENU_BAR_H_96
-				CHROME_TOP = TAB_STRIP_H + MENU_BAR_H
-				CONTENT_TOP = CHROME_TOP + TEXT_MARGIN_Y
+				chrome_apply()
 				STATUS_BAR_H, SCROLLBAR_W = STATUS_BAR_H_96, SCROLLBAR_W_96
 				TABLE_HEADER_H, TABLE_ROW_H, TABLE_CELL_PAD_X = TABLE_HEADER_H_96, TABLE_ROW_H_96, TABLE_CELL_PAD_X_96
 				TABLE_GUTTER_W = TABLE_GUTTER_W_96
@@ -17822,8 +17816,7 @@ when NEWTPAD_TESTS {
 				defer {g_theme, UI_SCALE = saved_theme, saved_scale}
 				UI_SCALE = 1
 				TEXT_MARGIN_Y, TAB_STRIP_H, MENU_BAR_H = TEXT_MARGIN_Y_96, TAB_STRIP_H_96, MENU_BAR_H_96
-				CHROME_TOP = TAB_STRIP_H + MENU_BAR_H
-				CONTENT_TOP = CHROME_TOP + TEXT_MARGIN_Y
+				chrome_apply()
 				STATUS_BAR_H, SCROLLBAR_W = STATUS_BAR_H_96, SCROLLBAR_W_96
 				TABLE_HEADER_H, TABLE_ROW_H, TABLE_CELL_PAD_X = TABLE_HEADER_H_96, TABLE_ROW_H_96, TABLE_CELL_PAD_X_96
 				TABLE_GUTTER_W = TABLE_GUTTER_W_96
@@ -18003,8 +17996,7 @@ when NEWTPAD_TESTS {
 				defer {g_theme, UI_SCALE = saved_theme, saved_scale}
 				UI_SCALE = 1
 				TEXT_MARGIN_Y, TAB_STRIP_H, MENU_BAR_H = TEXT_MARGIN_Y_96, TAB_STRIP_H_96, MENU_BAR_H_96
-				CHROME_TOP = TAB_STRIP_H + MENU_BAR_H
-				CONTENT_TOP = CHROME_TOP + TEXT_MARGIN_Y
+				chrome_apply()
 				STATUS_BAR_H, SCROLLBAR_W = STATUS_BAR_H_96, SCROLLBAR_W_96
 				TABLE_HEADER_H, TABLE_ROW_H, TABLE_CELL_PAD_X = TABLE_HEADER_H_96, TABLE_ROW_H_96, TABLE_CELL_PAD_X_96
 				TABLE_GUTTER_W = TABLE_GUTTER_W_96
@@ -18309,8 +18301,7 @@ when NEWTPAD_TESTS {
 				defer {g_theme, UI_SCALE = saved_theme, saved_scale}
 				UI_SCALE = 1
 				TEXT_MARGIN_Y, TAB_STRIP_H, MENU_BAR_H = TEXT_MARGIN_Y_96, TAB_STRIP_H_96, MENU_BAR_H_96
-				CHROME_TOP = TAB_STRIP_H + MENU_BAR_H
-				CONTENT_TOP = CHROME_TOP + TEXT_MARGIN_Y
+				chrome_apply()
 				STATUS_BAR_H, SCROLLBAR_W = STATUS_BAR_H_96, SCROLLBAR_W_96
 				TABLE_HEADER_H, TABLE_ROW_H, TABLE_CELL_PAD_X = TABLE_HEADER_H_96, TABLE_ROW_H_96, TABLE_CELL_PAD_X_96
 				TABLE_GUTTER_W = TABLE_GUTTER_W_96
@@ -18594,8 +18585,7 @@ when NEWTPAD_TESTS {
 				}
 				UI_SCALE = 1
 				TEXT_MARGIN_Y, TAB_STRIP_H, MENU_BAR_H = TEXT_MARGIN_Y_96, TAB_STRIP_H_96, MENU_BAR_H_96
-				CHROME_TOP = TAB_STRIP_H + MENU_BAR_H
-				CONTENT_TOP = CHROME_TOP + TEXT_MARGIN_Y
+				chrome_apply()
 				STATUS_BAR_H, SCROLLBAR_W = STATUS_BAR_H_96, SCROLLBAR_W_96
 				TABLE_HEADER_H, TABLE_ROW_H, TABLE_CELL_PAD_X = TABLE_HEADER_H_96, TABLE_ROW_H_96, TABLE_CELL_PAD_X_96
 				TABLE_GUTTER_W = TABLE_GUTTER_W_96
@@ -18799,8 +18789,7 @@ when NEWTPAD_TESTS {
 				defer {g_theme, UI_SCALE = saved_theme, saved_scale}
 				UI_SCALE = 1
 				TEXT_MARGIN_Y, TAB_STRIP_H, MENU_BAR_H = TEXT_MARGIN_Y_96, TAB_STRIP_H_96, MENU_BAR_H_96
-				CHROME_TOP = TAB_STRIP_H + MENU_BAR_H
-				CONTENT_TOP = CHROME_TOP + TEXT_MARGIN_Y
+				chrome_apply()
 				STATUS_BAR_H, SCROLLBAR_W = STATUS_BAR_H_96, SCROLLBAR_W_96
 				TABLE_HEADER_H, TABLE_ROW_H, TABLE_CELL_PAD_X = TABLE_HEADER_H_96, TABLE_ROW_H_96, TABLE_CELL_PAD_X_96
 				TABLE_GUTTER_W = TABLE_GUTTER_W_96
@@ -19430,8 +19419,7 @@ when NEWTPAD_TESTS {
 				}
 				UI_SCALE = 1
 				TEXT_MARGIN_Y, TAB_STRIP_H, MENU_BAR_H = TEXT_MARGIN_Y_96, TAB_STRIP_H_96, MENU_BAR_H_96
-				CHROME_TOP = TAB_STRIP_H + MENU_BAR_H
-				CONTENT_TOP = CHROME_TOP + TEXT_MARGIN_Y
+				chrome_apply()
 				STATUS_BAR_H, SCROLLBAR_W = STATUS_BAR_H_96, SCROLLBAR_W_96
 				TABLE_HEADER_H, TABLE_ROW_H, TABLE_CELL_PAD_X = TABLE_HEADER_H_96, TABLE_ROW_H_96, TABLE_CELL_PAD_X_96
 				TABLE_GUTTER_W = TABLE_GUTTER_W_96
@@ -19600,8 +19588,7 @@ when NEWTPAD_TESTS {
 				for sc in ([]f32{1.0, 1.25, 1.5}) {
 					UI_SCALE = sc
 					TEXT_MARGIN_Y, TAB_STRIP_H, MENU_BAR_H = sx(TEXT_MARGIN_Y_96), sx(TAB_STRIP_H_96), sx(MENU_BAR_H_96)
-					CHROME_TOP = TAB_STRIP_H + MENU_BAR_H
-					CONTENT_TOP = CHROME_TOP + TEXT_MARGIN_Y
+					chrome_apply()
 					STATUS_BAR_H, SCROLLBAR_W = sx(STATUS_BAR_H_96), sx(SCROLLBAR_W_96)
 					TABLE_HEADER_H, TABLE_ROW_H = sx(TABLE_HEADER_H_96), sx(TABLE_ROW_H_96)
 					TABLE_CELL_PAD_X, TABLE_GUTTER_W = sx(TABLE_CELL_PAD_X_96), sx(TABLE_GUTTER_W_96)
@@ -19925,8 +19912,7 @@ when NEWTPAD_TESTS {
 					TEXT_MARGIN_Y = sx(TEXT_MARGIN_Y_96)
 					TAB_STRIP_H = sx(TAB_STRIP_H_96)
 					MENU_BAR_H = sx(MENU_BAR_H_96)
-					CHROME_TOP = TAB_STRIP_H + MENU_BAR_H
-					CONTENT_TOP = CHROME_TOP + TEXT_MARGIN_Y
+					chrome_apply()
 					STATUS_BAR_H = sx(STATUS_BAR_H_96)
 					SCROLLBAR_W = sx(SCROLLBAR_W_96)
 					TABLE_HEADER_H = sx(TABLE_HEADER_H_96)
@@ -20128,8 +20114,7 @@ when NEWTPAD_TESTS {
 				defer {g_theme, UI_SCALE = saved_theme, saved_scale}
 				UI_SCALE = 1
 				TEXT_MARGIN_Y, TAB_STRIP_H, MENU_BAR_H = TEXT_MARGIN_Y_96, TAB_STRIP_H_96, MENU_BAR_H_96
-				CHROME_TOP = TAB_STRIP_H + MENU_BAR_H
-				CONTENT_TOP = CHROME_TOP + TEXT_MARGIN_Y
+				chrome_apply()
 				STATUS_BAR_H, SCROLLBAR_W = STATUS_BAR_H_96, SCROLLBAR_W_96
 				TABLE_HEADER_H, TABLE_ROW_H, TABLE_CELL_PAD_X = TABLE_HEADER_H_96, TABLE_ROW_H_96, TABLE_CELL_PAD_X_96
 				TABLE_GUTTER_W = TABLE_GUTTER_W_96
@@ -30784,6 +30769,59 @@ when NEWTPAD_TESTS {
 					// And a chip is never the first thing to go.
 					chip_first := len(gone) > 0 && (gone[0] == .Find_Toggle_Case || gone[0] == .Find_Toggle_Word || gone[0] == .Find_Toggle_Regex)
 					mt_chk(&bad, !chip_first, "a chip is never dropped before a button")
+				}
+
+				// 1b. Show Menu Bar: the 30px the whole window hangs off.
+				//
+				// This is the one change in the batch that can move EVERY y in the
+				// program at once, so what is pinned here is not "the flag works"
+				// but that exactly one formula produces the coordinate and that
+				// nothing keeps claiming the row after it is gone. A bar that
+				// vanished from the draw while menu_hit_test still owned its 30px
+				// would swallow the first row of clicks in the document -- HANDOFF
+				// §6j with the window as its subject.
+				{
+					fmt.println("--- show menu bar ---")
+					was := MENU_BAR_SHOWN
+					defer {MENU_BAR_SHOWN = was;chrome_apply()}
+
+					MENU_BAR_SHOWN = true
+					chrome_apply()
+					shown_top := CHROME_TOP
+					shown_content := CONTENT_TOP
+					MENU_BAR_SHOWN = false
+					chrome_apply()
+					mt_chk(&bad, CHROME_TOP == TAB_STRIP_H, fmt.tprintf("hidden: chrome top is the rail alone (%.0f == %.0f)", CHROME_TOP, TAB_STRIP_H))
+					mt_chk(&bad, shown_top - CHROME_TOP == MENU_BAR_H, fmt.tprintf("hiding it reclaims exactly the bar's height (%.0f)", shown_top - CHROME_TOP))
+					mt_chk(&bad, shown_content - CONTENT_TOP == MENU_BAR_H, "and the content top moves with it, not independently")
+					mt_chk(&bad, CONTENT_TOP == CHROME_TOP + TEXT_MARGIN_Y, "content top stays derived from chrome top")
+
+					// Nothing may still own the bar's row once it is gone. The
+					// window is wide so the Commands item exists when shown, which
+					// is the other thing that must stop answering.
+					W2 := f32(1280)
+					mid := TAB_STRIP_H + MENU_BAR_H * 0.5
+					mt2: plat.Text
+					plat.text_load_faces(&mt2)
+					a2: App
+					menu_init(&a2.menu)
+					app_new_scratch(&a2)
+					defer app_destroy(&a2)
+					w2: plat.Window
+					w2.mouse_pressed = true
+					w2.mouse_x, w2.mouse_y = i32(sx(20)), i32(mid)
+
+					MENU_BAR_SHOWN = true
+					chrome_apply()
+					_, consumed_shown := menu_hit_test(&a2, &mt2, &w2, W2, 900)
+					menu_close(&a2)
+					w2.mouse_pressed = true
+					MENU_BAR_SHOWN = false
+					chrome_apply()
+					_, consumed_hidden := menu_hit_test(&a2, &mt2, &w2, W2, 900)
+					mt_chk(&bad, consumed_shown, "shown: a click on a title is consumed by the bar")
+					mt_chk(&bad, !consumed_hidden, "hidden: the same click is NOT consumed -- the document owns that row now")
+					mt_chk(&bad, menu_bar_command_at(&mt2, W2, W2 - sx(60)) == .Palette_Open, "the Commands item is still produced (the bar's own geometry is unconditional)")
 				}
 
 				// 2. Regex honours case and whole word. Both were ignored: the

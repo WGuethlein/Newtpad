@@ -62,6 +62,11 @@ Settings :: struct {
 	// needs an in-memory DirectWrite loader that does not exist yet, so that
 	// lands as one more row in that table later rather than holding this up.
 	ui_font_family:  string,
+	// UI spec 11's `Show menu bar`. Ships ON -- a locked decision ("menu bar
+	// ships visible": Wyatt lives in the menus, buyers may live in the palette,
+	// and both are first-class). When off, Alt reveals it temporarily and the
+	// tab rail's button becomes a hamburger onto the same menus.
+	show_menu_bar:   bool,
 	link_style:      Link_Style, // when/how clickable links are shown
 	split_frac:      f32, // Markdown Split divider position; a global preference (not per-file/per-tab)
 	// Remembered per-FAMILY view (not per-extension, not per-file — Wyatt's call:
@@ -191,6 +196,7 @@ font_choice_index :: proc(name: string) -> int {
 settings_default :: proc() -> Settings {
 	return Settings {
 		restore_session = true,
+		show_menu_bar = true,
 		wrap_default = false,
 		font_size = int(BASE_PX_96),
 		zoom_pct = ZOOM_DEFAULT,
@@ -279,6 +285,8 @@ settings_load :: proc() -> Settings {
 			}
 		case "font_family":
 			s.font_family = strings.clone(parts[1])
+		case "show_menu_bar":
+			s.show_menu_bar = parts[1] != "0"
 		case "ui_font_family":
 			s.ui_font_family = strings.clone(parts[1])
 		case "font_style":
@@ -351,8 +359,9 @@ settings_save :: proc(s: Settings) -> bool {
 	if s.split_frac == 0 {s.split_frac = SPLIT_DEFAULT}
 	s.split_frac = clamp(s.split_frac, SPLIT_MIN, SPLIT_MAX)
 	body := fmt.tprintf(
-		"newtpad-settings 1\nrestore_session %d\nwrap_default %d\nfont_size %d\nzoom_pct %d\ntab_width %d\nfont_family %s\nfont_style %d\nui_font_family %s\nlink_style %d\nsplit_frac %.4f\nmd_default %d\ntable_default %d\ntable_header_mode %d\nremember_views %d\ncaret_blink %d\ncurrent_line %d\ngutter %d\npreview_font %s\ntheme_name %s\n",
+		"newtpad-settings 1\nrestore_session %d\nshow_menu_bar %d\nwrap_default %d\nfont_size %d\nzoom_pct %d\ntab_width %d\nfont_family %s\nfont_style %d\nui_font_family %s\nlink_style %d\nsplit_frac %.4f\nmd_default %d\ntable_default %d\ntable_header_mode %d\nremember_views %d\ncaret_blink %d\ncurrent_line %d\ngutter %d\npreview_font %s\ntheme_name %s\n",
 		1 if s.restore_session else 0,
+		1 if s.show_menu_bar else 0,
 		1 if s.wrap_default else 0,
 		s.font_size,
 		s.zoom_pct,
@@ -407,6 +416,8 @@ SETTINGS_ROWS := []Setting_Row {
 	{"Blink the caret", "A steady caret is easier on some eyes; the blink is 500ms"},
 	{"Highlight the current line", "A 3% tint on the line the caret is on"},
 	{"Preview font", "The markdown preview's body face; Editor font makes it match the source"},
+	// Appended, per the rule above.
+	{"Show menu bar", "When off, Alt reveals it and the rail's button opens the same menus"},
 }
 
 settings_row_count :: proc() -> int {return len(SETTINGS_ROWS)}
@@ -609,6 +620,8 @@ settings_toggle_row :: proc(rc: ^Render_Ctx, row, dir: int) {
 		s.gutter = !s.gutter
 	case 11:
 		s.caret_blink = !s.caret_blink
+	case 14:
+		s.show_menu_bar = !s.show_menu_bar
 	case 12:
 		s.current_line = !s.current_line
 	case 13:
@@ -733,6 +746,8 @@ settings_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, t: ^plat.Text, ap
 			val = "On" if app.settings.current_line else "Off"
 		case 13:
 			val = app.settings.preview_font if app.settings.preview_font != "" else "Auto"
+		case 14:
+			val = "On" if app.settings.show_menu_bar else "Off"
 		}
 		vc := g_theme[.Success] if val != "Off" else g_theme[.Text_Muted]
 		// The selected row's value brightens, per UI spec 11 -- the row you are

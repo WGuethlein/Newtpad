@@ -565,8 +565,18 @@ main :: proc() {
 		// reaches here.
 		if window.alt_tapped {
 			window.alt_tapped = false
-			if menu_is_active(&app) {menu_close(&app)} else {app.menu.mode = true}
+			if menu_is_active(&app) {
+				menu_close(&app)
+			} else {
+				app.menu.mode = true
+				// UI spec 11: "When off, Alt reveals it." Only meaningful while the
+				// setting hides it -- with the bar already up this is just keyboard mode.
+				if !app.settings.show_menu_bar {app.menu.revealed = true}
+			}
 		}
+		// The tap above can have just revealed the bar, and every hit-test below
+		// this point reads CHROME_TOP. Apply before them, not after.
+		menu_bar_apply(&app)
 		// Alt+<char> mnemonics, matched on the layout-translated character.
 		// Explicit Alt bindings (Alt+Z) already consumed their press via the key
 		// path, so this only sees letters no binding claimed.
@@ -2093,6 +2103,9 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 	gfx, text, quad_pipe, window := rc.gfx, rc.text, rc.quads, rc.window
 	px, char_w, line_h := rc.px, rc.char_w, rc.line_h
 	doc := app_active(rc.app)
+	// Before ANY geometry below reads CHROME_TOP. A resize repaints through this
+	// path without going round the frame loop, so the loop's call is not enough.
+	menu_bar_apply(rc.app)
 	doc_update_top_inset(doc) // filter banner inset; must match the main loop's value
 	// The same split the frame loop makes (see its comment): `rows` is what
 	// fits wholly and feeds the scroll/scrollbar geometry, `drawn` adds the
@@ -2848,8 +2861,7 @@ metrics_recompute :: proc(rc: ^Render_Ctx) {
 	MENU_BAR_H = dp(rc, MENU_BAR_H_96)
 	MENU_ITEM_H = dp(rc, MENU_ITEM_H_96)
 	MENU_PAD = dp(rc, MENU_PAD_96)
-	CHROME_TOP = TAB_STRIP_H + MENU_BAR_H
-	CONTENT_TOP = CHROME_TOP + TEXT_MARGIN_Y
+	chrome_apply()
 	TAB_W = dp(rc, TAB_W_96)
 	TAB_H = dp(rc, TAB_H_96)
 	TAB_MIN_W = dp(rc, TAB_MIN_W_96)

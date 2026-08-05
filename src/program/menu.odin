@@ -739,6 +739,15 @@ tab_menu_items := []Menu_Item {
 // (what a bare Alt tap gives you); `open` is the index of the open dropdown.
 Menu_State :: struct {
 	mode: bool,
+	// The menu bar is hidden by settings but showing right now because Alt was
+	// tapped. TRANSIENT and never persisted -- it is cleared by menu_close, so
+	// Esc, a picked command and a click away all put the bar back automatically
+	// rather than each having to remember to.
+	//
+	// Windows' own convention (Explorer, Office, Firefox): Alt reveals, the bar
+	// goes again when you are done with it. Wyatt chose it over a latch on the
+	// grounds that a latch makes Alt a second Settings toggle.
+	revealed: bool,
 	open: int, // -1 = no dropdown
 	// THE KEYBOARD CURSOR within the open dropdown, and what Enter runs. -1 when
 	// there is none, which is the normal state of a MOUSE-opened menu -- only the
@@ -871,7 +880,23 @@ menu_init :: proc(m: ^Menu_State) {
 // reach them either: command_from_name (keymap.odin) refuses any name for which
 // command_needs_menu_target (commands.odin) holds. That is true by construction,
 // not by the accident of nothing having bound one yet.
+// Does the menu bar occupy a row this frame, and what that makes CHROME_TOP.
+//
+// Applied ONCE per frame and BEFORE anything reads CHROME_TOP. The input pass
+// and the draw run at different points in the frame and must agree about the
+// same 30px: if the bar appeared for the draw but not for the hit-test, every
+// click in the document would land one row off -- HANDOFF §6j's bug class with
+// the whole window as its subject rather than one widget.
+menu_bar_apply :: proc(app: ^App) {
+	MENU_BAR_SHOWN = app.settings.show_menu_bar || app.menu.revealed
+	chrome_apply()
+}
+
 menu_close :: proc(app: ^App) {
+	// The Alt reveal ends with the interaction it was for. Every dismissal path
+	// -- Esc, a picked command, a click away -- already funnels through here, so
+	// none of them has to remember the bar separately.
+	app.menu.revealed = false
 	app.menu.mode = false
 	app.menu.open = -1
 	app.menu.item = -1
@@ -962,7 +987,7 @@ menu_hit_test :: proc(app: ^App, t: ^plat.Text, win: ^plat.Window, w, h: f32) ->
 	if !win.mouse_pressed {return .None, false}
 	mx, my := f32(win.mouse_x), f32(win.mouse_y)
 
-	if my >= TAB_STRIP_H && my < TAB_STRIP_H + MENU_BAR_H {
+	if MENU_BAR_SHOWN && my >= TAB_STRIP_H && my < TAB_STRIP_H + MENU_BAR_H {
 		if cmd := menu_bar_command_at(t, w, mx); cmd != .None {
 			menu_close(app)
 			consume_click(win)
@@ -1348,6 +1373,13 @@ menu_origin :: proc(t: ^plat.Text, app: ^App) -> (x0, y0: f32) {
 // --- drawing ---
 
 menu_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, t: ^plat.Text, app: ^App, win: ^plat.Window, width, height: f32) {
+	// Hidden: no bar, no titles, no Commands item. A DROPDOWN can still be open
+	// over the document -- the rail's hamburger opens one without the bar coming
+	// back -- so that draw is below this return, not inside the branch.
+	if !MENU_BAR_SHOWN {
+		if menu_dropdown_active(app) {menu_draw_dropdown(gfx, qp, t, app, width, height)}
+		return
+	}
 	cw := plat.text_char_width(t, UI_PX)
 	base_y := TAB_STRIP_H + MENU_BAR_H - sx(8)
 	plat.quads_draw(gfx, qp, []plat.Quad{{pos = {0, TAB_STRIP_H}, size = {width, MENU_BAR_H}, color = g_theme[.Bg_Panel]}})
