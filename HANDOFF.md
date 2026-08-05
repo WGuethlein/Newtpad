@@ -8307,6 +8307,70 @@ the test green. Verified live instead (Alt on the Settings page reveals; one Dow
 Extracting that context choice into a proc is what would make it testable, and is the smallest real
 improvement available to the next session on this surface.
 
+## 6cu. The palette's open HIGH, and a bug the fix's own screenshot revealed (2026-08-05, v0.81.0, branch `fix/palette-scroll-and-runes`)
+
+Started as a re-count of the register and turned into two fixes, which is the useful part: **both were
+found by checking, and neither was a spec gap.**
+
+### The audit's HIGH, closed
+
+`palette_move` clamped `selected` to `len(results)-1` while the draw emitted at most `PALETTE_MAX_ROWS`
+rows *starting at result 0*. With 74 commands the twelfth Down put the highlight on a row nobody could
+see — **and Enter still ran it.** Running an unseen command is the defect; the vanished highlight was
+the symptom.
+
+The list scrolls now. Resolution happens in the **input phase** (`palette_move`, `palette_recompute`),
+not in the layout — writing it back from a proc the draw calls would be scroll resolution inside the
+draw, which CLAUDE.md forbids outright and which `menu_scroll_to_item` is already carrying a note owed
+against. The hit-test adds the offset too: without that, a click on the first visible row picked result
+0 whatever was scrolled to, the same divergence in the other direction.
+
+`palettetest` walks Down through every result and back up, asserting the selection stays inside the
+window **the layout reports** rather than checking the pure resolver — which could be perfect while the
+draw ignored it.
+
+### "Save As???"
+
+The screenshot verifying the scroll fix showed six command titles rendering their ellipsis as three
+replacement boxes. `palette_draw_match` walked `0 ..< len(label)` and drew `label[i:i+1]` — **one
+byte** — so a multi-byte rune became that many invalid one-byte draws.
+
+Invisible while every command title was ASCII. It appeared the moment six of them took a real ellipsis
+in **v0.74.0**, in the palette only, because the menus draw a label in one call. Seven releases with the
+bug in it. It walks runes now and advances by **cells**, so a full-width name cannot overlap itself
+either.
+
+**The lesson is about where the two bugs came from.** Neither is a mockup divergence; neither would have
+been found by comparing a surface against §7. One came from re-reading code I had already filed as
+"open", the other from *looking at the screenshot I took to prove something else*. A visual register is
+not a bug list.
+
+### Two of my own mistakes, kept
+
+The first scroll test called `palette_row_at` with `(width, height)` where `(mx, my)` belong and
+"failed" on my own argument order. And its stray-step counter recorded the **last** stray while the
+message said "first" — under sabotage it reported step 77 when the selection had been off-screen since
+step 12. A message that misstates what it measured is the same defect as a test that measures nothing,
+and this session has now hit it three times.
+
+### The register, re-counted
+
+**~24 remaining**, from 59 originally: 12 shipped, 13 struck as already built, 5 struck by decision. The
+number has moved downward twice, both times because items were filed from *reading* rather than
+*checking*. Quote the current figure, not a remembered one.
+
+Also struck this pass: §18's gamma-correct blending (`quads.odin` does `srgb_to_linear` on an sRGB-typed
+target for both the quad and text paths), §10's malformed-row warning bar (`table_row_malformed` draws
+it), and §8's gutter, which derives its width from the line count rather than the spec's fixed 44 —
+better, not worse.
+
+### Owed
+
+- §9.4's bordered markdown-table card is the largest single visual item left.
+- `menu_bar_command` and the find bar's replace row still carry their own geometry rather than `ui`'s.
+- Extracting the frame loop's context selection into a proc, so the Alt-reveal wiring (§6ct) becomes
+  testable.
+
 ## 7. Build environment (Windows, this machine)
 
 - **`build.bat` is the one build script.** `build.bat` = debug, **console subsystem** so the

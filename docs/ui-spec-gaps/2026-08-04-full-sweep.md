@@ -323,31 +323,48 @@ No icon work exists. §16 names **16a "Caret on paper"** as recommended and give
 
 ## The total
 
-**Revised 2026-08-04 after the §9 / §10 / §11.1 corrections and the first work batch.** The first
-figure was 59; C4 struck 3 (Argon, embedding, the type scale) and the corrections struck 8 more that
-were already built. Six shipped in the polish batch. **Roughly 42 remain.** The number moved by a
-third in one session, in the direction of *less work than claimed*, which is worth knowing before
-quoting any of it as a plan.
+**Re-counted 2026-08-05, after v0.74.0–v0.81.0.** The figure has now moved twice, both times downward,
+and the reason is the same each time: **items were filed from reading rather than from checking.** Quote
+the current number, not a remembered one.
+
+### Shipped
+
+| Section | Item | Version |
+|---|---|---|
+| §4 | Gear removed, `│ Commands  Ctrl+P` in its place | v0.74.0 |
+| §6 | `Find: Regex`, `Ctrl+=`, six `…` | v0.74.0 |
+| §13 | All four right-group cells + the size in the left group | v0.74.0 |
+| §12 | Bordered input, count column, chips inline, `↑ ↓`, `Filter Ctrl+L`, `✕` | v0.75.0 |
+| — | **`src/ui` exists** — control geometry, 12 tests, no device | v0.75.0 |
+| §6/§11 | `Show Menu Bar`: setting, Alt reveal, `☰` in the rail | v0.76.0 |
+| §5 | The 360px collapse | v0.77.0 |
+| §9 | Ticked checkbox: filled box, knocked-out tick | v0.77.0 |
+| §11 | Header hint's fourth key | v0.77.0 |
+| §11 | **Group headers** (B14), and the id refactor that unblocked them | v0.78.0 |
+| §2 | Font enumeration — 22 families against 14 | v0.79.0 |
+| §7 | **Palette scrolling** — the audit's open HIGH | v0.81.0 |
+
+### Struck as already built (verified, not assumed)
+
+§9 ×4 · §10 ×4 (zebra, sorting, header band, **malformed-row warning bar**) · §11.1 ×3 ·
+§18 **gamma-correct blending** (`quads.odin` does `srgb_to_linear` on an sRGB target for both paths) ·
+§8 gutter (derives its width from the line count — better than the spec's fixed 44, not worse).
+
+### Struck by decision
+
+§2 Argon and font embedding (C4) · §2's 13-row type scale, which died with it · §6 `Open Themes Folder`
+(C5) · §6 regex chord (C6) · §1 `scrollbar_thumb` (C3).
 
 | | Count |
 |---|---|
-| Visual divergences in things that exist **[V]** | ~21 |
-| Absent features **[F]** | ~21 |
-| **Total remaining** | **~42** |
-| Struck as already built (verified at 1:1 or in the producer) | 8 |
-| Struck by decision C4 (Argon) | 3 |
-| Shipped 2026-08-04 (polish batch) | 6 |
-| Already-decided, leave alone **[D]** | 3 (C1, C2, and new C3) |
-| Verification tasks not run this pass (§3 DPI ×8, §14, gutter, settings row fill) | 11 |
-| Sections needing no work | 2 (§15, §19) |
+| Shipped since the sweep | **12** |
+| Struck as already built | **13** |
+| Struck by decision | **5** |
+| **Remaining** | **~24** |
 
-**59 items.** Weighted honestly, though, they are not 59 equal things:
-
-- **One item (§2 Argon) touches all 19 sections.** It is the difference the per-surface lists kept
-  describing and never named.
-- **Roughly 20 items are single-surface polish** — a colour, a label, an ellipsis, a chord.
-- **The rest cluster into six jobs**: status-bar cells, find-bar completion, Show Menu Bar, markdown
-  tables + code fills, table-view zebra + sorting, settings groups + NEW rows.
+**And two bugs the sweep never saw**, both found this session by checking rather than reading: the font
+scan's 431 MB temp arena, and the palette drawing labels a byte at a time. Neither was a spec gap;
+neither would have been found by comparing against a mockup. **A visual register is not a bug list.**
 
 ## What this changes about the queue
 
