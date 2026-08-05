@@ -18,6 +18,7 @@ import "core:thread"
 import "core:unicode/utf8"
 import base "src:base"
 import plat "src:platform"
+import ui "src:ui"
 
 MAX_MATCHES :: 100_000
 
@@ -222,46 +223,142 @@ find_close :: proc(doc: ^Document) {
 }
 
 find_toggle_field :: proc(doc: ^Document) {doc.find.field = 1 - doc.find.field}
-// The find bar's three mode chips, as rects. ONE geometry, consumed by the draw
-// and by the click -- CLAUDE.md's rule, and the reason this exists at all: the
-// chips were computed inside render_frame, so they were drawn to look like
-// buttons and there was nothing to hit-test them against. A control that looks
-// pressable and is not is worse than one that was never drawn.
-Find_Toggle :: struct {
-	label:  string,
-	x, w:   f32,
-	on:     bool,
-	cmd:    Command_Id,
+// --- the find bar's first row: ONE geometry for every control on it ----------
+//
+// UI spec 12's mockup reads
+// `Find │ [input] │ 3 / 349 │ Aa ab| .* │ sep │ ↑ ↓ │ Filter Ctrl+L │ ✕`.
+//
+// This used to be find_toggles, which owned only the three chips and pinned them
+// hard right. Everything else on the row was either absent or drawn inline in
+// render_frame. Widening it to the whole row is what lets the chips move inline
+// (Wyatt, 2026-08-04) without the draw and the click growing separate opinions
+// about where they went -- the failure this procedure's ancestor was written to
+// stop, one control at a time.
+//
+// The boxes come from `ui`, which knows nothing of Document, Command_Id or the
+// theme; this maps its int tags back onto commands and states. The DROP is
+// ui.pack's, with the priorities Wyatt chose: the Filter pill goes first, then
+// the steppers, then the close, and the chips and the count are the last things
+// standing. The rule behind those numbers is that everything dropped keeps a
+// keyboard route -- Ctrl+L still filters, Enter/Shift+Enter still step, Esc still
+// closes -- while the chips and the count are the only things on the bar that
+// REPORT state. A dropped button costs a click; a dropped count costs knowing.
+FIND_CTL_MAX :: 7 // 3 chips + 2 steppers + filter + close
+
+Find_Ctl :: struct {
+	using box: ui.Button,
+	cmd:       Command_Id,
+	on:        bool, // chips: the toggle is engaged, so it takes the accent fill
+	chip:      bool, // chips draw their label; steppers and close draw a glyph
 }
 
-find_toggles :: proc(doc: ^Document, winw: f32, out: []Find_Toggle) -> []Find_Toggle {
-	if doc == nil || !doc.find.active || len(out) < 3 {return out[:0]}
-	f := &doc.find
-	tw := sx(30)
-	gap := sx(4)
-	x := winw - sx(12) - 3 * (tw + gap)
-	set := [3]Find_Toggle {
-		{"Aa", 0, tw, f.case_sens, .Find_Toggle_Case},
-		{"ab|", 0, tw, f.whole_word, .Find_Toggle_Word},
-		{".*", 0, tw, f.regex, .Find_Toggle_Regex},
+// The advances and box metrics the row is built from.
+@(private = "file")
+find_ui_metrics :: proc(text: ^plat.Text) -> ui.Metrics {
+	return ui.Metrics {
+		h = sx(24),
+		pad = sx(8),
+		gap = sx(8),
+		label_cw = plat.text_char_width(text, UI_SMALL_PX),
+		chord_cw = plat.text_char_width(text, UI_SMALL_PX),
+		baseline = sx(24) - sx(7),
 	}
-	for t, i in set {
-		out[i] = t
-		out[i].x = x + f32(i) * (tw + gap)
-	}
-	return out[:3]
 }
 
-// The chip a click at (mx, my) landed on, or .None. The bar occupies its own
-// strip at the top (doc_top_bar_h), and only the FIRST row carries the chips --
-// the replace row below has no controls of its own.
-find_toggle_at :: proc(doc: ^Document, winw, mx, my: f32) -> Command_Id {
-	if doc == nil || !doc.find.active {return .None}
+// The bordered query field. Spec 12: bg_base, radius 6, 26 tall, padding 0 10,
+// with a 2px accent ring. It FLEXES -- the label column and the count are fixed,
+// the controls are pinned right, and the field takes what is left.
+find_input_box :: proc(doc: ^Document, text: ^plat.Text, winw: f32, row: int) -> (x, y, w, h: f32) {
 	row_h := sx(FIND_BAR_H_96)
-	if my < CHROME_TOP || my >= CHROME_TOP + row_h {return .None}
-	buf: [3]Find_Toggle
-	for t in find_toggles(doc, winw, buf[:]) {
-		if mx >= t.x && mx < t.x + t.w {return t.cmd}
+	h = sx(26)
+	y = CHROME_TOP + f32(row) * row_h + (row_h - h) * 0.5
+	x = sx(12) + FIND_LABEL_W + sx(14)
+	right := winw - sx(12)
+	if row == 0 {
+		// Row 0 shares its width with the count and the controls.
+		cbuf: [FIND_CTL_MAX]Find_Ctl
+		ctls := find_controls(doc, text, winw, &cbuf)
+		if len(ctls) > 0 {right = ctls[0].x - sx(14)}
+		right -= FIND_COUNT_W + sx(14)
+	}
+	w = max(sx(60), right - x)
+	return
+}
+
+FIND_LABEL_W_96 :: f32(46) // the fixed `Find` / `Replace` caption column
+FIND_COUNT_W_96 :: f32(62) // `3 / 349`, right-aligned in its own column
+FIND_LABEL_W := FIND_LABEL_W_96
+FIND_COUNT_W := FIND_COUNT_W_96
+
+// The count column's right edge, so the draw can right-align into it.
+find_count_right :: proc(doc: ^Document, text: ^plat.Text, winw: f32) -> f32 {
+	cbuf: [FIND_CTL_MAX]Find_Ctl
+	ctls := find_controls(doc, text, winw, &cbuf)
+	if len(ctls) > 0 {return ctls[0].x - sx(14)}
+	return winw - sx(12)
+}
+
+find_controls :: proc(doc: ^Document, text: ^plat.Text, winw: f32, out: ^[FIND_CTL_MAX]Find_Ctl) -> []Find_Ctl {
+	if doc == nil || !doc.find.active {return out[:0]}
+	f := &doc.find
+	m := find_ui_metrics(text)
+	sq := sx(24)
+	gap := sx(4)
+
+	// Declared left to right, exactly as they are drawn and read.
+	Spec :: struct {
+		label: string,
+		chord: string,
+		cmd:   Command_Id,
+		on:    bool,
+		chip:  bool,
+		drop:  int,
+		sq:    bool,
+	}
+	specs := [FIND_CTL_MAX]Spec {
+		{"Aa", "", .Find_Toggle_Case, f.case_sens, true, 1, false},
+		{"ab|", "", .Find_Toggle_Word, f.whole_word, true, 1, false},
+		{".*", "", .Find_Toggle_Regex, f.regex, true, 1, false},
+		{"↑", "", .Find_Step_Prev, false, false, 3, true},
+		{"↓", "", .Find_Step_Next, false, false, 3, true},
+		{"Filter", "Ctrl+L", .Find_Toggle_Filter, doc.filter, false, 4, false},
+		{"✕", "", .Find_Close, false, false, 2, true},
+	}
+
+	items: [FIND_CTL_MAX]ui.Item
+	for s, i in specs {
+		w := sq if s.sq else ui.button_width(s.label, s.chord, m)
+		items[i] = {w = w, drop = s.drop, tag = i}
+	}
+	// What is left of the row once the label column, the count and their gaps
+	// have taken theirs. The controls get the remainder, and ui.pack decides.
+	avail := winw - sx(12) - (sx(12) + FIND_LABEL_W + sx(14) + sx(60) + sx(14) + FIND_COUNT_W + sx(14))
+	keep: [FIND_CTL_MAX]bool
+	used := ui.pack(items[:], max(0, avail), gap, keep[:])
+
+	// Placed left to right from the group's left edge, so the cluster stays flush
+	// against the window's right edge whatever survived.
+	x := winw - sx(12) - used
+	y := CHROME_TOP + (sx(FIND_BAR_H_96) - m.h) * 0.5
+	n := 0
+	for s, i in specs {
+		if !keep[i] {continue}
+		b := ui.button_square(x, y, sq, s.label, m, i) if s.sq else ui.button_layout(x, y, s.label, s.chord, m, i)
+		out[n] = {box = b, cmd = s.cmd, on = s.on, chip = s.chip}
+		x += b.w + gap
+		n += 1
+	}
+	return out[:n]
+}
+
+// The control a click at (mx, my) landed on, or .None. The bar occupies its own
+// strip at the top (doc_top_bar_h), and only the FIRST row carries controls --
+// the replace row below has its own two buttons (find_actions).
+find_control_at :: proc(doc: ^Document, text: ^plat.Text, winw, mx, my: f32) -> Command_Id {
+	if doc == nil || !doc.find.active {return .None}
+	buf: [FIND_CTL_MAX]Find_Ctl
+	for c in find_controls(doc, text, winw, &buf) {
+		if ui.button_hit(c.box, mx, my) {return c.cmd}
 	}
 	return .None
 }
@@ -1917,18 +2014,21 @@ find_status_info :: proc(doc: ^Document) -> string {
 		// the reason replaces the count. Never a dialog, never silent." An
 		// invalid pattern and a pattern with no matches look identical otherwise,
 		// and they mean entirely different things.
-		return " (invalid pattern)"
+		return "invalid pattern"
 	case len(f.matches) > 0:
 		// "+" marks a partial result: we stopped at the match limit, so there
 		// may be more further down the file.
-		return fmt.tprintf(" (%d/%d%s)", f.current + 1, len(f.matches), "+" if f.truncated else "")
+		return fmt.tprintf("%d / %d%s", f.current + 1, len(f.matches), "+" if f.truncated else "")
 	case search_running(doc) && f.last_total > 0:
 		// Mid-restart after an edit: the matches are cleared but the search is
 		// still running, so the last published figure is the honest one. Saying
 		// "(no matches)" here made every replace flicker to zero.
-		return fmt.tprintf(" (%d/%d%s)", f.last_current + 1, f.last_total, "+" if f.truncated else "")
+		return fmt.tprintf("%d / %d%s", f.last_current + 1, f.last_total, "+" if f.truncated else "")
 	case search_running(doc):
 		return ""
 	}
-	return " (no matches)"
+	// UI spec 12 names this one exactly: "0 / 0 in danger". Zero is a COUNT,
+	// not a sentence -- it lines up under the running total in the same column
+	// instead of changing width and shoving the chips sideways as you type.
+	return "0 / 0"
 }
