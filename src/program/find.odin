@@ -381,13 +381,8 @@ find_control_at :: proc(doc: ^Document, text: ^plat.Text, winw, mx, my: f32) -> 
 // all consume what it returns. A draw that positioned its own text would be a
 // second producer, which is the shape HANDOFF 6j is a list of.
 Find_Action :: struct {
-	label:  string,
-	chord:  string, // from command_chord: the keymap is the only place that knows
-	x, y:   f32, // box origin
-	w, h:   f32,
-	tx, ty: f32, // label origin (ty is the baseline)
-	cx:     f32, // chord origin, same baseline
-	cmd:    Command_Id,
+	using box: ui.Button, // label, chord, box, label origin, chord origin
+	cmd:       Command_Id,
 }
 
 FIND_ACTION_PAD_96 :: f32(9) // inside a button, either side of its text
@@ -414,38 +409,48 @@ find_actions :: proc(doc: ^Document, t: ^plat.Text, winw: f32, out: []Find_Actio
 	// included: doc_read_only_view deliberately excludes it because Split's
 	// left half is the real editor.
 	if doc_read_only_view(doc) {return out[:0]}
+
+	// BUILT ON ui.Button. This used to compute the box, the label origin and the
+	// chord origin itself -- the same arithmetic ui.button_layout does, written a
+	// second time. `snap` keeps what the hand-rolled version was careful about:
+	// whole-pixel coordinates, so the glyphs land on texel centres in the alpha
+	// atlas instead of sampling between them.
+	//
+	// gap = 2 cells, which is what the old `len(label) + 2` chord offset meant.
 	cw := plat.text_char_width(t, UI_SMALL_PX)
 	row_h := sx(FIND_BAR_H_96)
-	pad := sx(FIND_ACTION_PAD_96)
-	gap := sx(FIND_ACTION_GAP_96)
-	set := [2]Find_Action {
-		{label = "Replace", cmd = .Find_Replace_One},
-		{label = "Replace All", cmd = .Find_Replace_All},
+	h := f32(int(row_h - sx(12)))
+	m := ui.Metrics {
+		h        = h,
+		pad      = sx(FIND_ACTION_PAD_96),
+		gap      = 2 * cw,
+		label_cw = cw,
+		chord_cw = cw,
+		// The same 0.35-of-the-size drop the find bar's own rows use
+		// (main.odin's `fbase`).
+		baseline = h * 0.5 + UI_SMALL_PX * 0.35,
+		snap     = true,
 	}
+	set := [2]struct {
+		label: string,
+		cmd:   Command_Id,
+	}{{"Replace", .Find_Replace_One}, {"Replace All", .Find_Replace_All}}
+
+	gap := sx(FIND_ACTION_GAP_96)
 	total := gap
-	for &a in set {
-		a.chord = command_chord(a.cmd)
-		cells := len(a.label)
-		if a.chord != "" {cells += 2 + len(a.chord)}
-		a.w = f32(int(f32(cells) * cw + pad * 2 + 0.5)) // whole pixels: text is drawn from these
-		a.h = f32(int(row_h - sx(12)))
-		total += a.w
+	widths: [2]f32
+	chords: [2]string
+	for e, i in set {
+		chords[i] = command_chord(e.cmd)
+		widths[i] = ui.button_width(e.label, chords[i], m)
+		total += widths[i]
 	}
 	x := winw - sx(FIND_ACTION_EDGE_96) - total
 	if x < sx(FIND_ACTION_MIN_LEFT_96) {return out[:0]}
-	x = f32(int(x))
-	y := f32(int(CHROME_TOP + row_h + (row_h - set[0].h) * 0.5))
-	for a, i in set {
-		out[i] = a
-		out[i].x = x
-		out[i].y = y
-		out[i].tx = f32(int(x + pad))
-		// Baseline inside the box, the same 0.35-of-the-size drop the find bar's
-		// own rows use (main.odin's `fbase`), snapped so the glyphs land on whole
-		// pixels rather than sampling between texels in the alpha atlas.
-		out[i].ty = f32(int(y + a.h * 0.5 + UI_SMALL_PX * 0.35))
-		out[i].cx = f32(int(x + pad + f32(len(a.label) + 2) * cw))
-		x += a.w + gap
+	y := CHROME_TOP + row_h + (row_h - h) * 0.5
+	for e, i in set {
+		out[i] = {box = ui.button_layout(x, y, e.label, chords[i], m, i), cmd = e.cmd}
+		x += widths[i] + gap
 	}
 	return out[:2]
 }
@@ -459,7 +464,7 @@ find_actions :: proc(doc: ^Document, t: ^plat.Text, winw: f32, out: []Find_Actio
 find_action_at :: proc(doc: ^Document, t: ^plat.Text, winw, mx, my: f32) -> Command_Id {
 	buf: [2]Find_Action
 	for a in find_actions(doc, t, winw, buf[:]) {
-		if mx >= a.x && mx < a.x + a.w && my >= a.y && my < a.y + a.h {return a.cmd}
+		if ui.button_hit(a.box, mx, my) {return a.cmd}
 	}
 	return .None
 }

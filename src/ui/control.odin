@@ -51,6 +51,18 @@ Metrics :: struct {
 	label_cw: f32, // advance per character at the label size
 	chord_cw: f32, // advance per character at the chord size
 	baseline: f32, // from the box's top edge down to the text baseline
+	// Round every coordinate to a whole pixel.
+	//
+	// A rendering concern reaching into a geometry package, and it belongs here
+	// anyway: the alternative is the DRAW rounding while the hit-test does not, and
+	// half a pixel of divergence between them is the same seam bug as thirty, just
+	// harder to see. One producer means one rounding.
+	//
+	// Opt-in because it is not free: rounding a CENTRED glyph moves it up to half a
+	// pixel off centre, which is the right trade for chrome text (a blurry label is
+	// worse than a half-pixel lean) and the wrong one for a test asserting exact
+	// symmetry. find_actions and menu_bar_command set it; the unit tests do not.
+	snap:     bool,
 }
 
 // A labelled control: a box with its label and optional chord already placed.
@@ -75,6 +87,11 @@ button_width :: proc(label, chord: string, m: Metrics) -> f32 {
 	return w
 }
 
+@(private = "file")
+rnd :: proc(v: f32, on: bool) -> f32 {
+	return f32(int(v + 0.5)) if on else v
+}
+
 // THE ONE PRODUCER. `x, y` is the box's top-left.
 button_layout :: proc(x, y: f32, label, chord: string, m: Metrics, tag := 0) -> Button {
 	b := Button {
@@ -89,6 +106,10 @@ button_layout :: proc(x, y: f32, label, chord: string, m: Metrics, tag := 0) -> 
 	b.tx = x + m.pad
 	b.ty = y + m.baseline
 	b.cx = b.tx + cells(label) * m.label_cw + m.gap
+	if m.snap {
+		b.x, b.y, b.w, b.h = rnd(b.x, true), rnd(b.y, true), rnd(b.w, true), rnd(b.h, true)
+		b.tx, b.ty, b.cx = rnd(b.tx, true), rnd(b.ty, true), rnd(b.cx, true)
+	}
 	return b
 }
 
@@ -106,6 +127,10 @@ button_square :: proc(x, y, size: f32, label: string, m: Metrics, tag := 0) -> B
 	b.tx = x + (size - cells(label) * m.label_cw) * 0.5
 	b.ty = y + m.baseline
 	b.cx = b.tx
+	if m.snap {
+		b.x, b.y, b.w, b.h = rnd(b.x, true), rnd(b.y, true), rnd(b.w, true), rnd(b.h, true)
+		b.tx, b.ty, b.cx = rnd(b.tx, true), rnd(b.ty, true), rnd(b.cx, true)
+	}
 	return b
 }
 
