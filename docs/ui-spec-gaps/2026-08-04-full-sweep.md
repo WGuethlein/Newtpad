@@ -122,6 +122,47 @@ all comparing labels and colours, which mostly match, while the letterforms neve
 
 ---
 
+## The preview vs Obsidian — Wyatt, 2026-08-05
+
+He put our markdown preview beside Obsidian's on the same document and said ours *"looks significantly
+worse… it 1000% needs to be retouched"*. He was right, and the gap is **three concrete things, not a
+vague quality difference**. Diagnosed rather than eyeballed:
+
+### 1. A fence with no resolved lexer renders in the PROPORTIONAL SERIF body face — a bug
+
+`md_layout_build`'s `.Fence_Body` case sets `px`, `lead` and `base_col` but **not `fallback_set`**, which
+defaults to `plat.Font_Set.Body` at the top of the proc. Only `.Table` overrides it. The mono, coloured
+span path (`set = .Doc` + `syn_*` per token) is gated on `fence_lex != nil`, so:
+
+- a fence whose language HAS a lexer → mono, syntax-coloured, correct;
+- a fence whose language does not → **proportional serif, one flat colour**.
+
+Inline code is unaffected (correctly mono), which is why the two disagree in the same paragraph. Code in
+a proportional face is the single biggest reason his screenshot looked unlike Obsidian's.
+
+### 2. ` ```powershell ` resolves no lexer, though the lexer exists
+
+`md_fence_lexer` maps aliases → extension: `js`→`c`, `bash`→`sh`, `yml`→`yaml`, `csharp`→`cs`, `c++`→`cpp`.
+There is **no `powershell`/`pwsh` → `ps1`**, and `EXT_LEXERS` carries a real PowerShell lexer at `.ps1`
+(`lex_shell_ps1_adapt`, stateful, `#>` resync). So every ` ```powershell ` block — which is most of what
+his deploy docs contain — falls into case 1 above and gets neither the mono face nor the colours that
+are already implemented and already tested.
+
+### 3. No language label on the fence
+
+§9.2 item 4's preview column asks for *"6px radius block, 12px padding, lang label"*. The block and the
+radius ship; the label does not.
+
+### Cost, which is the part worth knowing
+
+**1 and 2 are roughly two lines between them** — a `fallback_set = .Doc` in the `.Fence_Body` case, and
+one `case "powershell", "pwsh": tag = "ps1"` arm. Together they turn his screenshot's flat serif blocks
+into mono, syntax-coloured ones using machinery that already exists.
+
+Wyatt deferred this behind the queued batches on the assumption it was a retouch. **It is mostly a
+two-line fix plus a genuine polish tail** (the lang label, padding, and whatever spacing comparison
+survives after the face is right). Flagged so the scheduling call can be made against the real cost.
+
 ## Per section
 
 Tags: **[V]** visual divergence in something that exists · **[F]** feature absent · **[✓]** matches ·
