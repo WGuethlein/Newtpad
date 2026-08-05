@@ -185,8 +185,8 @@ as the palette.)*
 - [F] No 20px colour swatch in the gutter of an open `.theme` tab — confirmed absent in the capture.
 
 ### §2 Metrics & type — 3 items
-- [F] **Chrome family: Argon.** See above. *The single highest-value item in this document.*
-- [F] Font embedding (~1.1 MB, four faces) with Consolas fallback.
+- ~~[F] **Chrome family: Argon.**~~ **STRUCK by C4.**  See above. *The single highest-value item in this document.*
+- ~~[F] Font embedding (~1.1 MB, four faces) with Consolas fallback.~~ **STRUCK by C4.** 
 - [V] Per-role type scale — the spec names 13 distinct role/size pairs; the app has two UI sizes
   (`UI_PX`, `UI_SMALL_PX`). Mostly moot until Argon lands, then worth one pass.
 - [✓] Chrome metrics that already match: 40px rail, 30px tab, 132/220 tab clamp, reserved 8px dirty
@@ -198,11 +198,11 @@ as the palette.)*
 > the menu bar's full text is `File Edit View Encoding Help │ Commands Ctrl+P`. Newtpad ships the
 > `>_` (at the left of the rail) and a gear icon where the mockup puts `Commands`.
 
-- [V] The `>_` sits at the **far left** of the rail; the mockup puts it right of `+`, immediately
+- ~~[V] The `>_` sits at the **far left** of the rail~~ **LEFT AS BUILT (not approved).** ; the mockup puts it right of `+`, immediately
   before the caption buttons. **[C] Left as built for now** — reposition not approved.
-- [F] No `Commands  Ctrl+P` item (with its 1px separator) at the right end of the menu bar.
+- ~~[F] No `Commands  Ctrl+P` item (with its 1px separator) at the right end of the menu bar.~~ **SHIPPED v0.74.0.** 
   **Approved.**
-- [V] The gear icon at the menu bar's right edge appears in no mockup. **Approved for removal**, with
+- ~~[V] The gear icon at the menu bar's right edge appears in no mockup.~~ **SHIPPED v0.74.0.**  **Approved for removal**, with
   `Commands` taking its place.
 - [✓] Pill tabs, radii, per-tab `✕`, `+`, reserved dirty slot, caption buttons all match.
 
@@ -210,25 +210,25 @@ as the palette.)*
 - [V] Overflow is a `+N` indicator that opens the palette's tab list. The mockup specifies a
   **scrolling rail with `‹` `›` chevrons** once tabs hit the 132px floor. Different mechanism, same
   goal — worth a decision, not an automatic change.
-- [F] The `>_` drop at 460px and the menu-bar → `☰` collapse at 360px. The `☰` metric exists
+- ~~[F] The `>_` drop at 460px and the menu-bar → `☰` collapse at 360px.~~ **SHIPPED v0.77.0 (360px; the 460px `>_` drop is still open).**  The `☰` metric exists
   (`ui_tabs.odin:50`); the behaviour rides on Show Menu Bar.
 - [✓] 318px floor honoured. Status cells drop at ~700px, and they drop by **measuring** the left
   group rather than against a hardcoded breakpoint — better than the spec asks for.
 
 ### §6 Menus — 4 items
 14 prose rules met; panel, rows, dividers, check column, accent keyboard selection all match.
-- [F] `Show Menu Bar` row + `Alt` accelerator (B15).
-- [V] `Find: Regular Expression` / `Alt+R` built vs `Find: Regex` / `Ctrl+R` in the mockup — label
+- ~~[F] `Show Menu Bar` row + `Alt` accelerator (B15).~~ **SHIPPED v0.76.0.** 
+- ~~[V] `Find: Regular Expression` / `Alt+R` built vs `Find: Regex`~~ **SHIPPED v0.74.0 (label; chord kept by C6).**  / `Ctrl+R` in the mockup — label
   *and* chord.
-- [V] `Zoom In  Ctrl++` vs the mockup's `Ctrl+=`.
-- [V] `Open Themes Folder` exists; the mockup has only `Open Logs Folder`.
+- ~~[V] `Zoom In  Ctrl++` vs the mockup's `Ctrl+=`.~~ **SHIPPED v0.74.0.** 
+- ~~[V] `Open Themes Folder` exists; the mockup has only `Open Logs Folder`.~~ **KEPT by C5.** 
 - [D] C1 (`Toggle` verb dropped) and C2 (disabled row shows its reason) — confirmed correct in the
   running app, leave them.
 
 ### §7 Command palette — 3 items
 Rebuilt to the mockup: `>` prompt, subtle raised selection (the accent-fill regression **is** reverted
 — verified), dimmed legend footer, 560 wide.
-- [F] **No scroll.** `PALETTE_MAX_ROWS` truncates, and the audit's HIGH — selection walking past the
+- ~~[F] **No scroll.** `PALETTE_MAX_ROWS` truncates~~ **SHIPPED v0.81.0.** , and the audit's HIGH — selection walking past the
   drawn rows — is the same bug. Open.
 - [V] Footer reads `> command · : go to line · ? help`; the mockup shows a live
   `: 124   go to line · type a number`.
@@ -238,7 +238,7 @@ Rebuilt to the mockup: `>` prompt, subtle raised selection (the accent-fill regr
 ### §8 Editor surface — 1 item
 Closest section to done. 16px top padding, 2px caret, find-match vs current-match fills, gutter off by
 default, 8px scrollbar with accent tick marks — all present in source.
-- [V] Confirm gutter is 44px + 12px gap when enabled (spec §2) — not visually verified this pass.
+- ~~[V] Confirm gutter is 44px + 12px gap when enabled (spec §2)~~ **STRUCK -- derives from the line count, better than a fixed 44.**  — not visually verified this pass.
 
 ### §9 Markdown — 6 items (**smaller than expected, but with one real defect**)
 The expectation that §9 would outweigh the find bar was half right: it is the biggest *section*, but it
@@ -260,11 +260,11 @@ breaks, links and `Ctrl+M` cycling three states. §9.3's serif is honoured.
 > | Done text not dimmed | It is — `read` renders in `Text_Muted` beside the blue `v1.json` link. |
 
 Remaining, all verified at 1:1:
-- [V] **The ticked checkbox is an accent-*outlined* box containing `✕`.** §9.2 item 9 and §9.4's mockup
+- ~~[V] **The ticked checkbox is an accent-*outlined* box containing `✕`.**~~ **SHIPPED v0.77.0.**  §9.2 item 9 and §9.4's mockup
   both want an accent-**filled** 14px box with a dark `✓` (`bg=#d99b62 fg=#221f1c r=3px`). The 14px
   box (`m.task_box = sx(14)`) and the dimmed done-text are already right; only the fill and the glyph
   are wrong. Small.
-- [V] **The preview's table is text-with-rules, not the mockup's card.** It *does* render — header,
+- ~~[V] **The preview's table is text-with-rules, not the mockup's card.**~~ **SHIPPED v0.82.0.**  It *does* render — header,
   a `md_rule` under it, column separators, code chips inside cells — so "renders broken" was an
   overstatement. What it lacks is §9.4's bordered card: `1px #3a342e` at `radius 6` around the whole
   table, a `bg_raised` 26px header row, and no full-height vertical rules. Also a wide gap between the
@@ -292,14 +292,14 @@ Remaining:
   characters, distribute leftover width proportionally"*, and the mockup's columns are `fr` units that
   fill. **Unverified whether the code intends the slack**, and it is arguably right not to stretch a
   4-column CSV across 1280px. Needs a decision, not a fix.
-- [F] Malformed rows are not marked with a `warning` bar. *(A warning fill does exist at
+- ~~[F] Malformed rows are not marked with a `warning` bar.~~ **STRUCK -- table_row_malformed draws it.**  *(A warning fill does exist at
   `table.odin:4142` — confirm what triggers it before counting this as owed.)*
 
 ### §11 Settings + §11.1 Font — 9 items
-- [F] Group headers `SESSION` / `APPEARANCE` / `VIEWS` (B14).
-- [F] `Show menu bar` row; [F] `Animations` / reduce-motion row.
+- ~~[F] Group headers `SESSION` / `APPEARANCE` / `VIEWS` (B14).~~ **SHIPPED v0.78.0.** 
+- ~~[F] `Show menu bar` row; [F] `Animations` / reduce-motion row.~~ **SHIPPED v0.76.0 (Show menu bar; Animations still open).** 
 - [F] `NEW` badges, and the dimmed accent bar the mockup gives a NEW row.
-- [V] Header hint row omits `←→ adjust` and spells the arrows as words.
+- ~~[V] Header hint row omits `←→ adjust` and spells the arrows as words.~~ **SHIPPED v0.77.0 (the fourth key; arrows still spelled).** 
 - [V] Confirm the selected row uses `accent_wash` + a 2px accent bar (role exists; not visually
   verified — Settings did not open in the capture pass).
 - §11.1 — **corrected 2026-08-04, three of five were already built** (`fontpage.odin:55-68,105`): the
@@ -311,14 +311,14 @@ Remaining:
 ### §12 Find / Replace / Filter — 6 items
 Already built: three chips with the active one accent-filled, a live count with `Danger` at zero, and
 two real replace-row buttons with hover and a narrow-window drop. See correction 2.
-- [V] The query is flat text (`Find: the_`). Mockup: a **bordered input**, `bg_base`, radius 6, 26px,
+- ~~[V] The query is flat text (`Find: the_`).~~ **SHIPPED v0.75.0.**  Mockup: a **bordered input**, `bg_base`, radius 6, 26px,
   with a 2px inset accent ring.
-- [V] Count reads `(1/5)` inline; mockup is `3 / 349` right-aligned in a 62px column.
-- [V] Chips sit at the far right (`winw - 12 - 3*(w+gap)`); mockup places them straight after the
+- ~~[V] Count reads `(1/5)` inline; mockup is `3 / 349`~~ **SHIPPED v0.75.0.**  right-aligned in a 62px column.
+- ~~[V] Chips sit at the far right~~ **SHIPPED v0.75.0.**  (`winw - 12 - 3*(w+gap)`); mockup places them straight after the
   count, then a separator.
-- [F] `↑` `↓` step buttons (24×24).
-- [F] `Filter  Ctrl+L` pill.
-- [F] `✕` close button.
+- ~~[F] `↑` `↓` step buttons (24×24).~~ **SHIPPED v0.75.0.** 
+- ~~[F] `Filter  Ctrl+L` pill.~~ **SHIPPED v0.75.0.** 
+- ~~[F] `✕` close button.~~ **SHIPPED v0.75.0.** 
 - [V] Also: 46px `Find` / `Replace` label column; bar is `Bg_Panel` where the mockup is `bg_raised`.
   *(Corrected 2026-08-04: an earlier draft of this file said the bar was ~30px against the mockup's
   38px, estimated from a screenshot. `FIND_BAR_H_96 :: f32(38)` at `doc.odin:992` — **the height
@@ -327,12 +327,12 @@ two real replace-row buttons with hover and a narrow-window drop. See correction
 ### §13 Status bar — 7 items
 Seam fixed (the drop lives in `status_cells`), and the selection count already replaces the line count
 exactly as §13 asks — verified live (`Ln 3, Col 22   3 selected`).
-- [F] `42.1 KB` file-size cell. [F] Language cell — the right group shows the **view name**
+- ~~[F] `42.1 KB` file-size cell. [F] Language cell~~ **SHIPPED v0.74.0 (all three cells).**  — the right group shows the **view name**
   (`Markdown Split (Ctrl+M)`) where the mockup shows `Markdown`. [F] `Tab 4` cell.
 - [F] `Saved` as a **cell** in `success`; today it is a centred transient notice.
 - [V] The left group is one text run; the mockup is three cells, each `padding 0 12px` with a 1px
   `border_subtle` on its left edge (the first cell in each group has none).
-- [V] **Numbers in Neon, words in Argon** — a two-font rule *inside* the bar. Blocked on §2.
+- ~~[V] **Numbers in Neon, words in Argon**~~ **STRUCK by C4 (Argon rejected).**  — a two-font rule *inside* the bar. Blocked on §2.
 - [F] Errors take the whole bar in `danger`.
 - ⚠ `status_cells` guards on `len(out) < 2` and callers pass `[4]Status_Cell`. Three more cells
   overflow it silently. Grow the buffer and check every call site first.
@@ -364,48 +364,42 @@ No icon work exists. §16 names **16a "Caret on paper"** as recommended and give
 
 ## The total
 
-**Re-counted 2026-08-05, after v0.74.0–v0.81.0.** The figure has now moved twice, both times downward,
-and the reason is the same each time: **items were filed from reading rather than from checking.** Quote
-the current number, not a remembered one.
+**Re-counted 2026-08-05 after v0.74.0–v0.85.0.** Every shipped or struck bullet in the sections above is
+now struck through and stamped with the version that closed it, because the first re-count updated only
+the totals and left the per-section lists reading like pre-v0.74 state — a document that would have had
+the next session redo shipped work, which is the exact failure this whole register exists to stop.
 
-### Shipped
-
-| Section | Item | Version |
-|---|---|---|
-| §4 | Gear removed, `│ Commands  Ctrl+P` in its place | v0.74.0 |
-| §6 | `Find: Regex`, `Ctrl+=`, six `…` | v0.74.0 |
-| §13 | All four right-group cells + the size in the left group | v0.74.0 |
-| §12 | Bordered input, count column, chips inline, `↑ ↓`, `Filter Ctrl+L`, `✕` | v0.75.0 |
-| — | **`src/ui` exists** — control geometry, 12 tests, no device | v0.75.0 |
-| §6/§11 | `Show Menu Bar`: setting, Alt reveal, `☰` in the rail | v0.76.0 |
-| §5 | The 360px collapse | v0.77.0 |
-| §9 | Ticked checkbox: filled box, knocked-out tick | v0.77.0 |
-| §11 | Header hint's fourth key | v0.77.0 |
-| §11 | **Group headers** (B14), and the id refactor that unblocked them | v0.78.0 |
-| §2 | Font enumeration — 22 families against 14 | v0.79.0 |
-| §7 | **Palette scrolling** — the audit's open HIGH | v0.81.0 |
-
-### Struck as already built (verified, not assumed)
-
-§9 ×4 · §10 ×4 (zebra, sorting, header band, **malformed-row warning bar**) · §11.1 ×3 ·
-§18 **gamma-correct blending** (`quads.odin` does `srgb_to_linear` on an sRGB target for both paths) ·
-§8 gutter (derives its width from the line count — better than the spec's fixed 44, not worse).
-
-### Struck by decision
-
-§2 Argon and font embedding (C4) · §2's 13-row type scale, which died with it · §6 `Open Themes Folder`
-(C5) · §6 regex chord (C6) · §1 `scrollbar_thumb` (C3).
+The figure has moved **twice, both times downward**, and the reason was the same each time: items filed
+from *reading* rather than *checking*. **Quote the current number, not a remembered one, and re-verify
+before starting anything on this list.**
 
 | | Count |
 |---|---|
-| Shipped since the sweep | **12** |
-| Struck as already built | **13** |
-| Struck by decision | **5** |
+| Shipped v0.74.0–v0.85.0 | **21** |
+| Struck as already built (verified) | **13** |
+| Struck by decision (C3–C6) | **6** |
 | **Remaining** | **~24** |
 
-**And two bugs the sweep never saw**, both found this session by checking rather than reading: the font
-scan's 431 MB temp arena, and the palette drawing labels a byte at a time. Neither was a spec gap;
-neither would have been found by comparing against a mockup. **A visual register is not a bug list.**
+Remaining, by weight rather than by count:
+
+- **§1 theme** ×4 — third (high-contrast) theme, `SPI_GETHIGHCONTRAST`, "Follow Windows", the `.theme`
+  tab's colour swatches.
+- **§17 colour rules** ×3 — contrast warning on save, "N rules inactive on this file", `Bg_*` validation.
+- **§18** ×3 — extend the focus ring past tabs, the 50ms motion table, the reduce-motion setting.
+- **§11** ×4 — `Animations` row, `NEW` badges, `Ligatures`, a syntax-highlighted code sample on the font
+  page. Plus one **unverified**: does the selected row use `accent_wash` + a 2px bar?
+- **§9** ×2 + **3 deferred** — blockquote bar to accent, the deferred markdown tier (front matter,
+  footnotes, images, setext); and the fence face / `powershell` alias / lang label Wyatt deferred.
+- **§7** ×2 — the footer's live form, and two palette rows the mockup shows that do not exist
+  (`Unwrap Selected Lines`, `Reflow Paragraph at Wrap Column`).
+- **§13** ×3 — `Saved` as a cell, the left group as three bordered cells, errors taking the whole bar.
+- **§16** ×1 — the icon (16a "Caret on paper", geometry and palette both specified).
+- **Three needing a DECISION, not work:** §5's `+N` overflow vs the mockup's `‹ ›` scrolling rail;
+  §10's columns not filling the pane; §2's per-role type scale, now that Argon is struck.
+
+**And two bugs the sweep could never have seen**, both found by checking rather than reading: the font
+scan's 431 MB temp arena and the palette drawing labels a byte at a time. Neither was a mockup
+divergence. **A visual register is not a bug list.**
 
 ## What this changes about the queue
 
