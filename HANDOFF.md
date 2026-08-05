@@ -8100,6 +8100,59 @@ away and `☰` returns.
 - `menu_bar_apply` runs per frame and is idempotent. If a future pass wants it edge-triggered, the flag
   is the thing to watch, not the callers.
 
+## 6cq. The three things §6cp owed (2026-08-04, v0.77.0, branch `feat/ui-followups`)
+
+### §5's 360px floor
+
+The bar now collapses below 360px whatever the setting says, and **Alt cannot force it back up** —
+revealing a row whose own titles are clipped is precisely the state the collapse exists to avoid. The
+width and the setting are two independent reasons the bar can be absent, and the width one wins.
+`menu_bar_apply` takes the window width; `metricstest` pins the floor, the exact-at-floor case, and
+that the setting still applies above it.
+
+### The ticked checkbox, and a bug in the first attempt
+
+§9.2 item 9 and §9.4 both show an accent-**filled** box with a dark tick. It was an accent *outline*
+with an X in it, which reads as "rejected" rather than "done". Now filled, with the tick knocked out in
+`Bg_Base`.
+
+**The first attempt escaped its box.** Strokes ran to `w` and `h`, but every quad is `st` square drawn
+*from* its origin, so ink landed at `w + st`. Invisible at normal sizes and caught immediately by
+`mdtest`'s degenerate case — a checkbox smaller than `4*st`, which is there because of Finding 5. The
+endpoints span `(w - st, h - st)` now.
+
+Worth recording: the 0.05px centring assertion **still means what it meant**. A check leans, so its ink
+is not symmetric — but the *span* it occupies is centred by construction (first stroke starts at the
+left edge, second ends at the right, vertex touches the bottom, second stroke's end touches the top).
+The assertion was always about the span, so a shape change did not require weakening it. Changing a
+drawing and then loosening the test that measured it is how a tolerance ends up admitting the defect,
+which is exactly what that assertion's own comment records happening once already.
+
+### `status_cells` now uses `ui.pack`
+
+It hand-rolled the drop: a `group_w` helper and a walk that decremented a count — the same rule the
+find bar needed a day later and would have written a second time. Decide-then-place still happens; it
+happens in one tested place now. Sabotaged the language cell's priority to confirm §5's order is still
+pinned through the new path.
+
+### Owed, with honest costs
+
+- **Font enumeration (Phase 4)** — Wyatt chose off-thread with symbol charsets excluded. Not started.
+  It is DirectWrite COM on a worker thread (`GetSystemFontCollection`, per-family `IsMonospacedFont`,
+  charset filtering, localized family names) plus a `font_choices_refresh` call site that assumes a
+  synchronous rebuild. **Its own batch**, not a tail-end addition. `text.odin:164`'s comment argues
+  against enumeration on three grounds; two are answerable and the third — localized names — is
+  unsolved and must be named rather than dropped.
+- **Settings group headers (B14)** — bigger than it looks, and the reason is worth writing down before
+  someone starts it casually. `SETTINGS_ROWS` carries a comment warning that the value switch is
+  index-based, so rows may only be *appended*; grouping requires *reordering*. That means converting
+  **30 index-based cases across `settings_draw` and `settings_toggle_row`** onto a stable id enum
+  first — which is a good change on its own merits, since the index coupling is a documented trap.
+  Then the headers add vertical space to a list whose scroll math assumes a fixed row height.
+- The preview's markdown table is still text-with-rules rather than §9.4's bordered card.
+- `menu_bar_command` and the find bar's replace row still carry their own geometry; both are
+  single-producer and seam-tested, so that is tidying rather than a fix.
+
 ## 7. Build environment (Windows, this machine)
 
 - **`build.bat` is the one build script.** `build.bat` = debug, **console subsystem** so the
