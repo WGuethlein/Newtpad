@@ -15,6 +15,7 @@ import "core:thread"
 import "core:unicode/utf8"
 import base "src:base"
 import plat "src:platform"
+import ui "src:ui"
 
 // Max bytes scanned per visible line for its end (bounds per-frame work).
 RENDER_LINE_CAP :: 8192
@@ -1145,23 +1146,24 @@ status_cells :: proc(doc: ^Document, text: ^plat.Text, winw, cw: f32, out: ^[STA
 	Cand :: struct {
 		label: string,
 		cmd:   Command_Id,
+		drop:  int,
 	}
-	cands: [STATUS_CELL_MAX]Cand
-	nc := 0
-	push :: proc(c: ^[STATUS_CELL_MAX]Cand, n: ^int, label: string, cmd: Command_Id) {
-		if n^ >= STATUS_CELL_MAX {return}
-		c[n^] = {label, cmd}
-		n^ += 1
-	}
+	// Listed LEFT TO RIGHT as the mockup reads them: `Markdown | UTF-8 | LF | Tab 4`.
+	// The drop priorities are §5's order read straight off -- "Tab width -> LF ->
+	// UTF-8 -> language" -- so the language survives longest, as §5's own 700px
+	// mockup shows (`Markdown · UTF-8`).
+	//
 	// Both new cells dispatch .Settings_Open: neither language nor tab width is a
 	// two-state toggle the way encoding and line endings are, so there is nothing
-	// honest for a click to cycle. UI spec 13 asks that every cell be clickable,
-	// and a cell that takes you to where the setting lives satisfies that without
-	// inventing a hidden cycle through 40 languages.
-	push(&cands, &nc, highlight_language_name(doc.path), .Settings_Open)
-	push(&cands, &nc, enc_name(doc.enc), .Enc_UTF8 if doc.enc != .UTF8 else .Enc_UTF16LE)
-	push(&cands, &nc, base.line_ending_name(doc.eol), .Eol_CRLF if doc.eol == .LF else .Eol_LF)
-	push(&cands, &nc, fmt.tprintf("Tab %d", plat.text_tab_width(text)), .Settings_Open)
+	// honest for a click to cycle. UI spec 13 asks that every cell be clickable, and
+	// a cell that takes you to where the setting lives satisfies that without
+	// inventing a hidden cycle through forty languages.
+	cands := [STATUS_CELL_MAX]Cand {
+		{highlight_language_name(doc.path), .Settings_Open, 1},
+		{enc_name(doc.enc), .Enc_UTF8 if doc.enc != .UTF8 else .Enc_UTF16LE, 2},
+		{base.line_ending_name(doc.eol), .Eol_CRLF if doc.eol == .LF else .Eol_LF, 3},
+		{fmt.tprintf("Tab %d", plat.text_tab_width(text)), .Settings_Open, 4},
+	}
 
 	// THE DROP LIVES HERE, not in the draw. Measured against what the left group
 	// actually needs rather than a hardcoded breakpoint, so it holds at any DPI and
@@ -1171,27 +1173,29 @@ status_cells :: proc(doc: ^Document, text: ^plat.Text, winw, cw: f32, out: ^[STA
 	// status_cell_at disagreed about which cells existed: a dropped cell was
 	// invisible and still clickable, and clicking where the LF cell had been fired
 	// `.Eol_CRLF` and rewrote the buffer. One producer now -- whatever this returns
-	// is what is drawn AND what is hit-tested, and there is no third place to add a
-	// second opinion.
-	need := sx(12) + f32(len(status_left_text(doc, text))) * cw + sx(24)
-	group_w :: proc(c: []Cand, cw: f32) -> f32 {
-		w := f32(0)
-		for e, i in c {
-			w += f32(len(e.label)) * cw
-			if i > 0 {w += sx(24)} // the gap a divider sits in the middle of
-		}
-		return w
+	// is what is drawn AND what is hit-tested.
+	//
+	// ui.pack owns the RULE. This used to hand-roll it -- a group_w helper and a
+	// walk that decremented a count -- which is the same rule the find bar then
+	// needed and would have written a second time. Decide-then-place is still what
+	// happens; it just happens in one place now, tested without a device.
+	items: [STATUS_CELL_MAX]ui.Item
+	for c, i in cands {
+		items[i] = {w = f32(len(c.label)) * cw, drop = c.drop, tag = i}
 	}
-	for nc > 0 && winw - sx(12) - group_w(cands[:nc], cw) < need {nc -= 1}
+	need := sx(12) + f32(len(status_left_text(doc, text))) * cw + sx(24)
+	keep: [STATUS_CELL_MAX]bool
+	ui.pack(items[:], max(0, winw - sx(12) - need), sx(24), keep[:])
 
 	// Now place the survivors right to left, so the group stays flush right and no
 	// gap is left where a dropped cell used to be.
 	n := 0
 	x := winw - sx(12)
-	for i := nc - 1; i >= 0; i -= 1 {
-		w := f32(len(cands[i].label)) * cw
+	#reverse for c, i in cands {
+		if !keep[i] {continue}
+		w := f32(len(c.label)) * cw
 		x -= w
-		out[n] = {label = cands[i].label, x = x, w = w, cmd = cands[i].cmd}
+		out[n] = {label = c.label, x = x, w = w, cmd = c.cmd}
 		n += 1
 		x -= sx(24)
 	}

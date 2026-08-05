@@ -887,8 +887,19 @@ menu_init :: proc(m: ^Menu_State) {
 // same 30px: if the bar appeared for the draw but not for the hit-test, every
 // click in the document would land one row off -- HANDOFF §6j's bug class with
 // the whole window as its subject rather than one widget.
-menu_bar_apply :: proc(app: ^App) {
-	MENU_BAR_SHOWN = app.settings.show_menu_bar || app.menu.revealed
+// UI spec 5: "360px -- the menu bar collapses to ☰". A hard floor on the
+// window width, independent of the setting: five titles plus the Commands item
+// do not fit, and a bar whose items run off the edge is worse than one that
+// stood down cleanly.
+MENU_BAR_MIN_W_96 :: f32(360)
+
+menu_bar_apply :: proc(app: ^App, winw: f32) {
+	// Below the floor the bar cannot appear AT ALL -- not by setting, and not by
+	// Alt either. Letting Alt force it up at 330px would reveal a row whose own
+	// titles are clipped, which is the state §5 collapses to avoid. The rail's
+	// hamburger is the route at that width, and it is always there.
+	fits := winw >= sx(MENU_BAR_MIN_W_96)
+	MENU_BAR_SHOWN = fits && (app.settings.show_menu_bar || app.menu.revealed)
 	chrome_apply()
 }
 

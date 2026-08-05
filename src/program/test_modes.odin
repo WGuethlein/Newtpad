@@ -30822,6 +30822,32 @@ when NEWTPAD_TESTS {
 					mt_chk(&bad, consumed_shown, "shown: a click on a title is consumed by the bar")
 					mt_chk(&bad, !consumed_hidden, "hidden: the same click is NOT consumed -- the document owns that row now")
 					mt_chk(&bad, menu_bar_command_at(&mt2, W2, W2 - sx(60)) == .Palette_Open, "the Commands item is still produced (the bar's own geometry is unconditional)")
+
+					// UI spec 5's 360px floor. The setting and the width are two
+					// independent reasons the bar can be absent, and the width one
+					// WINS: Alt must not force a row up at a width whose own titles
+					// would be clipped, which is the state §5 collapses to avoid.
+					a2.settings.show_menu_bar = true
+					a2.menu.revealed = false
+					menu_bar_apply(&a2, 900)
+					wide_shows := MENU_BAR_SHOWN
+					menu_bar_apply(&a2, sx(MENU_BAR_MIN_W_96) - 1)
+					narrow_hides := !MENU_BAR_SHOWN
+					a2.menu.revealed = true
+					menu_bar_apply(&a2, sx(MENU_BAR_MIN_W_96) - 1)
+					alt_cannot_force := !MENU_BAR_SHOWN
+					menu_bar_apply(&a2, sx(MENU_BAR_MIN_W_96))
+					at_floor_shows := MENU_BAR_SHOWN
+					a2.menu.revealed = false
+					mt_chk(&bad, wide_shows && narrow_hides, fmt.tprintf("the bar collapses below %.0fpx (%v / %v)", sx(MENU_BAR_MIN_W_96), wide_shows, narrow_hides))
+					mt_chk(&bad, at_floor_shows, "...and is back exactly AT the floor, not one pixel above it")
+					mt_chk(&bad, alt_cannot_force, "Alt cannot force the bar up below the floor")
+					// The setting still hides it above the floor, or the width
+					// check would be masking the preference rather than adding to it.
+					a2.settings.show_menu_bar = false
+					menu_bar_apply(&a2, 900)
+					mt_chk(&bad, !MENU_BAR_SHOWN, "a wide window still honours the setting")
+					a2.settings.show_menu_bar = true
 				}
 
 				// 2. Regex honours case and whole word. Both were ignored: the
