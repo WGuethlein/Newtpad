@@ -36734,7 +36734,7 @@ when NEWTPAD_TESTS {
 				os.remove(path)
 				rules_reset()
 
-				fmt.println("--- Edit Colour Rules... ---")
+				fmt.println("--- Edit Colour Rules… ---")
 				{
 					app_t: App
 					menu_init(&app_t.menu)
@@ -36790,7 +36790,7 @@ when NEWTPAD_TESTS {
 			ru_command :: proc(bad: ^int) {
 				fmt.println("--- the command ---")
 				ru_chk(bad, command_in_palette(.Rules_Edit), "Rules_Edit is offered in the palette")
-				ru_chk(bad, command_table[.Rules_Edit].title == "Edit Colour Rules..." && command_table[.Rules_Edit].category == "View", fmt.tprintf("titled and filed under View: %q / %q", command_table[.Rules_Edit].title, command_table[.Rules_Edit].category))
+				ru_chk(bad, command_table[.Rules_Edit].title == "Edit Colour Rules…" && command_table[.Rules_Edit].category == "View", fmt.tprintf("titled and filed under View: %q / %q", command_table[.Rules_Edit].title, command_table[.Rules_Edit].category))
 				ru_chk(bad, !command_mutates_doc(.Rules_Edit), "it is not a document mutation")
 				// In the View menu, beside the two rows it mirrors. The palette
 				// is not enough on its own: §6x and §6ad both shipped their file
@@ -38727,13 +38727,25 @@ when NEWTPAD_TESTS {
 			gs(&bad, cols_off > cols_on, fmt.tprintf("wrap width shrinks when the gutter is on (%d -> %d cells)", cols_off, cols_on))
 			gs(&bad, f32(cols_off - cols_on) * cw >= on_w - cw, "...by the gutter's own width, not by some other amount")
 
-			fmt.println("-- §8's wrap column cap --")
-			// 3000px of measure at 8px/cell is ~370 columns; the cap is what stops a
-			// maximised 1440p window handing back 200-character lines.
+			fmt.println("-- wrap follows the window width (§8's cap REMOVED) --")
+			// §8 capped the wrapped column at 100 characters. Wyatt overruled it in
+			// live use on 2026-08-05 -- on a ~120-column pane the text stopped at 100
+			// and left a band of dead space that reads as broken layout. The cap's
+			// argument (a maximised 1440p window handing back 200-character lines) is
+			// sound in the abstract and lost to what it looked like.
+			//
+			// What is pinned now is that `wrapping` no longer changes the answer at
+			// all: the same width in, the same columns out. Written as an EQUALITY
+			// between the two, not as "> WRAP_COL_CAP" -- a bound above the old cap
+			// would also pass if some new, larger cap appeared.
 			doc_update_gutter(&d, cw, false)
-			gs(&bad, doc_view_cols(3000, cw, true) == WRAP_COL_CAP, fmt.tprintf("a wide window wraps at the %d-column cap", WRAP_COL_CAP))
-			gs(&bad, doc_view_cols(3000, cw, false) > WRAP_COL_CAP, "...and an UNWRAPPED view still reports the real width, which h-scroll reads")
-			gs(&bad, doc_view_cols(200, cw, true) < WRAP_COL_CAP, "a narrow window is unaffected by the cap")
+			wide_on := doc_view_cols(3000, cw, true)
+			wide_off := doc_view_cols(3000, cw, false)
+			gs(&bad, wide_on == wide_off, fmt.tprintf("a wide window wraps at the real width, capped or not (%d == %d)", wide_on, wide_off))
+			gs(&bad, wide_on > WRAP_COL_CAP, fmt.tprintf("...which on a 3000px measure is well past the old %d-column cap (%d)", WRAP_COL_CAP, wide_on))
+			narrow_on := doc_view_cols(200, cw, true)
+			narrow_off := doc_view_cols(200, cw, false)
+			gs(&bad, narrow_on == narrow_off && narrow_on < WRAP_COL_CAP, fmt.tprintf("a narrow window is the width it always was (%d == %d)", narrow_on, narrow_off))
 
 			fmt.println("-- the filter view keeps its own gutter, and the setting does not govern it --")
 			// Its numbers are the point of the view, not a preference.

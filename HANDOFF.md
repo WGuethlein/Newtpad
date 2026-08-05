@@ -8482,6 +8482,44 @@ not a regression, and is not licence to loosen a bound.** Relaxing until green i
 rejecting the bug it was written for — which this file has already recorded happening once, to the
 checkbox centring tolerance.
 
+## 6cx. Two assertions the sweeps kept missing (2026-08-05, v0.84.0, branch `fix/wrap-cap-assertion`)
+
+No feature work. Two red assertions found by finally sweeping **every** mode instead of a list written
+from the change.
+
+- **`gutterseamtest`** asserted `doc_view_cols(3000, cw, true) == WRAP_COL_CAP`. v0.83.0 removed the
+  cap. Rewritten to pin the new rule as an **equality between the wrapped and unwrapped answers**,
+  rather than `> WRAP_COL_CAP` — a bound above the old cap would also pass if some new, larger cap
+  appeared.
+- **`rulestest`** expected `"Edit Colour Rules..."`. The label took a real ellipsis in **v0.74.0**, so
+  it had been failing for **nine releases** with nothing noticing.
+
+### Why they were missed, which is the actual finding
+
+Every sweep this session ran a list *I* wrote from the change I had just made. `development-loop.md` §6
+says exactly this: *"Sweep HANDOFF §7's list, not the shorter one your batch plan wrote down. A plan
+naturally names the modes it expects to touch; the sweep has to cover the modes the CHANGE can reach,
+and those are not the same set."* It cites `hscrolltest` going unrun for two releases. This is the same
+failure twice more in one session, and the ellipsis one is worse because a *label* change is exactly the
+kind that reaches modes no one would list.
+
+**All 94 one-argument modes now pass** (minus the three falsifiers that exit 0 regardless and the two
+deliberate crashers).
+
+### Three harness traps, each of which produced a wrong conclusion
+
+1. **A silent mode looks like a passing mode.** The first `gutterseamtest` run printed nothing and
+   exited 0 — because `build
+ewtpad.exe` was the **release** build at the time, GUI subsystem,
+   detached from the console. §6 warns about this for `--version`; it applies to every mode.
+2. **A stray process silently protects a stale binary.** The debug rebuild failed `LNK1104` because a
+   newtpad left over from a screenshot still held the exe. Had the linker not refused, the re-run would
+   have tested the old binary and "passed".
+3. **`Start-Process -PassThru` + `WaitForExit(ms)` leaves `$p.ExitCode` unpopulated** in PowerShell 5.1,
+   which reads as a failure for *every* mode — and the loop leaked a process that hung the whole sweep,
+   which is what made a mode look like it was falling through to the GUI. **No mode hangs on its own.**
+   Run them directly and read `$LASTEXITCODE`.
+
 ## 7. Build environment (Windows, this machine)
 
 - **`build.bat` is the one build script.** `build.bat` = debug, **console subsystem** so the
