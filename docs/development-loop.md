@@ -375,10 +375,26 @@ Each of these cost real time at least once.
 
 ## 7. Where to look first in a new session
 
-**As of 2026-08-04 the live work is the UI rework, which is now a V1 gate. Start at
-[docs/ui-spec-gaps/README.md](ui-spec-gaps/README.md)** — it carries the state per surface, the
-reading order for the four analysis files, the next action, and the three traps this work has already
-hit. Then HANDOFF §6cg–§6cm for how it got there.
+**As of 2026-08-05 the live work is the UI rework, which is now a V1 gate. Start at
+[docs/ui-spec-gaps/README.md](ui-spec-gaps/README.md)** — current as of v0.85.0, it carries the state,
+the six named exceptions to "mockup wins", the reading order, the next action, and the traps this work
+has hit. Then **HANDOFF §6cm-z**, the session handoff for v0.74.0 → v0.85.0, which is the five-minute
+version of the twelve batch entries §6cn–§6cy that follow it.
+
+**§6 of this file bit four times in that session.** Read it as a checklist, not as background. The two
+that cost the most:
+
+- *"Sweep HANDOFF §7's list, not the shorter one your batch plan wrote down"* — `gutterseamtest` and
+  `rulestest` both went red for releases, the second for nine, over a label change nobody would have
+  listed a mode for.
+- A **silent** mode is not a passing mode: a release build is GUI-subsystem and prints nothing, and a
+  stray `newtpad` holding the exe makes a "rebuild" test the old binary.
+
+And one rule that session added, from four separate instances: **an assertion with slack is one that
+something eventually drifts into.** A 1px centring tolerance that admitted the defect it was written
+for; a gap check that reduced to `trow <= trow * 1.5`; a probe that measured glyph ink instead of the
+fill it named; and "label and chord sit inside the box", which absorbed a 6px drift. **Where a value is
+derivable, assert the value, not a bound.**
 
 Then the standing list:
 

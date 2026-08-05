@@ -7890,6 +7890,141 @@ both still pass. That wants the draw reporting what it drew, `drawcount`-style. 
 ~~The mockup's three cells — `42.1 KB`, the language cell, `Tab 4` — are **not** added yet.~~
 **Done in §6cn.** The buffer warning below turned out to understate the problem — see there.
 
+## 6cm-z. SESSION HANDOFF — the UI rework, v0.74.0 → v0.85.0 (2026-08-04/05)
+
+**Read this instead of §6cn–§6cy if you only have five minutes.** Those twelve entries are the batches;
+this is what they add up to and what is still owed. The UI entry point is
+[docs/ui-spec-gaps/README.md](docs/ui-spec-gaps/README.md), current as of v0.85.0.
+
+### What this session was
+
+It began as one task: **sweep every `ui-spec` section's mockup against the running app and give one
+honest total.** Twelve releases later it had also built `src/ui`, rebuilt the find bar, shipped Show Menu
+Bar, font enumeration, settings groups and the markdown table card, and fixed six bugs — two of which had
+been shipping for several releases.
+
+### The 12 shipped batches
+
+| § | Version | What |
+|---|---|---|
+| 6cn | v0.74.0 | The sweep itself; menu labels; `Commands Ctrl+P` replaces the gear |
+| 6co | v0.75.0 | **`src/ui` becomes real**; the find bar rebuilt on it |
+| 6cp | v0.76.0 | Show Menu Bar — setting, Alt reveal, `☰`; `chrome_apply` consolidates 16 copies of one formula |
+| 6cq | v0.77.0 | §5's 360px collapse; the filled checkbox; `status_cells` onto `ui.pack` |
+| 6cr | v0.78.0 | Settings group headers, via 30 switch cases moved onto a stable id |
+| 6cs | v0.79.0 | Font enumeration — 22 families against the curated 14 |
+| 6ct | v0.80.0 | The scan's 431 MB temp arena; an Alt reveal that stuck for the session |
+| 6cu | v0.81.0 | Palette scrolling (the audit's open HIGH); labels drawn a byte at a time |
+| 6cv | v0.82.0 | §9.4's bordered markdown table card |
+| 6cw | v0.83.0 | Wrap follows the width; table cell padding |
+| 6cx | v0.84.0 | Two assertions the sweeps kept missing |
+| 6cy | v0.85.0 | Every control on `ui.Button` |
+
+### The register moved from 59 to ~24, twice downward
+
+**13 of the original 59 items were never real** — already built, and filed from reading rather than
+checking. Six more were struck by decision (C3–C6). 21 shipped.
+
+**The mechanism matters more than the number.** The spec's values are deliberately quiet: `md_code_bg` is
+eight units off `bg_base`, `table_zebra` four. At half scale they vanish, and "I cannot see it in a
+screenshot" got written down as "it is missing" — for zebra, sorting, the header band, the code-span
+fill, the bullet glyphs, the dimmed done-text, the font page's breadcrumb, and its caps `PREVIEW`.
+
+> **Verify at 1:1 or read the producer. A capture is evidence of presence, never of absence.**
+
+### The four corrections that changed the plan
+
+1. **A button primitive already existed** — `Find_Action`, since 2026-07-28, with the full one-producer
+   discipline. Both the README and the gap doc said *"nothing in Newtpad has ever drawn a button"*. The
+   find bar was a promotion job, not greenfield work.
+2. **The find bar's chips and live count already shipped.**
+3. **§9 markdown was nearly done**, not the large hole it was billed as.
+4. **`scrollbar_thumb`'s deviation was already decided** in `theme.odin` on a measurement, and became C3.
+
+And one anti-correction worth keeping: **I escalated `menuseam`'s 17 `DIVERGES` lines as a live HIGH
+outranking the whole queue. It is not a bug.** The mode's own header says so — it is a falsifier asking
+whether a *proposed* two-layout-pass frame would be stable. `development-loop.md` §6 names that exact
+trap two lines after the sentence I quoted while making the mistake.
+
+### `src/ui` — why it was possible now
+
+The stub said it *"produces draw intent for the renderer"*, which is why it sat empty for sixteen
+batches: a `ui` that draws needs `plat.Gfx`, `plat.Text` and the theme, and the theme lives in `program`.
+
+CLAUDE.md's rule is narrower — one `*_layout()` producer consumed by the draw, the hit-test, the hover
+and the cursor — and **never says the producer must draw.** Splitting there gives pure arithmetic over
+`f32` and strings: no COM, no device, no theme, no `Document`. It is the first layer besides `base` that
+`odin test` can reach.
+
+> **`ui` decides where things are; `program` decides what they look like.** Advances cross the seam as
+> numbers in `Metrics`, never as types; `Button.tag` is an `int`, not a `Command_Id`.
+
+`pack()` is the drop rule, with §6cq's lesson kept: **decide survival first, place second** — that is what
+keeps a right-aligned group flush instead of leaving a hole, and what lets a drop order be *intentional*
+rather than positional.
+
+### Six bugs, and where each came from
+
+| Bug | Found by |
+|---|---|
+| `Ctrl+=` in `key_names` would make `ctrl+= = Zoom_In` unparseable and silently break every existing keys.txt | Reasoning about the parser before writing the test |
+| Status cells dropped in the wrong order (§5 says the language survives longest) | Adding the cells |
+| `status_cells` took a slice, so a 5th cell would vanish from the draw AND the hit-test alike — no symptom at all | Reading the call sites |
+| `font_scan`'s temp arena reached **443.8 MB** (671 files, 431 MB of fonts) | Measuring, not reasoning |
+| An Alt reveal stuck for the whole session on the Settings/Font pages | Asking what clears it |
+| Palette labels drawn a **byte** at a time — `Save As…` as three boxes, for 7 releases | The screenshot taken to verify something else |
+
+Plus `NSimSun` resolving but never loading, because `.ttc` collections were opened as `.TRUETYPE` face 0 —
+so *every* collection family silently gave you a different font than the one you picked.
+
+### Process lessons, each of which recurred
+
+- **An assertion with slack is one that something eventually drifts into.** Four times this session: a 1px
+  centring tolerance that admitted the defect; a gap check that reduced to `trow <= trow * 1.5`; a
+  header-band probe that measured glyph ink; and "label and chord sit inside the box", which absorbed a
+  6px drift. **Where a value is derivable, assert the value, not a bound.**
+- **Sweep the modes the CHANGE can reach, not the list your batch wrote down.** `gutterseamtest` and
+  `rulestest` both went red for releases; the second for **nine**, over a label.
+- **A silent mode is not a passing mode** — a release build is GUI-subsystem and prints nothing, and a
+  stray `newtpad` holding the exe means a "rebuild" quietly tests the old binary.
+- **Sabotages need isolating too.** Two applied together *masked* each other: the locale bug selected a
+  single-byte name record, leaving the UTF-16 bug nothing to corrupt.
+- **A premise made false by a decision is not a regression.** Seven `mdtest` assertions plus one in
+  `gutterseamtest` existed to prove caps Wyatt removed. They were rewritten to the new rule — **not
+  relaxed.** Loosening a bound until it passes is how a test stops rejecting the bug it was written for.
+- **I committed straight to `main` twice.** The second time I moved the commits onto a branch and merged
+  properly rather than flagging it a second time.
+
+### Owed, in the order I would take it
+
+1. **Extract the frame loop's context selection into a proc.** §6ct's Alt-reveal fix is verified only by a
+   live pass — its test drives `menu_close` directly and cannot prove the frame loop *reaches* it, because
+   the context choice is inline in `main.odin`. Smallest real improvement available, and it closes the one
+   piece of this session whose coverage is admitted to be incidental.
+2. **The preview vs Obsidian — DEFERRED BY WYATT** (2026-08-05: *"push it off because there are other
+   issues"*). Diagnosed in the register: a fence with no resolved lexer renders in the **proportional
+   serif** face (`.Fence_Body` never sets `fallback_set`, which defaults to `Body`); ` ```powershell `
+   maps to no lexer although `.ps1` has a real stateful one; no lang label. **Two of the three are ~2
+   lines** and would transform the screenshots he compared.
+3. `Status_Cell` still carries its own cell geometry — it uses `ui.pack` but not `ui.Button`. Deliberately
+   left out of §6cy to keep the status bar out of a refactor it did not need.
+4. A `mdtest` fixture that measures a table's own height directly, so the separator collapse stops
+   depending on incidental coverage.
+5. **Three that need a decision, not work:** §5's `+N` overflow vs the mockup's scrolling rail; §10's
+   columns not filling the pane; §2's per-role type scale now that Argon is struck.
+
+### Verification state at v0.85.0
+
+All **94** one-argument test modes pass (minus the three falsifiers that exit 0 whatever they find, and
+the two deliberate crashers), plus **238** `base` tests and **13** `ui` tests. Every commit on every
+branch this session was checked to build independently.
+
+### Where to start
+
+[docs/ui-spec-gaps/README.md](docs/ui-spec-gaps/README.md) → the full sweep → this entry. Then
+[docs/development-loop.md](docs/development-loop.md), whose §6 traps bit **four times** this session and
+are worth reading as a checklist rather than as background.
+
 ## 6cn. The whole spec swept, and the first batch off it (2026-08-04, v0.74.0, branch `ui-polish-batch`)
 
 Every earlier gap list came from five surfaces Wyatt happened to screenshot. This opened **all 19
