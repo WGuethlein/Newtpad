@@ -14017,28 +14017,77 @@ when NEWTPAD_TESTS {
 					la, _, lok_a := ink(pix, bg, l0, l1, int(row1_y), int(row1_y + trow), W, H)
 					lb, _, lok_b := ink(pix, bg, l0, l1, int(row2_y), int(row2_y + trow), W, H)
 					tchk(&bad, lok_a && lok_b && la == lb, fmt.tprintf("align: the left-aligned column starts at the SAME pixel in a wrapping row and a plain one (%d vs %d)", la, lb))
-					// --- 4b. the separator rule sits where the draw intends it, on pixels --
+					// --- 4b. the header/body boundary is the BAND, not a rule -------------
 					//
-					// markdown.odin's separator-row quad is `ytop + ad.h * 0.5` -- vertically
-					// CENTRED in the separator row's own admitted height. The expression
-					// before this task was `ytop + ascent - px*0.5`, snug under the header
-					// text instead, and moved ~10px with nothing asserting either position
-					// -- disclosed as cosmetic, but a position nothing pins can drift again
-					// unnoticed. This pins the one the code draws now.
+					// REPLACES an assertion that pinned the separator's own md_rule as
+					// vertically centred in a full-height separator row. That was right
+					// while a table had no card around it. §9.4 draws the header on
+					// bg_raised with the body plain beneath and NO line between them, so
+					// the rule became a second answer to one question and the row
+					// collapsed to a hairline.
 					//
-					// The separator row is exactly one line tall (it draws no text, so only
-					// the empty-block fallback height applies) and sits directly above row 1
-					// with no gap, so its own top is row1_y - trow and its centre is
-					// row1_y - 0.5*trow.
-					rlo, rhi := int(cx) - 2, int(cx + cols[2].x + cols[2].w) + 2
-					want_y := row1_y - 0.5 * trow
-					_, _, at_centre := ink(pix, bg, rlo, rhi, int(want_y) - 1, int(want_y) + 2, W, H)
-					tchk(&bad, at_centre, fmt.tprintf("rule: the separator's rule sits centred in its row (row1_y %.1f, trow %.1f, want y~%.1f)", row1_y, trow, want_y))
-					// ...and NOT snug under the header, i.e. not near the separator row's
-					// own top edge -- the pre-task position, well clear of the centre band
-					// just confirmed above.
-					_, _, near_top := ink(pix, bg, rlo, rhi, int(row1_y - trow), int(row1_y - trow) + 3, W, H)
-					tchk(&bad, !near_top, fmt.tprintf("rule: ...and NOT snug under the header at the row's own top (nothing at y~%.1f)", row1_y - trow))
+					// The old assertion's PREMISE went false -- "the separator row is
+					// exactly one line tall" -- which is a different thing from the
+					// assertion failing, and is why it is rewritten rather than relaxed.
+					// Relaxing a bound until it passes is how a test stops rejecting the
+					// bug it was written for.
+					//
+					// What is pinned now: the header sits on a fill the body does not,
+					// and the separator adds no row of its own.
+					pix_at :: proc(pix: []u8, x, y, W, H: int) -> (u8, u8, u8) {
+						if x < 0 || y < 0 || x >= W || y >= H {return 0, 0, 0}
+						i := (y * W + x) * 4
+						return pix[i], pix[i + 1], pix[i + 2]
+					}
+					// Sampled in each row's TOP STRIP, two pixels below its own top edge.
+					//
+					// The first version sampled the row's vertical MIDDLE, which is where
+					// the glyphs are -- so it compared header ink against body ink and
+					// passed with the band deleted. Caught by sabotaging the band and
+					// watching it stay green. A probe has to land on the thing it claims
+					// to measure, and "inside the row" is not the same as "on the fill".
+					sx_probe := int(cx) + 3
+					hdr_y := row1_y - trow
+					// Find the band by SCANNING for it instead of computing where it should
+					// be. Three placement attempts in a row measured something else --
+					// glyph ink, then a strip that turned out to be Bg_Base -- so this
+					// walks up from row 1 looking for the Bg_Raised fill and reports what
+					// it found. A probe derived from data cannot be off by a row.
+					want := g_theme[.Bg_Raised]
+					wb, wg, wr := u8(want[2] * 255), u8(want[1] * 255), u8(want[0] * 255)
+					band_y := -1
+					for yy := int(row1_y); yy > max(0, int(row1_y) - 3 * int(trow)); yy -= 1 {
+						pb, pg, pr := pix_at(pix, sx_probe, yy, W, H)
+						if abs(int(pb) - int(wb)) + abs(int(pg) - int(wg)) + abs(int(pr) - int(wr)) <= 6 {
+							band_y = yy
+							break
+						}
+					}
+					tchk(&bad, band_y >= 0, fmt.tprintf("card: the header band (Bg_Raised %d,%d,%d) is drawn above row 1 (found at y=%d)", wb, wg, wr, band_y))
+					hb, hg, hr := pix_at(pix, sx_probe, max(0, band_y), W, H)
+					bb, bgn, br := pix_at(pix, sx_probe, int(row2_y) + 2, W, H)
+					differs := int(hb) != int(bb) || int(hg) != int(bgn) || int(hr) != int(br)
+					tchk(&bad, differs, fmt.tprintf("card: the header row sits on a fill the body does not (%d,%d,%d vs %d,%d,%d)", hb, hg, hr, bb, bgn, br))
+					// The band sits directly above row 1 rather than a row above it.
+					//
+					// STATED HONESTLY: this does NOT guard the separator collapse.
+					// Restoring the full-height separator leaves band_y and row1_y
+					// unchanged here, so the number below does not move -- I could not
+					// establish why within this fixture, and three placement attempts is
+					// enough guessing to stop and say so rather than keep tuning a bound
+					// until it looks like a guard.
+					//
+					// What DOES catch the collapse being reverted is the front-matter
+					// rule-position assertion further down this mode, which fails because
+					// every block below the table shifts. That coverage is real but
+					// INCIDENTAL, and incidental coverage is one refactor away from
+					// vanishing. Owed: a fixture whose table height is measured directly.
+					//
+					// The first version of this line was worse than useless -- it compared
+					// `row1_y - hdr_y` against `trow * 1.5` with `hdr_y := row1_y - trow`,
+					// which reduces to `trow <= trow * 1.5` and is true for every input.
+					gap := row1_y - f32(band_y)
+					tchk(&bad, gap < trow * 1.6, fmt.tprintf("card: the band sits directly above row 1 (band y=%d -> row1 %.1f = %.1f, one row %.1f)", band_y, row1_y, gap, trow))
 				}
 			}
 			// --- 5. natural widths measure rendered text, not raw markdown ---------
