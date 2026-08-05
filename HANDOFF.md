@@ -8054,6 +8054,52 @@ in a package whose entire job is measuring chrome glyphs tested the arithmetic a
 - `menu_bar_command` (§6cn) and `status_cells` predate `ui` and could both be expressed with it. Doing
   so would delete two hand-rolled drop rules.
 
+## 6cp. Show Menu Bar, and the sixteen-author formula (2026-08-04, v0.76.0, branch `feat/show-menu-bar`)
+
+UI spec 11's `Show menu bar`, defaulting **on** — "menu bar ships visible" is a locked decision. Off
+reclaims the 30px; Alt reveals the bar temporarily; the tab rail's button becomes a hamburger onto the
+same menus.
+
+Wyatt's three calls: **temporary reveal** (Explorer/Office convention, not a latch — a latch makes Alt
+a second Settings toggle), **push rather than overlay** (`CHROME_TOP` grows while revealed, reusing the
+existing layout path with no overlay special-case), and **the hamburger replaces `>_`** in the rail's
+existing 44px slot rather than sitting beside it.
+
+### The part that was already a bug
+
+`CHROME_TOP = TAB_STRIP_H + MENU_BAR_H` was written out at **sixteen sites** — `metrics_recompute` plus
+fifteen in `test_modes.odin`. A formula with sixteen authors, and the exact shape of every seam bug in
+§6j. Adding a term to it in one place would have left every headless mode laying its window out as
+though the bar were always there, and the modes would have gone on passing.
+
+It is `chrome_apply()` now, reading one flag, and `menu_bar_apply` sets that flag **once per frame,
+before either the input pass or the draw touches a coordinate**. That ordering is the whole risk of
+this feature: if the bar existed for the draw but not for the hit-test, the first row of clicks in the
+document would disappear into a bar that is not there.
+
+### The reveal is cleared in one place
+
+`menu.revealed` is transient and `menu_close` clears it. Esc, a picked command and a click away all
+funnel through there already, so none of them has to remember the bar separately — the alternative is
+three dismissal paths each needing to know about a fourth thing.
+
+### Verification
+
+`metricstest` pins the arithmetic (hidden chrome top is the rail alone; hiding reclaims exactly
+`MENU_BAR_H`; content top stays derived) and the seam (a click on a title is consumed when shown and
+**not** consumed when hidden). Sabotaged twice: leaving the hit-test owning the row while hidden fails
+the click assertion; making `chrome_apply` ignore the flag fails three. Live pass confirms the whole
+cycle — bar hidden with `☰`, Alt reveals with mnemonics underlined and pushes content down, Esc puts it
+away and `☰` returns.
+
+### Owed
+
+- **§5's 360px collapse is still not wired.** The narrow-window case and the *setting* case now share
+  the mechanism (`MENU_BAR_SHOWN`), so it is one condition away — but nothing sets it from width yet,
+  and the two want different reveal behaviour (a setting is a preference; a width collapse is not).
+- `menu_bar_apply` runs per frame and is idempotent. If a future pass wants it edge-triggered, the flag
+  is the thing to watch, not the callers.
+
 ## 7. Build environment (Windows, this machine)
 
 - **`build.bat` is the one build script.** `build.bat` = debug, **console subsystem** so the
