@@ -51,6 +51,15 @@ label_and_chord_sit_inside_the_box :: proc(t: ^testing.T) {
 	end := b.cx + f32(len(b.chord)) * M.chord_cw
 	testing.expect(t, end <= b.x + b.w, "chord ends inside")
 	testing.expect(t, b.cx > b.tx, "chord follows the label")
+	// EXACTLY one gap after the label, not merely somewhere inside the box.
+	//
+	// The three checks above have slack: a button sized from its own content has
+	// room to spare at the chord end, and shifting cx by 6px passed all of them.
+	// Found by sabotaging this producer after folding find_actions and
+	// menu_bar_command onto it -- two call sites whose chord placement nothing
+	// else pins, since their seam tests compare the BOX against the hit-test and
+	// never ask where the text inside it went.
+	testing.expect_value(t, b.cx, b.tx + f32(len("Filter")) * M.label_cw + M.gap)
 }
 
 // Odin's len() on a string is BYTES. Every glyph these controls actually use is
@@ -66,6 +75,33 @@ multibyte_glyphs_measure_as_one_cell :: proc(t: ^testing.T) {
 	// And in a labelled button, where the width is what drifts.
 	testing.expect_value(t, button_width("✕", "", M), button_width("x", "", M))
 	testing.expect_value(t, button_width("Filter", "Ctrl+L", M), f32(100))
+}
+
+// find_actions and menu_bar_command both hand-rolled their geometry and both
+// snapped every coordinate to a whole pixel, "so the glyphs land on whole pixels
+// rather than sampling between texels in the alpha atlas". Folding them onto
+// button_layout would have dropped that silently -- the boxes would still agree
+// with their hit-tests, and the text would just go slightly soft.
+@(test)
+snap_rounds_every_coordinate :: proc(t: ^testing.T) {
+	ms := M
+	ms.snap = true
+	// Fractional origin AND a fractional advance, so nothing lands whole by luck.
+	ms.label_cw = 7.4
+	b := button_layout(10.3, 20.7, "Filter", "Ctrl+L", ms)
+	whole :: proc(v: f32) -> bool {return v == f32(int(v))}
+	testing.expect(t, whole(b.x) && whole(b.y), "box origin is whole")
+	testing.expect(t, whole(b.w) && whole(b.h), "box size is whole")
+	testing.expect(t, whole(b.tx) && whole(b.ty), "label origin is whole")
+	testing.expect(t, whole(b.cx), "chord origin is whole")
+	// The seam still holds after rounding: both drawn edges hit, neither
+	// neighbour pixel does.
+	testing.expect(t, button_hit(b, b.x, b.y), "and the snapped box still hit-tests")
+	testing.expect(t, !button_hit(b, b.x - 1, b.y), "...with its left edge exclusive below")
+
+	// Off by default, or the centring test above would be asserting rounded values.
+	u := button_layout(10.3, 20.7, "Filter", "Ctrl+L", M)
+	testing.expect(t, u.x == 10.3, "snap is opt-in: unset leaves the origin alone")
 }
 
 @(test)

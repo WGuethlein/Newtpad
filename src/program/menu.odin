@@ -21,6 +21,7 @@ package main
 import "core:fmt"
 import "core:unicode/utf8"
 import plat "src:platform"
+import ui "src:ui"
 
 MENU_BAR_H_96 :: f32(30) // UI spec 2.1 (was 26)
 MENU_ITEM_H_96 :: f32(28) // dropdown row height, UI spec 2.2 (was 24)
@@ -1318,28 +1319,31 @@ menu_title_at :: proc(t: ^plat.Text, mx: f32) -> int {
 // replace row, for the same reason -- a control sitting half under the Help
 // menu is one the user can see and cannot press.
 Menu_Bar_Command :: struct {
-	x, y, w, h: f32, // the box: hover fill and hit-test both read exactly this
-	sep_x:      f32, // the 1px separator standing in the gap to its left
-	tx, ty:     f32, // label origin; ty is the baseline, shared with the chord
-	cx:         f32, // chord origin
-	label:      string,
-	chord:      string,
+	using box: ui.Button, // label, chord, box, label origin, chord origin
+	sep_x:     f32, // the 1px separator standing in the gap to its left
 }
 
 menu_bar_command :: proc(t: ^plat.Text, width: f32) -> (out: Menu_Bar_Command, ok: bool) {
-	out.label = "Commands"
-	out.chord = command_chord(.Palette_Open)
-	lw := f32(len(out.label)) * plat.text_char_width(t, UI_PX)
-	chw := f32(len(out.chord)) * plat.text_char_width(t, UI_SMALL_PX)
-	pad := sx(10) // UI spec 2: menu item padding 0 10
-	gap := sx(8)
-	out.w = pad + lw + gap + chw + pad
-	out.h = sx(22) // UI spec 2: menu item 22 tall
-	out.x = width - SCROLLBAR_W - out.w
-	out.y = TAB_STRIP_H + (MENU_BAR_H - out.h) * 0.5
-	out.tx = out.x + pad
-	out.ty = TAB_STRIP_H + MENU_BAR_H - sx(8) // the bar's shared baseline
-	out.cx = out.tx + lw + gap
+	// BUILT ON ui.Button. The box, the label origin and the chord origin were
+	// computed here by hand; that is ui.button_layout's whole job, and this was
+	// the second copy of it. `snap` because the bar's glyphs want whole pixels for
+	// the same reason the find bar's buttons do.
+	h := sx(22) // UI spec 2: menu item 22 tall
+	m := ui.Metrics {
+		h        = h,
+		pad      = sx(10), // UI spec 2: menu item padding 0 10
+		gap      = sx(8),
+		label_cw = plat.text_char_width(t, UI_PX),
+		chord_cw = plat.text_char_width(t, UI_SMALL_PX),
+		// The bar's SHARED baseline, not a fraction of this box -- every title on
+		// the row sits on it, and a Commands item on its own baseline would read
+		// as a typo.
+		baseline = (TAB_STRIP_H + MENU_BAR_H - sx(8)) - (TAB_STRIP_H + (MENU_BAR_H - h) * 0.5),
+		snap     = true,
+	}
+	label, chord := "Commands", command_chord(.Palette_Open)
+	w := ui.button_width(label, chord, m)
+	out.box = ui.button_layout(width - SCROLLBAR_W - w, TAB_STRIP_H + (MENU_BAR_H - h) * 0.5, label, chord, m)
 	out.sep_x = out.x - sx(7)
 	_, last_title_right := menu_title_rect(t, len(menus) - 1)
 	if out.sep_x <= last_title_right + sx(6) {return {}, false}
@@ -1351,6 +1355,10 @@ menu_bar_command :: proc(t: ^plat.Text, width: f32) -> (out: Menu_Bar_Command, o
 menu_bar_command_at :: proc(t: ^plat.Text, width, mx: f32) -> Command_Id {
 	c, ok := menu_bar_command(t, width)
 	if !ok {return .None}
+	// Y IS NOT CHECKED HERE, deliberately: menu_hit_test has already established
+	// the click is inside the bar row before calling this, and ui.button_hit's
+	// vertical bounds are the 22px item box inside a 30px row -- using it would
+	// make the top and bottom 4px of the bar dead where they are currently live.
 	if mx >= c.x && mx < c.x + c.w {return .Palette_Open}
 	return .None
 }

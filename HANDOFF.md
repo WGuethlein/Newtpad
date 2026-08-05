@@ -8520,6 +8520,49 @@ ewtpad.exe` was the **release** build at the time, GUI subsystem,
    which is what made a mode look like it was falling through to the GUI. **No mode hangs on its own.**
    Run them directly and read `$LASTEXITCODE`.
 
+## 6cy. Every control on one geometry (2026-08-05, v0.85.0, branch `refactor/controls-on-ui`)
+
+`find_actions` and `menu_bar_command` each computed a box, a label origin and a chord origin by hand —
+which is `ui.button_layout`'s job, written a second and third time. Both are `ui.Button` now, and their
+hit-tests read `ui.button_hit`. No behaviour change; verified live with both on screen at once.
+
+### `ui.Metrics.snap`
+
+`find_actions` was careful about something a naive fold would have dropped: it rounded every coordinate
+to a whole pixel, *"so the glyphs land on whole pixels rather than sampling between texels in the alpha
+atlas"*.
+
+Rounding belongs in the **producer**, not the draw. The alternative is a draw that rounds and a
+hit-test that does not — and half a pixel of divergence between them is the same seam bug as thirty,
+only harder to see. Opt-in because it is not free: rounding a *centred* glyph moves it up to half a
+pixel off centre, which is right for chrome text and wrong for a test asserting exact symmetry.
+
+`menu_bar_command_at` still checks x only, and now records why: `menu_hit_test` has already established
+the click is inside the bar row, and `button_hit`'s vertical bounds are the 22px item box inside a 30px
+row — using it would make the top and bottom 4px of the bar dead where they are currently live.
+
+### The sabotage found a gap instead of confirming the work
+
+Shifting the shared chord origin by 6px was caught by **nothing**. `menutest` and `metricstest` compare
+the *box* against the hit-test and never ask where the text inside it went, and the `ui` test "label and
+chord sit inside the box" has slack a 6px drift fits inside. The chord's offset from the label is pinned
+exactly now.
+
+**That is the fourth assertion this session that passed with room to spare until something moved into
+it** — after the checkbox centring tolerance, the palette's tautological gap check, and the table
+header-band probe that measured glyph ink. The pattern is worth naming: *an assertion written as "inside
+the box" or "within N" is measuring a bound, not a position, and a bound with slack is a bound something
+will eventually drift into.* Where a value is derivable, assert the value.
+
+### Owed
+
+- Extract the frame loop's context selection into a proc, so §6ct's Alt-reveal wiring becomes testable
+  rather than only live-verified. Next in the queue.
+- `Status_Cell` still carries its own geometry. It uses `ui.pack` for the drop but not `ui.Button` for
+  the cells; deliberately left alone this pass to keep the status bar out of a refactor it did not need.
+- The preview-vs-Obsidian work (fence face, `powershell` alias, lang label) is **deferred by Wyatt**,
+  2026-08-05 — see the register's diagnosis. Two of the three are ~2 lines.
+
 ## 7. Build environment (Windows, this machine)
 
 - **`build.bat` is the one build script.** `build.bat` = debug, **console subsystem** so the
