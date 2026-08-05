@@ -7989,6 +7989,71 @@ recommendation that the queue be reordered around a non-bug.
 - The left group is still one text run, not §13's three bordered cells. It carries five variable-length
   warning banners, which is why; the mockup has nowhere to put those.
 
+## 6co. `src/ui` becomes real, and the find bar moves onto it (2026-08-04, v0.75.0, branch `feat/ui-layer`)
+
+Wyatt's three calls: start `src/ui` properly rather than adding a `program/control.odin`; move the
+chips inline per the mockup; drop the Filter pill first, then the steppers, then close.
+
+### Why this package sat empty for sixteen batches, and what unlocked it
+
+The stub said `ui` "produces draw intent for the renderer". A `ui` that draws needs `plat.Gfx`,
+`plat.Text` and the theme — and the theme is in `program`. So every previous run at this extraction
+had to move the theme down first, which is how one button becomes a rewrite.
+
+CLAUDE.md's rule is narrower than "ui draws":
+
+> A widget's geometry is produced by exactly one `*_layout()` procedure, consumed by the draw *and*
+> the hit-test *and* the hover *and* the cursor.
+
+**It never says the producer must draw.** Splitting there gives a package that is pure arithmetic over
+`f32` and strings — no COM, no device, no theme, no `Document`. It satisfies "never calls Win32/COM
+directly" by construction rather than by discipline, and it is **the first layer besides `base` that
+`odin test` can reach**.
+
+**The boundary, for whoever extends it: `ui` decides where things are; `program` decides what they
+look like.** Advances cross the seam as numbers in `Metrics`, not as types, and `Button.tag` is an
+`int` rather than a `Command_Id` so nothing down there names a type that lives up here.
+
+`pack()` is the drop rule the status bar hand-rolled in §6cn, with that batch's lesson kept: **decide
+survival first, place second.** That is what keeps a right-aligned group flush instead of leaving a
+hole, and what lets the order be *intentional* rather than positional — the find bar drops its Filter
+pill before its close button, which no positional rule can express.
+
+### The find bar
+
+`find_toggles` owned three chips pinned hard right; everything else on the row was drawn inline in
+`render_frame`. It is now `find_controls`, one producer for all seven controls, with
+`find_control_at` reading it. The row is spec §12's: 46px caption, bordered field with a 2px accent
+ring and a real 2×15 caret, count right-aligned in a 62px column, chips inline, steppers, Filter pill,
+close.
+
+**Two commands had to exist first.** `.Find_Confirm` reads direction off the shift key *inside the
+action*, so "search backwards" was a gesture with no name and the `↑` had nothing to dispatch.
+`Find_Step_Next` / `Find_Step_Prev` also put both in the palette and the menus — §7 asks for exactly
+that, and `Shift+Enter` never satisfied it.
+
+**The count follows the spec's format**: `3 / 349`, `0 / 0` in danger. A count that stays a count keeps
+its column instead of changing width and shoving the chips sideways as you type.
+
+### The bug this batch would not have found by reading
+
+**`ui` measured labels in bytes.** Odin's `len()` on a string is bytes, and every glyph the row
+actually uses — `↑ ↓ ✕` — is multi-byte UTF-8, so a 3-byte arrow centred as though it were three cells
+and landed a cell and a half left. It was invisible in the pure tests because those used ASCII, and it
+only appeared when the real glyphs went in. `cells()` counts runes now; the test is pinned and was
+sabotaged back to bytes to watch it fail.
+
+The generalisable bit: **a pure layer's tests are only as honest as the data they use.** ASCII fixtures
+in a package whose entire job is measuring chrome glyphs tested the arithmetic and not the domain.
+
+### Owed
+
+- The replace row still uses `find_actions`' own geometry rather than `ui`. It is already single-
+  producer and seam-tested, so this is tidying, not a fix.
+- Filter mode's banner is §12's third mockup and untouched.
+- `menu_bar_command` (§6cn) and `status_cells` predate `ui` and could both be expressed with it. Doing
+  so would delete two hand-rolled drop rules.
+
 ## 7. Build environment (Windows, this machine)
 
 - **`build.bat` is the one build script.** `build.bat` = debug, **console subsystem** so the
