@@ -30708,22 +30708,83 @@ when NEWTPAD_TESTS {
 				UI_SCALE = 1
 				find_open(&od, false)
 
-				// 1. The chips are hit-testable, and each maps to its own command.
-				// They were drawn to look pressable with nothing behind them.
+				// 1. Every control on the row is hit-testable and maps to its own
+				// command. This used to cover only the three chips, which were
+				// drawn to look pressable with nothing behind them; the row now
+				// carries seven controls and the same rule has to hold for all of
+				// them.
 				W := f32(1280)
-				buf: [3]Find_Toggle
-				ts := find_toggles(&od, W, buf[:])
-				mt_chk(&bad, len(ts) == 3, fmt.tprintf("three mode chips exist (%d)", len(ts)))
+				mt: plat.Text
+				plat.text_load_faces(&mt)
+				buf: [FIND_CTL_MAX]Find_Ctl
+				ts := find_controls(&od, &mt, W, &buf)
+				mt_chk(&bad, len(ts) == FIND_CTL_MAX, fmt.tprintf("all %d controls fit at 1280 (%d)", FIND_CTL_MAX, len(ts)))
 				seen := 0
 				for t in ts {
-					// The chip's own middle, and the row it is drawn on.
-					got := find_toggle_at(&od, W, t.x + t.w * 0.5, CHROME_TOP + sx(FIND_BAR_H_96) * 0.5)
+					got := find_control_at(&od, &mt, W, t.x + t.w * 0.5, t.y + t.h * 0.5)
 					if got == t.cmd {seen += 1}
 				}
-				mt_chk(&bad, seen == 3, fmt.tprintf("every chip hit-tests to its own command (%d/3)", seen))
-				// Off the chips, and off the row, must both miss.
-				mt_chk(&bad, find_toggle_at(&od, W, sx(20), CHROME_TOP + sx(FIND_BAR_H_96) * 0.5) == .None, "a click in the query field is not a chip")
-				mt_chk(&bad, find_toggle_at(&od, W, ts[0].x + ts[0].w * 0.5, CHROME_TOP + sx(FIND_BAR_H_96) * 2) == .None, "a click below the chip row is not a chip")
+				mt_chk(&bad, seen == len(ts), fmt.tprintf("every control hit-tests to its own command (%d/%d)", seen, len(ts)))
+				// Distinct commands, or two controls do the same thing and one of
+				// them is a lie.
+				{
+					dupes := 0
+					for a, i in ts {
+						for b, j in ts {
+							if j > i && a.cmd == b.cmd {dupes += 1}
+						}
+					}
+					mt_chk(&bad, dupes == 0, fmt.tprintf("no two controls share a command (%d pair(s))", dupes))
+				}
+				// Off the controls, and off the row, must both miss.
+				mt_chk(&bad, find_control_at(&od, &mt, W, sx(20), CHROME_TOP + sx(FIND_BAR_H_96) * 0.5) == .None, "a click in the query field is not a control")
+				mt_chk(&bad, find_control_at(&od, &mt, W, ts[0].x + ts[0].w * 0.5, CHROME_TOP + sx(FIND_BAR_H_96) * 2) == .None, "a click below the row is not a control")
+				// Controls must not overlap the field they sit beside.
+				{
+					ix, _, iw, _ := find_input_box(&od, &mt, W, 0)
+					mt_chk(&bad, ts[0].x >= ix + iw, fmt.tprintf("the first control clears the input field (%.0f >= %.0f)", ts[0].x, ix + iw))
+				}
+				// The cluster stays flush right whatever survives -- the hole the
+				// status bar used to leave when it dropped before placing.
+				for wpx in ([]f32{1280, 1000, 820, 700, 620, 540, 460, 400}) {
+					cc := find_controls(&od, &mt, wpx, &buf)
+					if len(cc) == 0 {continue}
+					last := cc[len(cc) - 1]
+					mt_chk(&bad, abs(last.x + last.w - (wpx - sx(12))) < 1.5, fmt.tprintf("w=%4.0f the cluster is flush right (right edge %.0f, want %.0f)", wpx, last.x + last.w, wpx - sx(12)))
+				}
+				// Wyatt's drop order: Filter pill, then the steppers, then close;
+				// the chips and the count survive longest. The rule behind it is
+				// that everything dropped keeps a keyboard route, while the chips
+				// are the only things on the row that REPORT state.
+				{
+					has :: proc(cc: []Find_Ctl, cmd: Command_Id) -> bool {
+						for c in cc {
+							if c.cmd == cmd {return true}
+						}
+						return false
+					}
+					// Walk widths down and record the order things disappear.
+					gone: [dynamic]Command_Id
+					defer delete(gone)
+					prev := find_controls(&od, &mt, 1600, &buf)
+					pcmds: [FIND_CTL_MAX]Command_Id
+					pn := len(prev)
+					for c, i in prev {pcmds[i] = c.cmd}
+					for wpx := f32(1590); wpx >= 320; wpx -= 2 {
+						cc := find_controls(&od, &mt, wpx, &buf)
+						if len(cc) == pn {continue}
+						for i in 0 ..< pn {
+							if !has(cc, pcmds[i]) {append(&gone, pcmds[i])}
+						}
+						pn = len(cc)
+						for c, i in cc {pcmds[i] = c.cmd}
+					}
+					ok_order := len(gone) >= 3 && gone[0] == .Find_Toggle_Filter && (gone[1] == .Find_Step_Prev || gone[1] == .Find_Step_Next)
+					mt_chk(&bad, ok_order, fmt.tprintf("drop order is Filter, then the steppers, then close (got %v)", gone[:min(4, len(gone))]))
+					// And a chip is never the first thing to go.
+					chip_first := len(gone) > 0 && (gone[0] == .Find_Toggle_Case || gone[0] == .Find_Toggle_Word || gone[0] == .Find_Toggle_Regex)
+					mt_chk(&bad, !chip_first, "a chip is never dropped before a button")
+				}
 
 				// 2. Regex honours case and whole word. Both were ignored: the
 				// scan hardcoded Case_Insensitive and never looked at word
@@ -36652,7 +36713,7 @@ when NEWTPAD_TESTS {
 				// "+" ever goes away this pairing is what notices.
 				mm_chk(bad, partial, fmt.tprintf("find_mark_rects reports the set as partial: %v", partial))
 				info := find_status_info(&d)
-				mm_chk(bad, strings.has_suffix(info, "+)"), fmt.tprintf("the find bar says the set is partial: %q", info))
+				mm_chk(bad, strings.has_suffix(info, "+"), fmt.tprintf("the find bar says the set is partial: %q", info))
 			}
 			mm_truncated(&bad, mm_search)
 

@@ -53,6 +53,21 @@ label_and_chord_sit_inside_the_box :: proc(t: ^testing.T) {
 	testing.expect(t, b.cx > b.tx, "chord follows the label")
 }
 
+// Odin's len() on a string is BYTES. Every glyph these controls actually use is
+// multi-byte UTF-8 -- the find bar's ↑ ↓ ✕, the menu's ‹ ›. Measuring in bytes
+// centres a 3-byte arrow as though it were three cells, which lands it a cell
+// and a half off and reads as a wonky icon rather than as bad arithmetic.
+@(test)
+multibyte_glyphs_measure_as_one_cell :: proc(t: ^testing.T) {
+	arrow := button_square(0, 0, 24, "↑", M)
+	ascii := button_square(0, 0, 24, "x", M)
+	testing.expect_value(t, arrow.tx, ascii.tx)
+
+	// And in a labelled button, where the width is what drifts.
+	testing.expect_value(t, button_width("✕", "", M), button_width("x", "", M))
+	testing.expect_value(t, button_width("Filter", "Ctrl+L", M), f32(100))
+}
+
 @(test)
 square_centres_its_glyph :: proc(t: ^testing.T) {
 	b := button_square(0, 0, 24, "x", M)

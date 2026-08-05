@@ -1148,7 +1148,7 @@ main :: proc() {
 		if window.mouse_pressed && doc.find.active {
 			if c := find_action_at(doc, &text, f32(window.width), f32(window.mouse_x), f32(window.mouse_y)); c != .None {
 				command_dispatch(c, {}, &app, window, &text, srows)
-			} else if c := find_toggle_at(doc, f32(window.width), f32(window.mouse_x), f32(window.mouse_y)); c != .None {
+			} else if c := find_control_at(doc, &text, f32(window.width), f32(window.mouse_x), f32(window.mouse_y)); c != .None {
 				command_dispatch(c, {}, &app, window, &text, srows)
 			}
 		}
@@ -2542,30 +2542,64 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 		fbase := by + row_h * 0.5 + UI_PX * 0.35
 		cw := plat.text_char_width(text, UI_PX)
 
-		// Three toggles, always visible and always labelled. UI spec 12: "while
-		// regex is a hidden Ctrl+R state, there is no way to tell why a search is
-		// behaving oddly." Active ones take the accent fill, so the state is
-		// readable without hovering anything.
-		tbuf: [3]Find_Toggle
-		for t in find_toggles(doc, w, tbuf[:]) {
-			if t.on {
-				plat.quads_draw(gfx, quad_pipe, []plat.Quad{{pos = {t.x, by + sx(7)}, size = {t.w, row_h - sx(14)}, color = g_theme[.Accent], radius = {RADIUS_ROW, RADIUS_ROW, RADIUS_ROW, RADIUS_ROW}}})
-			}
-			lc := g_theme[.Bg_Base] if t.on else g_theme[.Text_Muted]
-			plat.text_draw(gfx, text, t.label, t.x + (t.w - f32(len(t.label)) * cw) * 0.5, fbase, UI_PX, lc)
+		scw := plat.text_char_width(text, UI_SMALL_PX)
+		mxp, myp := plat.window_cursor_client(window)
+		hovered := find_control_at(doc, text, w, f32(mxp), f32(myp))
+
+		// The caption column, then the bordered field. UI spec 12: a 46px label,
+		// then bg_base at radius 6 with a 2px accent ring -- the ring is what makes
+		// it read as a field you are typing into rather than a line of text that
+		// happens to have a cursor in it.
+		plat.text_draw(gfx, text, "Filter" if doc.filter else "Find", sx(12), fbase, UI_SMALL_PX, g_theme[.Text_Muted])
+		ix, iy, iw, ih := find_input_box(doc, text, w, 0)
+		ring := max(1, sx(2))
+		plat.quads_draw(
+			gfx,
+			quad_pipe,
+			[]plat.Quad {
+				{pos = {ix, iy}, size = {iw, ih}, color = g_theme[.Accent], radius = {RADIUS_TAB, RADIUS_TAB, RADIUS_TAB, RADIUS_TAB}},
+				{pos = {ix + ring, iy + ring}, size = {max(0, iw - ring * 2), max(0, ih - ring * 2)}, color = g_theme[.Bg_Base], radius = {RADIUS_TAB, RADIUS_TAB, RADIUS_TAB, RADIUS_TAB}},
+			},
+		)
+		qx := ix + sx(10)
+		plat.text_draw(gfx, text, string(f.query[:]), qx, fbase, UI_PX, g_theme[.Text_Bright])
+		if f.field == 0 {
+			// A real caret, 2x15 in accent (spec 12), not an underscore glyph --
+			// an underscore is a character in the field as far as the eye is
+			// concerned, and it moved with the font rather than with the metrics.
+			plat.quads_draw(gfx, quad_pipe, []plat.Quad{{pos = {snap(qx + f32(len(f.query)) * cw), iy + (ih - sx(15)) * 0.5}, size = {max(1, sx(2)), sx(15)}, color = g_theme[.Caret]}})
 		}
 
-		// The query, and the count beside it -- not in the status bar, "700
-		// pixels from where you are looking".
-		fcaret := "_" if f.field == 0 else ""
-		fline := fmt.tprintf("%s%s%s", "Filter: " if doc.filter else "Find: ", string(f.query[:]), fcaret)
-		plat.text_draw(gfx, text, fline, sx(12), fbase, UI_PX, g_theme[.Text_Primary])
+		// The count, right-aligned in its own 62px column so it stops moving as
+		// you type -- "the number you stare at while you type" cannot also be the
+		// thing that slides.
 		info := find_status_info(doc)
 		if info != "" {
-			ix := sx(12) + f32(len(fline)) * cw + sx(16)
-			// Zero results colours the count rather than beeping or shaking.
-			ic := g_theme[.Danger] if len(f.matches) == 0 && len(f.query) > 0 else g_theme[.Text_Muted]
-			plat.text_draw(gfx, text, info, ix, fbase, UI_PX, ic)
+			cr := find_count_right(doc, text, w)
+			ic := g_theme[.Danger] if len(f.matches) == 0 && len(f.query) > 0 else g_theme[.Text_Secondary]
+			plat.text_draw(gfx, text, info, cr - f32(len(info)) * scw, fbase, UI_SMALL_PX, ic)
+		}
+
+		// Every control on the row, from the one geometry find_control_at reads.
+		// Chips take the accent fill when engaged (spec 12: "always visible,
+		// always labelled" -- a hidden Ctrl+R state is why they exist).
+		cbuf: [FIND_CTL_MAX]Find_Ctl
+		for c in find_controls(doc, text, w, &cbuf) {
+			fill := [4]f32{}
+			switch {
+			case c.on:
+				fill = g_theme[.Accent]
+			case c.cmd == hovered:
+				fill = g_theme[.Bg_Hover]
+			}
+			if fill.a > 0 {
+				plat.quads_draw(gfx, quad_pipe, []plat.Quad{{pos = {c.x, c.y}, size = {c.w, c.h}, color = fill, radius = {RADIUS_ROW, RADIUS_ROW, RADIUS_ROW, RADIUS_ROW}}})
+			}
+			lc := g_theme[.Bg_Base] if c.on else g_theme[.Text_Secondary]
+			plat.text_draw(gfx, text, c.label, c.tx, c.ty, UI_SMALL_PX, lc)
+			if c.chord != "" {
+				plat.text_draw(gfx, text, c.chord, c.cx, c.ty, UI_SMALL_PX, g_theme[.Bg_Base] if c.on else g_theme[.Text_Muted])
+			}
 		}
 		if f.replace_mode {
 			rcaret := "_" if f.field == 1 else ""
@@ -2831,6 +2865,8 @@ metrics_recompute :: proc(rc: ^Render_Ctx) {
 	SCROLLBAR_W = dp(rc, SCROLLBAR_W_96)
 	SCROLLBAR_TRACK_W = dp(rc, SCROLLBAR_TRACK_W_96)
 	STATUS_BAR_H = dp(rc, STATUS_BAR_H_96)
+	FIND_LABEL_W = dp(rc, FIND_LABEL_W_96)
+	FIND_COUNT_W = dp(rc, FIND_COUNT_W_96)
 	RADIUS_MENU_BAR_ITEM = dp(rc, RADIUS_MENU_BAR_ITEM_96)
 	RADIUS_ROW = dp(rc, RADIUS_ROW_96)
 	RADIUS_TAB = dp(rc, RADIUS_TAB_96)

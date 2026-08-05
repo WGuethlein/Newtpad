@@ -181,6 +181,14 @@ Command_Id :: enum u8 {
 	// back out without closing the bar first. Wyatt, live use, 2026-07-29.
 	Find_Paste,
 	Find_Confirm,
+	// The two step verbs, split out for exactly the reason the replace verbs
+	// below were: .Find_Confirm reads DIRECTION off the shift key in the action,
+	// so "search backwards" could be spelled by one gesture and named nowhere. A
+	// button carries no key event, so the find bar's `↑` had nothing to dispatch.
+	// Naming them also puts both in the palette and the menus, which §7 asks for
+	// ("every command in it is also in a menu") and which Shift+Enter never was.
+	Find_Step_Next,
+	Find_Step_Prev,
 	Find_Field_Toggle,
 	Find_Toggle_Regex,
 	Find_Toggle_Case,
@@ -355,6 +363,8 @@ command_table := [Command_Id]Command {
 	.Find_Backspace           = {"Find: Delete Backward", "Search"},
 	.Find_Paste               = {"Find: Paste", "Search"},
 	.Find_Confirm             = {"Find: Confirm", "Search"},
+	.Find_Step_Next           = {"Find: Next Match", "Search"},
+	.Find_Step_Prev           = {"Find: Previous Match", "Search"},
 	.Find_Field_Toggle        = {"Find: Toggle Field", "Search"},
 	.Find_Toggle_Regex        = {"Find: Regex", "Search"},
 	.Find_Toggle_Case         = {"Find: Match Case", "Search"},
@@ -2249,6 +2259,14 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 				find_paste(doc, s)
 			}
 		}
+	case .Find_Step_Next:
+		// Read-only-safe by construction: stepping moves the caret and the view,
+		// and writes nothing. That is why these are NOT on command_mutates_doc
+		// while .Find_Confirm cannot be -- in the replace field that same command
+		// splices the buffer, and these two never can.
+		if doc.find.active {find_next(doc)}
+	case .Find_Step_Prev:
+		if doc.find.active {find_prev(doc)}
 	case .Find_Confirm:
 		if doc.find.field == 1 {
 			// Replace is a buffer write, and this is the one that got away: it

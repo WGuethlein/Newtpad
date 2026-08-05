@@ -27,6 +27,16 @@
 // not a type.
 package ui
 
+import "core:unicode/utf8"
+
+// Cells a label occupies on the chrome grid. RUNES, not bytes: Odin's len() on
+// a string counts bytes, and every glyph these controls actually use -- the find
+// bar's arrows and close, the menu's chevrons -- is multi-byte UTF-8. Centring a
+// 3-byte arrow as though it were three cells puts it a cell and a half left of
+// where it belongs, which reads as "the icon is off" and not as "the arithmetic
+// is wrong".
+cells :: proc(s: string) -> f32 {return f32(utf8.rune_count_in_string(s))}
+
 // Per-size text advances and the box metrics a control is built from. The caller
 // fills the advances from the platform's font measurement; ui cannot ask.
 //
@@ -60,8 +70,8 @@ Button :: struct {
 // The natural width of a button with this label and chord, before it is placed.
 // Split out so a caller can measure a control for `pack` without building it.
 button_width :: proc(label, chord: string, m: Metrics) -> f32 {
-	w := m.pad + f32(len(label)) * m.label_cw + m.pad
-	if chord != "" {w += m.gap + f32(len(chord)) * m.chord_cw}
+	w := m.pad + cells(label) * m.label_cw + m.pad
+	if chord != "" {w += m.gap + cells(chord) * m.chord_cw}
 	return w
 }
 
@@ -78,7 +88,7 @@ button_layout :: proc(x, y: f32, label, chord: string, m: Metrics, tag := 0) -> 
 	}
 	b.tx = x + m.pad
 	b.ty = y + m.baseline
-	b.cx = b.tx + f32(len(label)) * m.label_cw + m.gap
+	b.cx = b.tx + cells(label) * m.label_cw + m.gap
 	return b
 }
 
@@ -93,7 +103,7 @@ button_square :: proc(x, y, size: f32, label: string, m: Metrics, tag := 0) -> B
 		label = label,
 		tag   = tag,
 	}
-	b.tx = x + (size - f32(len(label)) * m.label_cw) * 0.5
+	b.tx = x + (size - cells(label) * m.label_cw) * 0.5
 	b.ty = y + m.baseline
 	b.cx = b.tx
 	return b
