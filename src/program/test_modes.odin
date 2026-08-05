@@ -9870,15 +9870,15 @@ when NEWTPAD_TESTS {
 				//    caller's synthetic emphasis reachable, and on a machine where
 				//    every installed family ships all four files it is otherwise
 				//    never executed.
-				full := plat.Font_Family{"F", "r.ttf", "b.ttf", "i.ttf", "z.ttf"}
-				none := plat.Font_Family{"N", "r.ttf", "", "", ""}
-				boldonly := plat.Font_Family{"B", "r.ttf", "b.ttf", "", ""}
-				f1, g1 := plat.font_style_file(full, .Bold)
-				f2, g2 := plat.font_style_file(full, .Bold_Italic)
-				f3, g3 := plat.font_style_file(none, .Bold)
-				f4, g4 := plat.font_style_file(none, .Italic)
-				f5, g5 := plat.font_style_file(boldonly, .Bold_Italic)
-				f6, g6 := plat.font_style_file(full, .Regular)
+				full := plat.Font_Family{"F", "r.ttf", "b.ttf", "i.ttf", "z.ttf", {}}
+				none := plat.Font_Family{"N", "r.ttf", "", "", "", {}}
+				boldonly := plat.Font_Family{"B", "r.ttf", "b.ttf", "", "", {}}
+				f1, g1, _ := plat.font_style_file(full, .Bold)
+				f2, g2, _ := plat.font_style_file(full, .Bold_Italic)
+				f3, g3, _ := plat.font_style_file(none, .Bold)
+				f4, g4, _ := plat.font_style_file(none, .Italic)
+				f5, g5, _ := plat.font_style_file(boldonly, .Bold_Italic)
+				f6, g6, _ := plat.font_style_file(full, .Regular)
 				fnt_chk(bad, f1 == "b.ttf" && g1 == .Bold, "font_style_file: a complete family returns its own bold file")
 				fnt_chk(bad, f2 == "z.ttf" && g2 == .Bold_Italic, "font_style_file: ...and its own bold-italic file")
 				fnt_chk(bad, f6 == "r.ttf" && g6 == .Regular, "font_style_file: regular is the regular file")
@@ -38575,6 +38575,146 @@ when NEWTPAD_TESTS {
 			d.filter = false
 
 			return mode_done("gutterseamtest", bad)
+		}
+
+		// `newtpad fontscantest` -- one argument, per the rule in
+		// development-loop.md 6: a mode that needs two and gets one falls through
+		// to the real GUI and hangs.
+		//
+		// This one is a MEASUREMENT as much as a test. What it can assert without
+		// knowing which fonts a given machine has: that the scan finds the
+		// families the curated table already vouches for, that everything it
+		// returns is monospaced by its own advance test, that the symbol fonts
+		// Windows always ships are excluded, and that every path it reports
+		// actually opens. The list itself is printed, because "which fonts did it
+		// find" is the question a human wants answered and no assertion can.
+		if os.args[1] == "fontscantest" {
+			bad := 0
+			fs_chk :: proc(bad: ^int, cond: bool, msg: string) {
+				fmt.printfln("  %-4s %s", "OK" if cond else "FAIL", msg)
+				if !cond {bad^ += 1}
+			}
+			fams := plat.font_scan(context.allocator)
+			fmt.printfln("--- font_scan found %d monospaced famil%s ---", len(fams), "y" if len(fams) == 1 else "ies")
+			for f in fams {
+				fmt.printfln(
+					"  %-28s r=%v b=%v i=%v bi=%v",
+					f.name,
+					f.regular != "",
+					f.bold != "",
+					f.italic != "",
+					f.bolditalic != "",
+				)
+			}
+			fs_chk(&bad, len(fams) > 0, fmt.tprintf("the scan found something at all (%d)", len(fams)))
+
+			has :: proc(fams: []plat.Scanned_Family, name: string) -> bool {
+				for f in fams {
+					if strings.equal_fold(f.name, name) {return true}
+				}
+				return false
+			}
+			// Consolas ships with Windows and is in the curated table, so a scan
+			// that misses it is broken rather than unlucky. This is the assertion
+			// that fails if the name table, the monospace probe or the directory
+			// walk regress.
+			fs_chk(&bad, has(fams, "Consolas"), "Consolas is found (it ships with Windows and is in FONT_FAMILIES)")
+
+			// The filter's whole job. These ship on every Windows and are exactly
+			// what a naive "IsMonospacedFont" or a bare directory listing would
+			// offer as editor fonts.
+			for junk in ([]string{"Marlett", "Wingdings", "Wingdings 2", "Webdings", "Symbol"}) {
+				fs_chk(&bad, !has(fams, junk), fmt.tprintf("%q is NOT offered", junk))
+			}
+			// Proportional faces must go too -- Segoe UI is in the fallback chain,
+			// so it is definitely present on disk and definitely not monospaced.
+			for prop in ([]string{"Segoe UI", "Arial", "Times New Roman", "Calibri"}) {
+				fs_chk(&bad, !has(fams, prop), fmt.tprintf("%q is NOT offered", prop))
+			}
+
+			// Every path must open. A family offered with a path that does not
+			// load is a choice that silently does nothing when picked -- the
+			// failure mode the "drop families with no regular" rule exists for.
+			missing := 0
+			for f in fams {
+				for path in ([]string{f.regular, f.bold, f.italic, f.bolditalic}) {
+					if path == "" {continue}
+					if !os.exists(path) {missing += 1}
+				}
+			}
+			fs_chk(&bad, missing == 0, fmt.tprintf("every reported path exists (%d missing)", missing))
+
+			// And the curated table's families that ARE installed should all turn
+			// up, since the scan is meant to be a superset of it.
+			curated_missing := 0
+			for cf in plat.FONT_FAMILIES {
+				if !plat.font_family_available(cf) {continue}
+				if !has(fams, cf.name) {
+					curated_missing += 1
+					fmt.printfln("       curated-but-unscanned: %s", cf.name)
+				}
+			}
+			fs_chk(&bad, curated_missing == 0, fmt.tprintf("every INSTALLED curated family is also scanned (%d missing)", curated_missing))
+			// THE ROUND TRIP, which is the whole point and the part that would fail
+			// silently. A scanned name has to reach real files through find_family
+			// and load -- if it does not, the family appears in the list and
+			// picking it quietly gives you Consolas instead.
+			plat.font_scan_publish(fams)
+			{
+				ft: plat.Text
+				plat.text_load_faces(&ft)
+				// A family the curated table does NOT name, so the load can only
+				// succeed via the scan. If every scanned family is also curated on
+				// this machine, say so rather than reporting a pass.
+				// PREFER A .ttc FAMILY. Collections are the case that was broken:
+				// text_load_family passed .TRUETYPE and face 0 for everything, so a
+				// family living inside simsun.ttc or msgothic.ttc resolved, loaded
+				// SOMETHING, and errored nothing -- you got whichever font happened
+				// to be face 0. A test that picked any non-curated family would have
+				// exercised a .ttf and missed it, which is what the first version
+				// did.
+				pick, pick_ttc := "", ""
+				for f in fams {
+					curated := false
+					for cf in plat.FONT_FAMILIES {
+						if strings.equal_fold(cf.name, f.name) {curated = true;break}
+					}
+					if curated {continue}
+					if pick == "" {pick = f.name}
+					if pick_ttc == "" && len(f.regular) > 4 && strings.equal_fold(f.regular[len(f.regular) - 4:], ".ttc") {
+						pick_ttc = f.name
+					}
+				}
+				if pick_ttc != "" {
+					fmt.printfln("       (picking %q -- it lives in a .ttc collection)", pick_ttc)
+					pick = pick_ttc
+				} else {
+					fmt.println("       (no scanned .ttc family here; the collection load path is UNTESTED on this machine)")
+				}
+				if pick == "" {
+					fmt.println("  --   every scanned family is also curated here; the scan-only load path is UNTESTED on this machine")
+				} else {
+					// RESOLVED, not merely loaded. text_load_family returns true for
+					// an unknown name too -- it loads the Consolas fallback, which
+					// is a face, so the bool cannot tell the two apart. Neither can
+					// the cell width: a first attempt compared it against Consolas
+					// and both measured 18.00, because a stroke font and Consolas
+					// genuinely share an advance ratio. font_family_known asks the
+					// only question that discriminates.
+					fs_chk(&bad, plat.font_family_known(pick), fmt.tprintf("a scan-only family RESOLVES (not the Consolas fallback): %q", pick))
+					fs_chk(&bad, plat.text_load_family(&ft, pick, .Regular, .Doc), fmt.tprintf("...and loads: %q", pick))
+					fs_chk(&bad, plat.text_char_width(&ft, 32) > 0, "...and measures a usable cell")
+					// The control: a name from nowhere must NOT resolve, or the
+					// assertion above would pass for anything.
+					fs_chk(&bad, !plat.font_family_known("Definitely Not Installed Mono"), "a made-up name does not resolve")
+				}
+			}
+			// text.odin's comment against enumeration is now stale in two of its
+			// three parts; the third (localized names) is answered by reading en-US
+			// only. Asserted here so the comment and the code cannot drift apart
+			// again: if someone reinstates a curated-only scan, this fails.
+			fs_chk(&bad, len(fams) >= len(plat.FONT_FAMILIES) / 2, fmt.tprintf("the scan is not a rounding error next to the curated table (%d vs %d)", len(fams), len(plat.FONT_FAMILIES)))
+			return mode_done("fontscantest", bad)
 		}
 
 		// `newtpad modeguardtest [path]` -- the guard on the guards.

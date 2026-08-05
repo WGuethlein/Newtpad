@@ -34,7 +34,10 @@ font_page_adjust :: proc(rc: ^Render_Ctx, row, dir: int) {
 	d := dir if dir != 0 else 1
 	switch row {
 	case 0:
-		if len(font_choices) == 0 {font_choices_refresh()}
+		// Start the system scan the first time a font list is shown, and rebuild
+		// once when it lands. `scan_merged` is what stops that being every frame.
+		font_scan_kick()
+		if len(font_choices) == 0 || (font_scan_landed() && !font_choices_scanned) {font_choices_refresh()}
 		i := font_choice_index(s.font_family)
 		s.font_family = font_choices[(i + d + len(font_choices)) % len(font_choices)]
 		settings_apply_font(rc)

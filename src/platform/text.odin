@@ -161,33 +161,66 @@ font_style_name :: proc(s: Font_Style) -> string {
 // A selectable family, with the file for each style. Empty means the family has
 // no such style and the regular file is used instead.
 //
-// A curated list of known code fonts, resolved by filename, rather than
-// enumerating the system font collection. Enumeration costs over a second on a
-// machine with many fonts — on the main thread, before the first frame — and
-// then needs filtering, because "monospaced" by the font's own metrics includes
-// Marlett, Wingdings, AutoCAD shape fonts and CJK faces, most of which would
-// wreck the cell grid if chosen. It also avoids six COM interfaces and the
-// localized-family-name problem entirely.
+// A curated list of known code fonts, resolved by filename. It is no longer the
+// ONLY source — fontscan.odin enumerates the system now — but it stays, and the
+// division is worth stating because it is not "curated because enumeration is
+// impossible" any more.
+//
+// WHAT THE CURATED TABLE IS FOR NOW: exact style files. An entry here names the
+// bold, italic and bold-italic files by hand, which is what lets text_load_family
+// load a real face instead of letting DirectWrite synthesise one — and synthetic
+// emphasis changes the advance, which the editor's cell grid cannot take. A
+// scanned family only knows what its files' name tables said, so where both
+// describe a family, find_family prefers this one.
+//
+// THIS COMMENT USED TO ARGUE AGAINST ENUMERATION, on three grounds. Recorded
+// with what happened to each, because two are answered and one was simply wrong:
+//
+//   - "costs over a second, on the main thread, before the first frame" —
+//     answered by moving it OFF the main thread and starting it lazily, when a
+//     font list is first shown. No frame waits for it. (settings.odin's
+//     font_scan_kick.)
+//   - "needs filtering, because monospaced by the font's own metrics includes
+//     Marlett, Wingdings, AutoCAD shape fonts and CJK faces" — half right.
+//     fontscan's probe excludes the symbol fonts by measurement rather than by
+//     charset, and they fail it twice over (varying advances AND missing glyphs).
+//     But CJK faces belong in the list: text_cell_width_at already returns width
+//     2 for full-width cells, so the grid handles them, and excluding them would
+//     have been the bug rather than the filter. AutoCAD's TrueType technical
+//     fonts (ISOCT*, Monotxt) DO pass, and are offered — they genuinely are
+//     monospaced text faces, however odd a choice.
+//   - "avoids six COM interfaces and the localized-family-name problem" — the
+//     COM count was the real objection and it was an undercount (eight). Avoided
+//     entirely by reading the name table directly; see base/sfnt.odin. The
+//     localized-name problem is answered by reading en-US ONLY, because the
+//     chosen family is stored in settings.txt as a plain string.
 Font_Family :: struct {
 	name:                              string,
 	regular, bold, italic, bolditalic: string,
+	// Face index within the file, per slot above. Zero for every curated entry --
+	// they all name single-font .ttf files. A SCANNED family may point into a .ttc
+	// collection (simsun.ttc holds SimSun and NSimSun; msgothic.ttc holds three),
+	// where the path alone does not say which font is meant. Offering such a family
+	// without this loaded face 0 of the collection, which returns a face and errors
+	// nothing -- you simply got a different font than the one you picked.
+	idx: [4]u32,
 }
 
 FONT_FAMILIES := [?]Font_Family {
-	{"Consolas", "consola.ttf", "consolab.ttf", "consolai.ttf", "consolaz.ttf"},
-	{"Cascadia Mono", "CascadiaMono.ttf", "", "", ""},
-	{"Cascadia Code", "CascadiaCode.ttf", "", "", ""},
-	{"Courier New", "cour.ttf", "courbd.ttf", "couri.ttf", "courbi.ttf"},
-	{"Lucida Console", "lucon.ttf", "", "", ""},
-	{"Lucida Sans Typewriter", "LTYPE.TTF", "LTYPEB.TTF", "LTYPEO.TTF", ""},
-	{"DejaVu Sans Mono", "DejaVuSansMono.ttf", "DejaVuSansMono-Bold.ttf", "DejaVuSansMono-Oblique.ttf", ""},
-	{"JetBrains Mono", "JetBrainsMono-Regular.ttf", "JetBrainsMono-Bold.ttf", "JetBrainsMono-Italic.ttf", ""},
-	{"Fira Code", "FiraCode-Regular.ttf", "FiraCode-Bold.ttf", "", ""},
-	{"Source Code Pro", "SourceCodePro-Regular.ttf", "SourceCodePro-Bold.ttf", "SourceCodePro-It.ttf", ""},
-	{"IBM Plex Mono", "IBMPlexMono-Regular.ttf", "IBMPlexMono-Bold.ttf", "IBMPlexMono-Italic.ttf", ""},
-	{"Hack", "Hack-Regular.ttf", "Hack-Bold.ttf", "Hack-Italic.ttf", ""},
-	{"Iosevka", "iosevka-regular.ttf", "iosevka-bold.ttf", "iosevka-italic.ttf", ""},
-	{"Ubuntu Mono", "UbuntuMono-R.ttf", "UbuntuMono-B.ttf", "UbuntuMono-RI.ttf", ""},
+	{"Consolas", "consola.ttf", "consolab.ttf", "consolai.ttf", "consolaz.ttf", {}},
+	{"Cascadia Mono", "CascadiaMono.ttf", "", "", "", {}},
+	{"Cascadia Code", "CascadiaCode.ttf", "", "", "", {}},
+	{"Courier New", "cour.ttf", "courbd.ttf", "couri.ttf", "courbi.ttf", {}},
+	{"Lucida Console", "lucon.ttf", "", "", "", {}},
+	{"Lucida Sans Typewriter", "LTYPE.TTF", "LTYPEB.TTF", "LTYPEO.TTF", "", {}},
+	{"DejaVu Sans Mono", "DejaVuSansMono.ttf", "DejaVuSansMono-Bold.ttf", "DejaVuSansMono-Oblique.ttf", "", {}},
+	{"JetBrains Mono", "JetBrainsMono-Regular.ttf", "JetBrainsMono-Bold.ttf", "JetBrainsMono-Italic.ttf", "", {}},
+	{"Fira Code", "FiraCode-Regular.ttf", "FiraCode-Bold.ttf", "", "", {}},
+	{"Source Code Pro", "SourceCodePro-Regular.ttf", "SourceCodePro-Bold.ttf", "SourceCodePro-It.ttf", "", {}},
+	{"IBM Plex Mono", "IBMPlexMono-Regular.ttf", "IBMPlexMono-Bold.ttf", "IBMPlexMono-Italic.ttf", "", {}},
+	{"Hack", "Hack-Regular.ttf", "Hack-Bold.ttf", "Hack-Italic.ttf", "", {}},
+	{"Iosevka", "iosevka-regular.ttf", "iosevka-bold.ttf", "iosevka-italic.ttf", "", {}},
+	{"Ubuntu Mono", "UbuntuMono-R.ttf", "UbuntuMono-B.ttf", "UbuntuMono-RI.ttf", "", {}},
 }
 
 // Proportional body faces for the markdown preview, in preference order.
@@ -203,25 +236,55 @@ FONT_FAMILIES := [?]Font_Family {
 // last-ditch proportional face -- Newtpad embeds no fonts until batch 20, so
 // everything here has to already be on the machine.
 BODY_FAMILIES := [?]Font_Family {
-	{"Georgia", "georgia.ttf", "georgiab.ttf", "georgiai.ttf", "georgiaz.ttf"},
-	{"Constantia", "constan.ttf", "constanb.ttf", "constani.ttf", "constanz.ttf"},
-	{"Times New Roman", "times.ttf", "timesbd.ttf", "timesi.ttf", "timesbi.ttf"},
-	{"Segoe UI", "segoeui.ttf", "segoeuib.ttf", "segoeuii.ttf", "segoeuiz.ttf"},
+	{"Georgia", "georgia.ttf", "georgiab.ttf", "georgiai.ttf", "georgiaz.ttf", {}},
+	{"Constantia", "constan.ttf", "constanb.ttf", "constani.ttf", "constanz.ttf", {}},
+	{"Times New Roman", "times.ttf", "timesbd.ttf", "timesi.ttf", "timesbi.ttf", {}},
+	{"Segoe UI", "segoeui.ttf", "segoeuib.ttf", "segoeuii.ttf", "segoeuiz.ttf", {}},
 }
 
 // The Windows font directory. Read from the environment rather than hardcoded:
 // %SystemRoot% is not C:\Windows on every machine (imaged corporate builds,
 // multi-boot), and a wrong path meant no faces loaded at all and the app failed
 // to start.
-@(private = "file")
+//
+// Package-visible, not file-private: fontscan.odin walks the same directory, and
+// a second copy of "where fonts live" is the thing this comment already explains
+// the cost of getting wrong.
+@(private)
 fonts_dir :: proc(allocator := context.temp_allocator) -> string {
 	root := os.get_env("SystemRoot", context.temp_allocator)
 	if root == "" {root = "C:\\Windows"}
 	return strings.concatenate({root, "\\Fonts\\"}, allocator)
 }
 
+// The user's own font directory. "Install for me only" is the DEFAULT in the
+// Windows font installer, and it puts nothing in %SystemRoot%\Fonts -- which is
+// where most developer fonts actually land, since installing them does not
+// require admin. A scan that looked only at the system directory would miss
+// exactly the fonts the person who wanted enumeration went and installed.
+fonts_dir_user :: proc(allocator := context.temp_allocator) -> string {
+	local := os.get_env("LOCALAPPDATA", context.temp_allocator)
+	if local == "" {return ""}
+	return strings.concatenate({local, "\\Microsoft\\Windows\\Fonts\\"}, allocator)
+}
+
+// Resolve a Font_Family's file reference to a path.
+//
+// The curated table names BARE FILENAMES ("consola.ttf") and always meant
+// %SystemRoot%\Fonts. Enumerated families carry ABSOLUTE paths, because a
+// per-user font is not in that directory at all. Both go through here, so the
+// two kinds of entry coexist rather than the table having to be rewritten.
+//
+// "Absolute" is decided by a drive letter or a leading separator -- crude, and
+// sufficient: every path on either side of this is machine-generated.
+font_file_path :: proc(file: string, allocator := context.temp_allocator) -> string {
+	if len(file) >= 2 && file[1] == ':' {return strings.clone(file, allocator)}
+	if len(file) >= 1 && (file[0] == '\\' || file[0] == '/') {return strings.clone(file, allocator)}
+	return strings.concatenate({fonts_dir(), file}, allocator)
+}
+
 font_family_available :: proc(f: Font_Family) -> bool {
-	return os.exists(strings.concatenate({fonts_dir(), f.regular}, context.temp_allocator))
+	return os.exists(font_file_path(f.regular))
 }
 
 // Fallbacks appended after the chosen family, for codepoints it lacks.
@@ -517,7 +580,27 @@ find_family :: proc(name: string, set: Font_Set) -> (fam: Font_Family, found: bo
 	for f in FONT_FAMILIES {
 		if f.name == name {return f, true}
 	}
+	// Then the system scan. Curated LAST-resort order is deliberate: a curated
+	// entry names exact bold/italic files, and a scanned one only knows what the
+	// name table said, so where both describe a family the curated one wins.
+	for sf in g_scanned {
+		if sf.name == name {
+			return Font_Family{name = sf.name, regular = sf.regular, bold = sf.bold, italic = sf.italic, bolditalic = sf.bolditalic, idx = sf.idx}, true
+		}
+	}
 	return FONT_FAMILIES[0], false
+}
+
+// Does this name resolve to a real family, curated or scanned?
+//
+// find_family returns FONT_FAMILIES[0] with found=false for an unknown name, and
+// text_load_family then loads that fallback and returns TRUE -- correctly, since
+// a face did load. So neither of those can tell a caller "the family you asked
+// for exists". This can, and it is the only honest way to assert that a scanned
+// family is reachable rather than silently becoming Consolas.
+font_family_known :: proc(name: string, set := Font_Set.Doc) -> bool {
+	_, found := find_family(name, set)
+	return found
 }
 
 // The file `fam` ships for `style`, and the style that file ACTUALLY is.
@@ -532,18 +615,18 @@ find_family :: proc(name: string, set: Font_Set) -> (fam: Font_Family, found: bo
 // no bold at all. That case is not otherwise reachable on a machine where every
 // installed family happens to be complete, which is exactly when the "keep the
 // caller's synthetic bold" path would go untested and rot.
-font_style_file :: proc(fam: Font_Family, style: Font_Style) -> (file: string, got: Font_Style) {
-	file, got = fam.regular, .Regular
+font_style_file :: proc(fam: Font_Family, style: Font_Style) -> (file: string, got: Font_Style, index: u32) {
+	file, got, index = fam.regular, .Regular, fam.idx[0]
 	switch style {
 	case .Bold:
-		if fam.bold != "" {file, got = fam.bold, .Bold}
+		if fam.bold != "" {file, got, index = fam.bold, .Bold, fam.idx[1]}
 	case .Italic:
-		if fam.italic != "" {file, got = fam.italic, .Italic}
+		if fam.italic != "" {file, got, index = fam.italic, .Italic, fam.idx[2]}
 	case .Bold_Italic:
 		if fam.bolditalic != "" {
-			file, got = fam.bolditalic, .Bold_Italic
+			file, got, index = fam.bolditalic, .Bold_Italic, fam.idx[3]
 		} else if fam.bold != "" {
-			file, got = fam.bold, .Bold
+			file, got, index = fam.bold, .Bold, fam.idx[1]
 		}
 	case .Regular:
 	}
@@ -611,7 +694,20 @@ face_char_em :: proc(face: ^IFontFace, units: f32) -> f32 {
 @(private = "file")
 add_face :: proc(t: ^Text, c: ^Face_Chain, file_name: string, kind: FONT_FACE_TYPE, index: u32) -> bool {
 	if c.n >= MAX_FACES {return false}
-	path := strings.concatenate({fonts_dir(), file_name}, context.temp_allocator)
+	path := font_file_path(file_name)
+	// The container kind comes from the EXTENSION, not the caller. Every caller
+	// passed .TRUETYPE, which is right for a .ttf and wrong for a .ttc --
+	// CreateFontFace refuses a collection asked for as a single font, so a scanned
+	// family living in one could not load at all.
+	container := kind
+	if len(path) > 4 {
+		switch path[len(path) - 4:] {
+			case ".ttc", ".TTC":
+				container = .OPENTYPE_COLLECTION
+			case ".otf", ".OTF":
+				container = .CFF
+		}
+	}
 	// NOT wide_path: a font file lives under %SystemRoot%\Fonts and is always far
 	// short of MAX_PATH, and DirectWrite's CreateFontFileReference is not one of
 	// the APIs \\?\ is documented to work with.
@@ -621,7 +717,7 @@ add_face :: proc(t: ^Text, c: ^Face_Chain, file_name: string, kind: FONT_FACE_TY
 		return false // not present on this machine
 	}
 	face: ^IFontFace
-	if hr := t.factory->CreateFontFace(kind, 1, &file, index, .NONE, &face); !win.SUCCEEDED(hr) {
+	if hr := t.factory->CreateFontFace(container, 1, &file, index, .NONE, &face); !win.SUCCEEDED(hr) {
 		file->Release()
 		return false
 	}
@@ -646,12 +742,12 @@ text_load_family :: proc(t: ^Text, family: string, style: Font_Style, set := Fon
 	}
 
 	chosen, _ := find_family(family, set)
-	file, got := font_style_file(chosen, style)
+	file, got, fidx := font_style_file(chosen, style)
 
 	// Build into a scratch chain so a failure can't strand us faceless.
 	fresh: Face_Chain
-	if !add_face(t, &fresh, file, .TRUETYPE, 0) {
-		if file == chosen.regular || !add_face(t, &fresh, chosen.regular, .TRUETYPE, 0) {
+	if !add_face(t, &fresh, file, .TRUETYPE, fidx) {
+		if file == chosen.regular || !add_face(t, &fresh, chosen.regular, .TRUETYPE, chosen.idx[0]) {
 			for i in 0 ..< fresh.n {fresh.faces[i]->Release()}
 			return false
 		}
