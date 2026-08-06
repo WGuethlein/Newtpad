@@ -79,9 +79,10 @@ Two more overrules of the spec, from live use on 2026-08-05:
 
 ## What next
 
-1. **Extract the frame loop's context selection into a proc.** The Alt-reveal fix (§6ct) is verified only
-   by a live pass; its test drives `menu_close` directly and cannot prove the frame loop *reaches* it,
-   because the context choice is inline in `main.odin`. This is the smallest real improvement available.
+1. ~~**Extract the frame loop's context selection into a proc.**~~ **DONE v0.86.0 (HANDOFF §6cz).** The
+   whole per-event decision — cell-edit intercept, context priority, `resolve_key`, both `menu_close`
+   rules — is `key_route` in `commands.odin`, and `keytest`/`metricstest` now drive it. Deleting the
+   guard §6ct says leaves the suite green fails four assertions across two modes.
 2. **The preview vs Obsidian** — **deferred by Wyatt on 2026-08-05** ("push it off, there are other
    issues"), and diagnosed in the sweep: a fence with no resolved lexer renders in the **proportional
    serif** face; ` ```powershell ` resolves no lexer though `.ps1` has one; no lang label. **Two of the

@@ -8698,6 +8698,84 @@ will eventually drift into.* Where a value is derivable, assert the value.
 - The preview-vs-Obsidian work (fence face, `powershell` alias, lang label) is **deferred by Wyatt**,
   2026-08-05 — see the register's diagnosis. Two of the three are ~2 lines.
 
+## 6cz. The frame loop's key routing becomes a proc (2026-08-05, v0.86.0, branch `refactor/key-route-proc`)
+
+The item §6cy and §6cm-z both put first. §6ct's stuck Alt reveal was fixed on 2026-08-05 and could only
+be verified by a live pass, because the thing that was broken — *whether the frame loop reaches
+`menu_close`* — lived inline in `main.odin`'s key loop and no headless mode could call it. Its test
+drives `menu_close` directly, which pins what the exit does and nothing about the wiring; §6ct recorded
+that limit in the test rather than letting a green line read as more than it was.
+
+`key_route` (`commands.odin`) is that loop body, minus `command_dispatch`. **Wyatt took the widest of the
+three scopes offered**, so it is the whole per-event decision in one place: the table cell-edit intercept,
+the context priority (`.Font`/`.Settings` > `.History` > `.Menu` > `.Palette` > `.Find` > `.Editor`),
+`resolve_key`, and both `menu_close` rules. The loop is now three lines.
+
+### It performs the effects rather than returning a flag
+
+A proc that returned "the caller should close the menu" would rebuild the exact seam §6ct came from — a
+decision in one place, its effect in another, and nothing able to observe the join. Calling `menu_close`
+inside means a mode asserts `app.menu.revealed` after the call and has proved the chain end to end. The
+one uncovered step is now a single call in the loop body, down from the whole decision.
+
+It takes **no `^plat.Window` and no `^plat.Text`** — every callee on these paths is `app`/`doc`-only —
+which is what makes it reachable at all. `command_dispatch` is what needs the window, and it stayed put.
+
+### The priority is tested by peeling
+
+Every surface is switched on at once and then turned off from the top, so each assertion states which
+context *beats the ones still active*. Six independent setups would pass with the chain in any order;
+this cannot. Hoisting `.Menu` above `.Settings` as a sabotage failed three `keytest` lines and four in
+`metricstest`.
+
+`metricstest`'s §6ct block now routes a real key event on a real Settings page instead of calling
+`menu_close` itself, and its comment no longer has to admit the gap.
+
+### Three isolated sabotages, each with its own failure
+
+| Sabotage | Result |
+|---|---|
+| Delete `if ctx != .Menu && app.menu.revealed` — **the deletion §6ct says leaves the suite green** | `keytest` 1 FAIL, `metricstest` 3 FAIL, both exit 1 |
+| Hoist `.Menu` above the full-page surfaces | `keytest` 3 FAIL, `metricstest` 4 FAIL |
+| Drop `!ev.ctrl && !ev.alt` from the cell-edit guard | `keytest` 1 FAIL (`Ctrl+Esc` consumed and cancelled the edit) |
+
+Applied and reverted one at a time, per the lesson from the locale/UTF-16 pair that masked each other.
+
+### The negative assertion is the one that matters
+
+"A key routed outside the menus ends the reveal" passes under `menu_close` called unconditionally. The
+line beside it — *a key going **to** the menu keeps it* — is what makes the pair mean the rule. Same
+shape as the four slack assertions §6cy names, caught before it shipped rather than after.
+
+### What the sweep found, which is the point of sweeping the whole list
+
+`tablegridtest` went red. Not a behaviour regression: its **F1** check counts the literal string
+`command_dispatch(cmd, ev, &app, window, &text, srows)` in `main.odin`'s source, because the frame loop
+has no message pump under test and a source count was all that was left. `cmd` became `r.cmd` and the
+count went to zero.
+
+That is the check working — it cannot tell a rename from the regression, so it reports both. The literal
+is restated exactly and now carries a note saying so, because the wrong repair is to loosen the count.
+**This is `rulestest`'s shape** (red for nine releases over a label) caught on the first sweep instead of
+the ninth, and only because the sweep ran all 85 runnable modes rather than the four the change looked
+like it touched.
+
+### Three timeouts from one documented trap
+
+`filtertest`, `repltest` and `savetest` were each run with a path and no further argument. All three
+carry `&& len(os.args) > 3` on their `case`, so a short invocation misses the arm, reaches `case:` and
+**falls through to the real GUI**, where it sits until killed. §7 listed the eight file-argument modes
+and not their arity; it does now.
+
+### Owed
+
+- `Status_Cell` still carries its own geometry (`ui.pack`, not `ui.Button`) — unchanged from §6cy.
+- The preview-vs-Obsidian work stays **deferred by Wyatt**.
+- One observation, deliberately not acted on: within a frame, `doc` is stale after a mid-loop tab switch
+  while `.find.active` is read fresh through `app_active`, so two keys in one frame across `Ctrl+Tab`
+  resolve the second one's context from the *previous* document's `kind`. Pre-existing and rare. The
+  extraction preserved it exactly — this was a refactor — but it now has one call site and a name.
+
 ## 7. Build environment (Windows, this machine)
 
 - **`build.bat` is the one build script.** `build.bat` = debug, **console subsystem** so the
@@ -8755,6 +8833,13 @@ will eventually drift into.* Where a value is derivable, assert the value.
     people stop reading. `mdperftest` and `rulestest` keep their gates in the exit code: both carry
     a *measured* debug multiplier rather than a bare number, and both exist to be that gate.
   - File-argument modes: `<file> count|keytest|findtest|filtertest|repltest|edittest|seltest|savetest`
+  - **Four of those eight need a THIRD argument and open the GUI without it** — their `case` arms
+    carry `&& len(os.args) > 3` (`> 4` for `repltest`), so a short invocation misses the arm, hits
+    `case:` and falls through to the real window, where it hangs until something kills it.
+    `findtest <file> <query> [rx]`, `filtertest <file> <query>`, `repltest <file> <query> <repl>`,
+    `savetest <file> <outpath>`. Cost three separate timeouts in one sweep on 2026-08-05 — the trap
+    development-loop.md §6 already names, from a list that named the modes and not their arity.
+    `count`, `edittest`, `seltest` and `keytest` take the path alone.
   - `jsonperf <file.json>` is a **measurement**, not a test: it prints input/output size, format
     time and peak bytes for one file and always exits 0. It exists because `JSON_FORMAT_MAX` was
     first picked by reasoning and the reasoning was wrong (§6bl). Re-measure with it before moving
