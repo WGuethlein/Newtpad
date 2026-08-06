@@ -472,6 +472,119 @@ when NEWTPAD_TESTS {
 			fmt.printfln("  %-6s the LEFT press is left alone, it has a terminal consumer (left=%v)", "ok" if okl else "FAIL", ow.mouse_pressed)
 		}
 
+		// THE FRAME LOOP'S KEY ROUTING, which is a proc as of 2026-08-05.
+		//
+		// Everything main.odin's key loop does with an event except run it lives in
+		// key_route (commands.odin): the table cell-edit intercept, the context
+		// priority, resolve_key, and the two menu_close rules. It was inline in the
+		// loop until now, so no mode could call it -- and §6ct's stuck Alt reveal was
+		// a bug in exactly that wiring, verified only by a live pass because its test
+		// could reach menu_close and not the decision to call it.
+		//
+		// THE PRIORITY IS TESTED BY PEELING, not by six independent setups. Every
+		// surface is switched on at once and then turned off from the top, so each
+		// assertion states which context BEATS the ones still active. A per-surface
+		// test would pass with the chain in any order; this one cannot.
+		//
+		// Its own local proc, and one App: keytest_run already holds one, and
+		// development-loop.md §6 records `blocktest` hitting a real
+		// STATUS_STACK_OVERFLOW from two live App frames under this dispatcher.
+		kr_cases :: proc(bad: ^int) {
+			kr_chk :: proc(bad: ^int, got, want: Ctx, label: string) {
+				ok := got == want
+				if !ok {bad^ += 1}
+				fmt.printfln("  %-6s %-46s -> %v", "ok" if ok else "FAIL", label, got)
+			}
+			ka: App
+			menu_init(&ka.menu) // a zeroed App has menu.open == 0, i.e. "menu 0 is open"
+			app_new_scratch(&ka)
+			defer app_destroy(&ka)
+			kd := app_active(&ka)
+			ev :: proc(k: plat.Key, ctrl := false, alt := false) -> plat.Key_Event {
+				return {key = k, ctrl = ctrl, alt = alt}
+			}
+
+			kd.kind = .Font
+			ka.history.open = true
+			ka.menu.mode = true
+			ka.palette.active = true
+			find_open(kd, false)
+			kr_chk(bad, key_route(&ka, kd, ev(.Down), 0).ctx, .Font, "Font page outranks everything")
+			kd.kind = .Settings
+			kr_chk(bad, key_route(&ka, kd, ev(.Down), 0).ctx, .Settings, "Settings outranks history/menu/palette/find")
+			kd.kind = .Text
+			kr_chk(bad, key_route(&ka, kd, ev(.Down), 0).ctx, .History, "history outranks menu/palette/find")
+			ka.history.open = false
+			ka.menu.mode = true // the reveal rule below cleared it; put it back
+			kr_chk(bad, key_route(&ka, kd, ev(.Down), 0).ctx, .Menu, "menu outranks palette/find")
+			ka.menu.mode = false
+			kr_chk(bad, key_route(&ka, kd, ev(.Down), 0).ctx, .Palette, "palette outranks find")
+			ka.palette.active = false
+			kr_chk(bad, key_route(&ka, kd, ev(.Down), 0).ctx, .Find, "find outranks the editor")
+			find_close(kd)
+			kr_chk(bad, key_route(&ka, kd, ev(.Down), 0).ctx, .Editor, "and the editor is the floor")
+
+			// §6ct, through the routing rather than beside it. On a full-page surface
+			// an Alt reveal used to survive every later key, because .Settings and
+			// .Font outrank .Menu and nothing else reached menu_close.
+			kd.kind = .Settings
+			ka.menu.revealed = true
+			r_pg := key_route(&ka, kd, ev(.Down), 0)
+			cleared := !ka.menu.revealed
+			if !cleared {bad^ += 1}
+			fmt.printfln("  %-6s %-46s -> ctx=%v revealed=%v", "ok" if cleared else "FAIL", "a key on the Settings page ends the reveal", r_pg.ctx, ka.menu.revealed)
+			// The NEGATIVE, without which "always call menu_close" would pass the line
+			// above: while the keys really are going to the menu, the reveal is what is
+			// holding the bar up and must survive.
+			kd.kind = .Text
+			ka.menu.mode = true
+			ka.menu.revealed = true
+			r_mn := key_route(&ka, kd, ev(.Down), 0)
+			kept := ka.menu.revealed && r_mn.ctx == .Menu && ka.menu.mode
+			if !kept {bad^ += 1}
+			fmt.printfln("  %-6s %-46s -> ctx=%v revealed=%v", "ok" if kept else "FAIL", "...but a key going TO the menu keeps it", r_mn.ctx, ka.menu.revealed)
+			// A global chord taken with the menu open closes it first, and still
+			// resolves -- the close must not eat the command.
+			ka.menu.mode = true
+			r_gl := key_route(&ka, kd, ev(.S, ctrl = true), 0)
+			glob := r_gl.cmd == .Save && !menu_is_active(&ka)
+			if !glob {bad^ += 1}
+			fmt.printfln("  %-6s %-46s -> cmd=%v active=%v", "ok" if glob else "FAIL", "Ctrl+S with the menu open closes it AND saves", r_gl.cmd, menu_is_active(&ka))
+			// ...while a menu key leaves the menu open, or arrowing a dropdown would
+			// dismiss it on the first press.
+			ka.menu.mode = true
+			ka.menu.open = 0
+			r_mk := key_route(&ka, kd, ev(.Down), 0)
+			menu_key := is_menu_cmd(r_mk.cmd) && menu_is_active(&ka)
+			if !menu_key {bad^ += 1}
+			fmt.printfln("  %-6s %-46s -> cmd=%v active=%v", "ok" if menu_key else "FAIL", "...a menu key does not", r_mk.cmd, menu_is_active(&ka))
+			menu_close(&ka)
+
+			// The cell-edit intercept: it owns the editing keys while a cell is being
+			// edited, and only unmodified ones. Escape and Left are the two arms that
+			// touch no buffer, so they can be driven on a synthetic edit state; the
+			// commit arms are covered against real grids by tablegridtest.
+			kd.table = true
+			kd.table_editing = true
+			r_esc := key_route(&ka, kd, ev(.Escape), 0)
+			esc_ok := r_esc.consumed && !kd.table_editing
+			if !esc_ok {bad^ += 1}
+			fmt.printfln("  %-6s %-46s -> consumed=%v editing=%v", "ok" if esc_ok else "FAIL", "Esc in a cell edit is consumed and cancels", r_esc.consumed, kd.table_editing)
+			kd.table_editing = true
+			r_ctrl := key_route(&ka, kd, ev(.Escape, ctrl = true), 0)
+			ctrl_ok := !r_ctrl.consumed && kd.table_editing
+			if !ctrl_ok {bad^ += 1}
+			fmt.printfln("  %-6s %-46s -> consumed=%v editing=%v", "ok" if ctrl_ok else "FAIL", "...but Ctrl+Esc is not -- the guard is !ctrl && !alt", r_ctrl.consumed, kd.table_editing)
+			// A key the intercept does not name falls through to the ordinary routing
+			// even mid-edit. As-built, pinned so it is a decision and not a surprise.
+			r_up := key_route(&ka, kd, ev(.Up), 0)
+			up_ok := !r_up.consumed && r_up.cmd == .Cursor_Up
+			if !up_ok {bad^ += 1}
+			fmt.printfln("  %-6s %-46s -> consumed=%v cmd=%v", "ok" if up_ok else "FAIL", "Up is not an intercept arm, so it still routes", r_up.consumed, r_up.cmd)
+			kd.table, kd.table_editing = false, false
+		}
+		kr_cases(&bad)
+
 		// NOT the only mode that exits non-zero -- 18 `os.exit(1)` sites live in this
 		// file as of this count (`grep -c` on the literal), and this branch alone
 		// added three of them (menutest, settingstest, tablesorttest). This one earns
@@ -31097,24 +31210,28 @@ when NEWTPAD_TESTS {
 					// down for the rest of the session, holding content 30px lower, on
 					// a page where Alt reaches nothing. Only focus loss recovered it.
 					//
-					// WHAT THIS DOES AND DOES NOT COVER, because the difference is the
-					// bug itself. It drives menu_close directly, so it pins that the exit
-					// CLEARS both flags and that MENU_BAR_SHOWN follows. It does NOT prove
-					// the frame loop REACHES that exit -- the context selection is inline
-					// in main.odin and cannot be called from here, and reaching it was
-					// precisely what was broken. Deleting the frame-loop guard leaves this
-					// green; the wiring is covered by a live pass instead. Recorded rather
-					// than left implied, because a green test here reads like more than it
-					// is -- and extracting that context choice into a proc is what would
-					// make it testable.
+					// WHAT THIS COVERS, updated 2026-08-05. It used to drive menu_close
+					// directly and said so: that pinned what the exit DOES and could not
+					// pin that the frame loop REACHES it, which was the entire bug. The
+					// context selection was inline in main.odin and no mode could call it,
+					// so deleting the frame-loop guard left this green.
+					//
+					// key_route (commands.odin) is that selection, extracted. This now goes
+					// through it with a real key event on a real Settings page -- the
+					// context that outranks .Menu and so never reached menu_close -- and
+					// deleting the guard fails these three lines. The remaining uncovered
+					// step is one call in the loop body, down from the whole decision.
 					a2.menu.revealed = true
 					a2.menu.mode = true
 					menu_bar_apply(&a2, 900)
 					mt_chk(&bad, MENU_BAR_SHOWN, "precondition: Alt reveals the bar while the setting hides it")
-					// Exactly what the frame loop now does for any key whose context
-					// is not .Menu.
-					if a2.menu.revealed {menu_close(&a2)}
+					sd2 := app_active(&a2)
+					kind_was := sd2.kind
+					sd2.kind = .Settings
+					kr := key_route(&a2, sd2, plat.Key_Event{key = .Down}, 0)
+					sd2.kind = kind_was
 					menu_bar_apply(&a2, 900)
+					mt_chk(&bad, kr.ctx == .Settings, "the Settings page outranks .Menu even with menu mode on -- the condition that stuck the reveal")
 					mt_chk(&bad, !a2.menu.revealed, "a key routed outside the menus ends the reveal")
 					mt_chk(&bad, !MENU_BAR_SHOWN, "...and the bar goes back down with it")
 					mt_chk(&bad, !a2.menu.mode, "...and keyboard menu mode ends too, so mnemonics stop being underlined")

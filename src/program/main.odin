@@ -594,90 +594,14 @@ main :: proc() {
 
 		for i in 0 ..< window.key_count {
 			ev := window.key_events[i]
-			// A cell edit in the table grid owns the editing keys (a mini text
-			// field), before they resolve to editor commands. Enter/Tab commit,
-			// Esc cancels; Tab then steps to the next cell on the same row.
-			if doc.table && doc.table_editing && !ev.ctrl && !ev.alt {
-				#partial switch ev.key {
-				case .Backspace:
-					table_edit_backspace(doc)
-					continue
-				case .Delete:
-					table_edit_delete(doc)
-					continue
-				case .Left:
-					table_edit_move(doc, -1)
-					continue
-				case .Right:
-					table_edit_move(doc, 1)
-					continue
-				case .Home:
-					table_edit_home(doc)
-					continue
-				case .End:
-					table_edit_end(doc)
-					continue
-				case .Escape:
-					table_edit_cancel(doc)
-					continue
-				case .Enter:
-					table_edit_commit(doc)
-					continue
-				case .Tab:
-					// COMMITS WITHOUT REORDERING, and `next_row` is why as much as
-					// the feel is: it is a VISIBLE row index, captured here and
-					// consumed after the commit, so a commit that re-sorted would
-					// leave it naming a different row entirely -- an index read in
-					// an order it was not taken in, which is the shape
-					// development-loop §4 calls Shape B. Tab means "the next cell in
-					// this row"; the row moves when it is left for good, by Enter or
-					// by a click elsewhere.
-					next_row, next_col := doc.table_edit_row, doc.table_edit_col + 1
-					table_edit_commit(doc, resort = false)
-					if ok, r, col, fs, fe, val := table_cell_at_index(doc, next_row, next_col, trows); ok {
-						table_edit_start(doc, r, col, fs, fe, val)
-					}
-					continue
-				case:
-				}
-			}
-			// Context is per-event; palette/find/menu/tab-switch can change it
-			// mid-loop. Priority: menu > palette > find > editor.
-			ctx := Ctx.Editor
-			if doc.kind == .Font {
-				ctx = .Font
-			} else if doc.kind == .Settings {
-				ctx = .Settings
-			} else if app.history.open {
-				ctx = .History
-			} else if menu_is_active(&app) {
-				ctx = .Menu
-			} else if app.palette.active {
-				ctx = .Palette
-			} else if app_active(&app).find.active {
-				ctx = .Find
-			}
-			cmd := resolve_key(ev.key, ev.ctrl, ev.alt, ctx)
-			// A global chord taken while the menu is open should close it first.
-			if ctx == .Menu && cmd != .None && !is_menu_cmd(cmd) {
-				menu_close(&app)
-			}
-			// ...and a key that routed SOMEWHERE ELSE ENTIRELY ends an Alt reveal.
-			//
-			// The reveal is cleared by menu_close, and every dismissal used to reach it
-			// -- but .Font and .Settings outrank .Menu in the priority above, so on
-			// those pages an Alt tap revealed the bar and then NO later key was ever
-			// routed to .Menu to close it. The bar stayed down for the rest of the
-			// session, holding the content 30px lower, on a page where Alt has nothing
-			// to reach. Focus loss was the only way out.
-			//
-			// Written as "any key not going to the menus" rather than "not on the
-			// settings page": the bug was one instance of a class, and naming the two
-			// contexts that outrank .Menu today would go stale the moment a third
-			// full-page surface is added.
-			if ctx != .Menu && app.menu.revealed {
-				menu_close(&app)
-			}
+			// The cell-edit intercept, the context priority, resolve_key and both
+			// menu_close rules all live in key_route (commands.odin) as of
+			// 2026-08-05 -- see the comment there for why they moved. The short
+			// version: none of it could be reached from a headless mode while it sat
+			// inline here, and §6ct's stuck Alt reveal was a bug in exactly that
+			// wiring. This loop now decides only whether to dispatch.
+			r := key_route(&app, doc, ev, trows)
+			if r.consumed {continue} // the table's cell editor took it
 			// srows, not rows: .Page_Up/.Page_Down (commands.odin) scroll by
 			// `rows - 1` and clamp against doc_max_top(rows) -- the vertical
 			// SCROLL MODEL's count, which is the grid's own budget in a grid and
@@ -686,7 +610,7 @@ main :: proc() {
 			// pressed, which is the one route batch 18's srows split did not
 			// cover: the wheel and the scrollbar already went through
 			// doc_scroll_rows, and this call site still had the old rows.
-			command_dispatch(cmd, ev, &app, window, &text, srows)
+			command_dispatch(r.cmd, ev, &app, window, &text, srows)
 		}
 		window.key_count = 0
 
