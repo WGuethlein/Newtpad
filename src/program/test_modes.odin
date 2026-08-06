@@ -31530,7 +31530,7 @@ when NEWTPAD_TESTS {
 				sd.anchor, sd.cursor = 0, 11 // "alpha\nbeta\n"
 				L2 := status_bar_layout(&a, &sd, &mt, W, H, cw, &buf)
 				sb_chk(&bad, L2.accent == 1, fmt.tprintf("the selection cell is the second, in accent (accent=%d)", L2.accent))
-				sb_chk(&bad, L2.cells[1].label == "11 selected, 2 lines", fmt.tprintf("...and carries both numbers: %q", L2.cells[1].label))
+				sb_chk(&bad, L2.cells[1].label == "  11 selected,  2 lines", fmt.tprintf("...and carries both numbers, right-aligned in their slots: %q", L2.cells[1].label))
 				accents := 0
 				for _, i in L2.cells {
 					if i == L2.accent {accents += 1}
@@ -31541,7 +31541,7 @@ when NEWTPAD_TESTS {
 				// a third.
 				sd.anchor, sd.cursor = 0, 6 // "alpha\n"
 				L3 := status_bar_layout(&a, &sd, &mt, W, H, cw, &buf)
-				sb_chk(&bad, L3.cells[1].label == "6 selected, 1 lines", fmt.tprintf("a selection ending on \\n does not gain a line: %q", L3.cells[1].label))
+				sb_chk(&bad, L3.cells[1].label == "   6 selected,  1 lines", fmt.tprintf("a selection ending on \\n does not gain a line: %q", L3.cells[1].label))
 				// The dirty marker rides with the count it qualifies. §4 gives every tab
 				// a RESERVED dirty slot, so the fact is already on screen -- this is the
 				// one element of the bar §13's mockup does not account for, kept rather
@@ -31550,6 +31550,27 @@ when NEWTPAD_TESTS {
 				Lm := status_bar_layout(&a, &sd, &mt, W, H, cw, &buf)
 				sb_chk(&bad, strings.has_suffix(Lm.cells[1].label, " *"), fmt.tprintf("a modified buffer marks the count cell: %q", Lm.cells[1].label))
 				sd.modified = false
+
+				// ...AND THE CELL DOES NOT RESIZE AS THE SELECTION GROWS, which is the
+				// whole reason both numbers are slotted. These change on every frame of
+				// a drag, so an unpadded cell shuffled the size cell and its divider
+				// continuously while you dragged. Swept across selection lengths that
+				// cross the digit boundaries the floor covers.
+				{
+					sd.anchor, sd.cursor = 0, 1
+					sbuf: [STATUS_CELL_MAX]ui.Button
+					ref := status_bar_layout(&a, &sd, &mt, W, H, cw, &sbuf)
+					refw := ref.cells[1].w
+					moved := 0
+					for n in ([]int{2, 9, 10, 11, 25, 30}) {
+						sd.cursor = min(n, sd.pt.length)
+						pbuf: [STATUS_CELL_MAX]ui.Button
+						Lp := status_bar_layout(&a, &sd, &mt, W, H, cw, &pbuf)
+						if Lp.cells[1].w != refw {moved += 1}
+					}
+					sb_chk(&bad, moved == 0, fmt.tprintf("the selection cell keeps its width as the selection grows (%d of 6 widths differed from %.0f)", moved, refw))
+					sd.anchor, sd.cursor = 0, 11
+				}
 
 				// -- 4. the size cell survives a selection (Wyatt, 2026-08-05) --------
 				sb_chk(&bad, L2.left_n == 3, fmt.tprintf("the size cell survives a selection (%d left cells)", L2.left_n))
@@ -31737,6 +31758,36 @@ when NEWTPAD_TESTS {
 					sb_chk(&bad, laps == 0, fmt.tprintf("no two cells overlap (%d overlapping pair(s))", laps))
 					// Above the bar is not a cell -- the editor owns that pixel.
 					sb_chk(&bad, status_cell_at(&a, &sd, &mt, W, H, cw, Lz.cells[0].x + 2, H - doc_bottom_bar_h(&sd) - 4) == .None, "a click above the bar is not a cell")
+				}
+
+				// -- THE DRAW READS THE LABEL ORIGIN, NOT THE BOX ORIGIN ---------------
+				//
+				// The one divergence a single producer still permits, and the gap
+				// §6da recorded as owed. `ui.Button` gives the draw `tx` (the label,
+				// inset by the padding) and the hit-test `x` (the box). They differ by
+				// exactly `pad`, so a draw that reached for `c.x` would render every
+				// label 12px left of its cell -- overlapping the divider, and looking
+				// like a spacing bug rather than a wrong variable. Nothing catches it,
+				// because the hit-test would still be correct.
+				//
+				// A source check, for the same reason tablegridtest's F1 is one: the
+				// draw needs a device and a frame. Written as "the status draw names
+				// c.tx and never c.x" over main.odin's own text.
+				{
+					msrc := #load("main.odin", string)
+					// BOTH COORDINATES FROM THE PRODUCER, and the count is what makes
+					// this unambiguous. main.odin has TWO ui.Button draws -- the find
+					// bar's action row and this one -- and the first version of this
+					// check looked for `c.label, c.tx,` anywhere, so sabotaging the
+					// STATUS draw left it green on the strength of the FIND BAR's.
+					// A weak assertion found by sabotaging the thing it names, which is
+					// the only way that class ever gets found.
+					good := strings.count(msrc, "plat.text_draw(gfx, text, c.label, c.tx, c.ty, UI_SMALL_PX,")
+					uses_x := strings.contains(msrc, "plat.text_draw(gfx, text, c.label, c.x,")
+					sb_chk(&bad, good == 2 && !uses_x, fmt.tprintf("both ui.Button draws use the LABEL origin and the producer's baseline (%d of 2, box-origin=%v)", good, uses_x))
+					// ...and the two are genuinely different, or the check above is
+					// satisfied by a metric where pad happens to be zero.
+					sb_chk(&bad, L.cells[0].tx - L.cells[0].x == sx(12), fmt.tprintf("...and they differ by exactly the 12px padding (%.0f)", L.cells[0].tx - L.cells[0].x))
 				}
 
 				// -- the drop order, carried over from metricstest ---------------------
