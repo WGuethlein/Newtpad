@@ -122,7 +122,20 @@ all comparing labels and colours, which mostly match, while the letterforms neve
 
 ---
 
-## The preview vs Obsidian — Wyatt, 2026-08-05
+## The preview vs Obsidian — REOPENED AND WIDENED, 2026-08-06 (decision C7)
+
+**Everything below this heading is a diagnosis of three defects in the SOURCE, and it is not the size of
+the problem.** Wyatt, having compared them: *"it's not just two lines, it deviates a lot compared to
+Obsidian's markdown previewer. it look horrendous compared to it. It definitely needs to be redone
+before the release."*
+
+The three items below are real and still want fixing. What they are not is an assessment of how the
+preview READS, which is the thing being complained about — and which cannot be reached by reading the
+code, only by putting the two side by side. **Obsidian now wins where it and §9 conflict, §9.3's serif
+included** (C7 in the README). The scope is a typography and spacing pass over the whole preview, and
+it is a pre-release blocker rather than polish. `docs/preview-compare.md` is the comparison fixture.
+
+### The original three-defect diagnosis — Wyatt, 2026-08-05
 
 He put our markdown preview beside Obsidian's on the same document and said ours *"looks significantly
 worse… it 1000% needs to be retouched"*. He was right, and the gap is **three concrete things, not a

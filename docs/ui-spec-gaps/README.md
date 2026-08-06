@@ -60,6 +60,18 @@ The spec's own values are deliberately quiet. `md_code_bg` is **eight units** of
 | **C4** | **Monaspace Argon is rejected.** Chrome stays monospace. §2's type table is a rejected section, and §13's "numbers in Neon, words in Argon" dies with it. |
 | **C5** | `Open Themes Folder` stays, though the mockup omits it. |
 | **C6** | Regex keeps `Alt+R` (all three find toggles are Alt, matching VS Code); only the label shortened. |
+| **C7** | **The markdown preview is measured against OBSIDIAN, and Obsidian wins where it and §9 conflict.** Wyatt, 2026-08-06, after comparing them: *"it deviates a lot compared to Obsidian's markdown previewer. it look horrendous compared to it. It definitely needs to be redone before the release."* This is the first exception that overrules a whole section's design rather than one row of it, and **§9.3's serif body is explicitly in scope** — the register records that serif as something we got right, and it is now something to re-judge rather than defend. |
+
+**C7 also reclassifies the work.** It was deferred on 2026-08-05 as a retouch, and I costed it at "two
+lines plus a polish tail" as recently as 2026-08-06 — from the three defects visible in the SOURCE.
+That was the wrong question. *"Three things I can point at in the code"* is not *"does it look good
+beside the thing it will be compared to"*, and only one of us can answer the second. **It is a
+pre-release blocker, not polish**, and the scope is a typography and spacing pass over the whole
+preview: heading scale and weights, body size and line height, the space above and below every block
+kind, measure, list indentation, code-block and inline-code treatment, blockquote, table density.
+
+`docs/preview-compare.md` is the fixture: every structure the preview renders, on one screen, so the
+same document can be captured in both applications and compared block for block.
 
 Two more overrules of the spec, from live use on 2026-08-05:
 
