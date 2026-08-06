@@ -28436,6 +28436,49 @@ when NEWTPAD_TESTS {
 				ps_chk(&bad, l2.top == 0, fmt.tprintf("a narrowed result set scrolls back to the top (top=%d)", l2.top))
 			}
 
+			// UI SPEC 7'S FOOTER IS A LIVE FORM, not a static legend.
+			//
+			// The mockup renders three runs -- the prefix, the argument typed after it,
+			// then the hint (`: 124  go to line · type a number`). The legend answers
+			// "what can I type here"; once the user has answered that themselves the
+			// footer should say what THIS will do and echo the argument, so a mistyped
+			// number is visible without looking back up at the input.
+			//
+			// Asserted on the MODE and the query the draw switches on, because the draw
+			// itself needs a device. What is pinned is that each prefix reaches its own
+			// branch and that the argument survives to be echoed.
+			{
+				pf_chk :: proc(bad: ^int, cond: bool, msg: string) {
+					if !cond {bad^ += 1}
+					fmt.printfln("  %-6s %s", "ok" if cond else "FAIL", msg)
+				}
+				// ITS OWN App. The outer `a` is destroyed ~300 lines above this, and
+				// reaching for it here was an access violation the first time this ran --
+				// a use-after-free in a test, which is the same shape the frame loop's
+				// own one had (§6cz) and just as invisible from the verdict: the mode
+				// exited 0xC0000005 with every earlier line still reading `ok`.
+				pf: App
+				menu_init(&pf.menu)
+				app_new_scratch(&pf)
+				defer app_destroy(&pf)
+				palette_open(&pf)
+				pf_chk(&bad, pf.palette.mode == .Tabs && len(pf.palette.query) == 0, "an empty palette rests in .Tabs, so the footer shows the legend")
+				for pair in ([][2]string{{":", "Goto"}, {">", "Commands"}, {"?", "Help"}}) {
+					clear(&pf.palette.query)
+					palette_recompute(&pf)
+					for r in pair[0] {palette_input_rune(&pf, r)}
+					for r in "124" {palette_input_rune(&pf, r)}
+					got := fmt.tprintf("%v", pf.palette.mode)
+					pf_chk(&bad, got == pair[1], fmt.tprintf("%q switches the footer to %s (got %s)", pair[0], pair[1], got))
+					pf_chk(&bad, string(pf.palette.query[1:]) == "124", fmt.tprintf("...and the argument the footer echoes survives (%q)", string(pf.palette.query[1:])))
+				}
+				clear(&pf.palette.query)
+				palette_recompute(&pf)
+				// The resting legend is a named constant so the draw and this cannot
+				// drift apart into two spellings of the same row.
+				pf_chk(&bad, strings.contains(PALETTE_LEGEND, "go to line"), fmt.tprintf("the resting legend still lists the prefixes (%q)", PALETTE_LEGEND))
+			}
+
 			// Non-zero exit, for the reason keytest grew one: a mode that only ever
 			// prints its verdict is a mode whose verdict a sweep can miss.
 			mode_done("palettetest", bad)

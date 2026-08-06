@@ -5785,7 +5785,12 @@ md_block_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text,
 		for d in 0 ..< lay.cls.level {
 			// ad.h for the same reason the fence body's band uses it: the bar runs
 			// beside the quote's admitted lines, not past them.
-			plat.quads_draw(gfx, qp, []plat.Quad{{pos = {cx + f32(d) * step, ytop}, size = {max(sx(2), 2), ad.h}, color = g_theme[.Md_Quote]}})
+			// ACCENT, not Md_Quote. §9.4's mockup gives the bar `border-left: 2px
+			// solid #d99b62` -- the only border-left value in the whole section -- and
+			// it read as decoration in the muted quote colour, which is the TEXT's
+			// role. The text stays Md_Quote; only the bar moves, the same split the
+			// bullet glyph already uses (accent mark, ordinary body text).
+			plat.quads_draw(gfx, qp, []plat.Quad{{pos = {cx + f32(d) * step, ytop}, size = {max(sx(2), 2), ad.h}, color = g_theme[.Accent]}})
 		}
 	case .List:
 		lx := cx + lay.marker // md_layout_build's own number, not a second copy

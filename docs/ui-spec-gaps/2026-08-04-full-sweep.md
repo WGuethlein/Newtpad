@@ -240,8 +240,9 @@ Rebuilt to the mockup: `>` prompt, subtle raised selection (the accent-fill regr
 — verified), dimmed legend footer, 560 wide.
 - ~~[F] **No scroll.** `PALETTE_MAX_ROWS` truncates~~ **SHIPPED v0.81.0.** , and the audit's HIGH — selection walking past the
   drawn rows — is the same bug. Open.
-- [V] Footer reads `> command · : go to line · ? help`; the mockup shows a live
-  `: 124   go to line · type a number`.
+- ~~[V] Footer reads `> command · : go to line · ? help`; the mockup shows a live
+  `: 124   go to line · type a number`.~~ **SHIPPED v0.90.0.** Three runs once a prefix is typed --
+  the prefix in accent, the argument in primary, the hint dimmed -- and the named legend at rest.
 - ~~[F] `Unwrap Selected Lines` and `Reflow Paragraph at Wrap Column` appear as ordinary palette rows in
   the mockup and exist nowhere in the product.~~ **SHIPPED v0.89.0.** Both are palette rows and Edit
   menu rows (in their own divider group), with a `Reflow column` setting defaulting to 80 — the view is
@@ -281,7 +282,9 @@ Remaining, all verified at 1:1:
   overstatement. What it lacks is §9.4's bordered card: `1px #3a342e` at `radius 6` around the whole
   table, a `bg_raised` 26px header row, and no full-height vertical rules. Also a wide gap between the
   header rule and the first body row. This is the **markdown-table job**, not polish.
-- [V] Blockquote bar → accent (§9.4 shows 2px `#d99b62`).
+- ~~[V] Blockquote bar → accent (§9.4 shows 2px `#d99b62`).~~ **SHIPPED v0.90.0.** It was drawn in
+  `Md_Quote`, which is the quote TEXT's role; only the bar moved, the same split the bullet glyph
+  already uses.
 - [F] Deferred tier untouched: YAML front-matter card, footnotes, image placeholders, setext headings.
 
 ### §10 Table view — 2 items (**corrected 2026-08-04 — three of the five were wrong**)

@@ -263,6 +263,11 @@ palette_recompute :: proc(app: ^App) {
 
 PALETTE_MAX_ROWS :: 12
 
+// The footer's resting state: what you can type here. Replaced by a live form
+// (palette_draw) the moment a prefix is typed. Named so the draw and any test
+// read the same string.
+PALETTE_LEGEND :: ">  command   ·   :  go to line   ·   ?  help"
+
 // The palette's geometry, computed once and consumed by the draw, the hit-test
 // and the hover. Two expressions in two procs is how every seam bug in this
 // codebase has started.
@@ -516,10 +521,43 @@ palette_draw :: proc(gfx: ^plat.Gfx, quad_pipe: ^plat.Quad_Pipeline, text: ^plat
 		col := g_theme[.Text_Muted] if len(p.results) > 0 else g_theme[.Danger]
 		plat.text_draw(gfx, text, n, x0 + PW - sx(16) - f32(len(n)) * cw, y0 + sx(22), UI_SMALL_PX, col)
 	}
-	// The dimmed prefix legend, along the bottom.
+	// The footer. A LIVE FORM once a prefix is typed, not a static legend.
+	//
+	// §7's mockup renders it as three runs -- the prefix, what you have typed after
+	// it, then the hint -- e.g. `: 124  go to line · type a number`. The legend
+	// answers "what can I type here"; once you have answered that yourself it
+	// should tell you what THIS is going to do, and echo the argument so a
+	// mistyped number is visible without looking back up at the input.
 	{
-		hint := ">  command   ·   :  go to line   ·   ?  help"
-		plat.text_draw(gfx, text, hint, x0 + sx(12), y0 + boxh - sx(9), UI_SMALL_PX, g_theme[.Text_Muted])
+		fx := x0 + sx(12)
+		fy := y0 + boxh - sx(9)
+		cwf := plat.text_char_width(text, UI_SMALL_PX)
+		q := string(p.query[:])
+		if p.mode != .Tabs && len(q) > 0 {
+			// The prefix in the accent, the argument in primary text, the hint
+			// dimmed -- the mockup's three colours, in its order.
+			pre := q[:1]
+			arg := q[1:]
+			hint := ""
+			switch p.mode {
+			case .Goto:
+				hint = "go to line · type a number"
+			case .Commands:
+				hint = "command · type to filter"
+			case .Help:
+				hint = "help"
+			case .Tabs:
+			}
+			plat.text_draw(gfx, text, pre, fx, fy, UI_SMALL_PX, g_theme[.Accent])
+			fx += f32(len(pre) + 1) * cwf
+			if arg != "" {
+				plat.text_draw(gfx, text, arg, fx, fy, UI_SMALL_PX, g_theme[.Text_Primary])
+				fx += f32(len(arg) + 2) * cwf
+			}
+			plat.text_draw(gfx, text, hint, fx, fy, UI_SMALL_PX, g_theme[.Text_Muted])
+		} else {
+			plat.text_draw(gfx, text, PALETTE_LEGEND, fx, fy, UI_SMALL_PX, g_theme[.Text_Muted])
+		}
 	}
 
 	if p.mode == .Goto {
