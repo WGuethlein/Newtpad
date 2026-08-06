@@ -358,9 +358,29 @@ exactly as §13 asks — verified live (`Ln 3, Col 22   3 selected`).
 `drop a file anywhere in this window`), with the caret and no logo/welcome/recent grid. **Done.**
 
 ### §16 Icon — 1 item
-No icon work exists. §16 names **16a "Caret on paper"** as recommended and gives full geometry at
-96/48/32/16px with its palette (paper `#F2EBE0`, accent caret `#D99B62`, two `#B3A897` lines, one
-`#CDC3B4`). Plus the `.ico` size set a shipped product needs.
+> **STRUCK 2026-08-06 — "No icon work exists" was FALSE, and this is the FOURTEENTH item filed from
+> reading rather than checking.** §16's recommended direction **16a "Caret on paper" shipped in
+> v0.31.0** (HANDOFF §6at, whose title is literally *"Newtpad gets an icon"*). `src/platform/newtpad.ico`
+> is committed, `tools/gen_icon/main.odin` generates it, `src/platform/newtpad.rc` embeds it as ICON
+> resource id 1 — which is what gives the `.exe` its Explorer and taskbar icon — and **`icontest` was in
+> HANDOFF §7's sweep list the whole time**, parsing the icon back out of the built exe and asserting
+> every property this entry called missing:
+>
+> | §16 asks | icontest asserts |
+> |---|---|
+> | seven sizes in one `.ico` | 16, 20, 24, 32, 48, 64, 256 — all seven |
+> | *"do not scale one bitmap"* | no two entries share a bitmap offset |
+> | paper `#F2EBE0` | sampled in **every** size |
+> | two/three text lines | 2 bars at 16/20px, 3 at 24px and up |
+> | accent caret `#D99B62` | `gen_icon`'s `CARET` constant, per size |
+>
+> A mode that runs in every sweep and prints 39 `OK` lines was the evidence, and the entry was written
+> without looking at it.
+
+What §16 asks for that is genuinely absent, and all this section should have said:
+- [F] A **document icon per associated extension** (same shape, extension label in the corner).
+- [✓] *"an app icon that does not change with the theme"* — ours is static, so this is already right.
+- [n/a] A monochrome notification-area variant. Newtpad has no tray presence.
 
 ### §17 Themes & colour rules — 3 items
 - [F] Contrast warning on save — check six named pairs, warn once, never clamp.
@@ -401,7 +421,7 @@ before starting anything on this list.**
 | | Count |
 |---|---|
 | Shipped v0.74.0–v0.85.0 | **21** |
-| Struck as already built (verified) | **13** |
+| Struck as already built (verified) | **14** |
 | Struck by decision (C3–C6) | **6** |
 | **Remaining** | **~24** |
 
@@ -418,7 +438,8 @@ Remaining, by weight rather than by count:
 - **§7** ×2 — the footer's live form, and two palette rows the mockup shows that do not exist
   (`Unwrap Selected Lines`, `Reflow Paragraph at Wrap Column`).
 - **§13** ×3 — `Saved` as a cell, the left group as three bordered cells, errors taking the whole bar.
-- **§16** ×1 — the icon (16a "Caret on paper", geometry and palette both specified).
+- ~~**§16** ×1 — the icon.~~ **STRUCK 2026-08-06 — shipped in v0.31.0 and covered by `icontest`.** What
+  remains of §16 is a per-extension DOCUMENT icon, which is a different and smaller thing.
 - **Three needing a DECISION, not work:** §5's `+N` overflow vs the mockup's `‹ ›` scrolling rail;
   §10's columns not filling the pane; §2's per-role type scale, now that Argon is struck.
 

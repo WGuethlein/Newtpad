@@ -21,9 +21,15 @@ be extracted with inline styles, which is stricter than eyeballing a screenshot.
 
 ## The second thing: verify before you believe this folder
 
-Of the 59 items the full sweep first filed, **13 turned out to be already built** and were struck on
+Of the 59 items the full sweep first filed, **14 have turned out to be already built** and were struck on
 inspection. The cause each time: the item was filed from *reading* — a downscaled screenshot, or a prose
 rule — rather than from checking the code or the app at 1:1.
+
+**The fourteenth (2026-08-06) is the sharpest example, because the evidence was already running.** §16
+said *"No icon work exists."* The icon shipped in v0.31.0, `newtpad.rc` embeds it as the exe's own icon,
+and **`icontest` has been in HANDOFF §7's required sweep the whole time** — printing 39 `OK` lines that
+assert the seven sizes, the no-scaling rule, the `#F2EBE0` paper and the two/three-line rule this entry
+called missing. Every sweep since ran it. **Before filing anything as absent, grep the mode list for it.**
 
 The spec's own values are deliberately quiet. `md_code_bg` is **eight units** off `bg_base`;
 `table_zebra` is **four**. At half scale they vanish, and "I cannot see it" reads as "it is missing."
