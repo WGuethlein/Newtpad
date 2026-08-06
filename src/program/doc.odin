@@ -3816,7 +3816,11 @@ MOVE_LINE_BUDGET :: 2 * 1024 * 1024
 // `cap` bytes of `line_start`, meaning the line is longer than the move
 // budget. The caller must bail rather than trust content_end/term_len, or a
 // pathologically long line gets split instead of refused.
-@(private = "file")
+//
+// NOT file-private since 2026-08-06: reflow.odin needs the same line-span
+// contract, and reimplementing it there would put the cap's "bail rather than
+// trust the result" rule in two places -- which is the one thing this proc exists
+// to keep in one.
 line_span_cap :: proc(pt: ^base.Piece_Table, line_start, cap: int) -> (content_end, term_len: int, ok: bool) {
 	limit := min(pt.length, line_start + cap)
 	nl := base.pt_line_end_cap(pt, line_start, cap)

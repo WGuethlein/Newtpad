@@ -242,8 +242,10 @@ Rebuilt to the mockup: `>` prompt, subtle raised selection (the accent-fill regr
   drawn rows — is the same bug. Open.
 - [V] Footer reads `> command · : go to line · ? help`; the mockup shows a live
   `: 124   go to line · type a number`.
-- [F] `Unwrap Selected Lines` and `Reflow Paragraph at Wrap Column` appear as ordinary palette rows in
-  the mockup and exist nowhere in the product.
+- ~~[F] `Unwrap Selected Lines` and `Reflow Paragraph at Wrap Column` appear as ordinary palette rows in
+  the mockup and exist nowhere in the product.~~ **SHIPPED v0.89.0.** Both are palette rows and Edit
+  menu rows (in their own divider group), with a `Reflow column` setting defaulting to 80 — the view is
+  not a usable target since wrap follows the window.
 
 ### §8 Editor surface — 1 item
 Closest section to done. 16px top padding, 2px caret, find-match vs current-match fills, gutter off by

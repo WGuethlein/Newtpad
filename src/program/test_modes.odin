@@ -10839,6 +10839,10 @@ when NEWTPAD_TESTS {
 				font_size       = 22,
 				zoom_pct        = 125,
 				tab_width       = 3, // non-default and in range, so the whole-struct compare below can see it
+				// Same rule, and it caught a real omission: left at its zero the
+				// normaliser turns it into the default on load, so the round-trip
+				// fails on a field the fixture never set rather than on a bug.
+				reflow_col      = 72,
 				font_family     = "Courier New",
 				font_style      = .Italic,
 				// Non-default and different from font_family, so the round-trip
@@ -10949,12 +10953,15 @@ when NEWTPAD_TESTS {
 				// without ever opening Font is the user's path, and it is the one
 				// that was dead.
 				for row in 0 ..< settings_row_count() {
-					// Enter. Two rows RESET to a default rather than cycling (Zoom and
-					// Tab width), so Enter is a legitimate no-op when the value is
-					// already the default -- move both off it first, or the check
-					// fails them for behaving correctly.
+					// Enter. THREE rows RESET to a default rather than cycling (Zoom,
+					// Tab width and Reflow column), so Enter is a legitimate no-op when
+					// the value is already the default -- move each off it first, or the
+					// check fails them for behaving correctly. The count in this comment
+					// is load-bearing: it was "two" and the third row's addition is what
+					// made this fail.
 					ar.settings.tab_width = plat.TAB_WIDTH_DEFAULT + 1
 					ar.settings.zoom_pct = ZOOM_STEPS[len(ZOOM_STEPS) - 1]
+					ar.settings.reflow_col = REFLOW_COL_DEFAULT + 4
 					before := ar.settings
 					settings_toggle_row(&rcr, row, 0)
 					ent := ar.settings != before
@@ -11029,6 +11036,8 @@ when NEWTPAD_TESTS {
 						return "theme_name"
 					case .Tab_Width:
 						return "tab_width"
+					case .Reflow_Col:
+						return "reflow_col"
 					case .Ui_Font:
 						return "ui_font_family"
 					case .Gutter:
@@ -31899,7 +31908,37 @@ when NEWTPAD_TESTS {
 							ts_chk(&bad, !clash, fmt.tprintf("%d tabs @ %.0f: the + button clears the tabs and the overflow count", ntabs, width))
 						}
 
-						// 6. THE OTHER SEAM, and the one that shipped broken: the rail's
+						// 5b. THERE IS ALWAYS SOMEWHERE TO GRAB THE WINDOW.
+					//
+					// Wyatt, live use 2026-08-06: at one width nothing on the top row
+					// could move the window. That was v0.87.0's own doing -- it
+					// stretched the client region to cover the "+N", which sits flush
+					// at `limit - over_w`, so the region reached `limit` exactly and
+					// the caption area went to zero. The reserve is in the LIMIT now,
+					// so this asserts the property the user actually needs (a strip
+					// exists) rather than the mechanism.
+					{
+						tr := tabs_right(&a, &win, &txt, width)
+						cap_x := width - 3 * f32(plat.window_caption_btn_w(&win))
+						ts_chk(&bad, tr <= cap_x - sx(TAB_DRAG_RESERVE_96) + 0.5, fmt.tprintf("%d tabs @ %.0f: a %0.f px drag strip survives (rail ends %.0f, buttons start %.0f)", ntabs, width, sx(TAB_DRAG_RESERVE_96), tr, cap_x))
+					}
+
+					// 5c. NO HOLE ON THE LEFT once the rail scrolls.
+					//
+					// Same report: `>_`, then empty rail, then the first tab. A tab
+					// straddling MENU_W is not drawn (a clipped tab shows a truncated
+					// name), so an unsnapped scroll leaves its whole width blank.
+					// Asserted as the DERIVABLE VALUE -- the first drawn tab starts AT
+					// the lane, not merely near it.
+					if L.hidden > 0 && a.tab_scroll > 0 {
+						firstx := f32(-1)
+						for r in L.tabs {
+							if r.drawn && (firstx < 0 || r.x < firstx) {firstx = r.x}
+						}
+						ts_chk(&bad, firstx < 0 || abs(firstx - MENU_W) < 0.5, fmt.tprintf("%d tabs @ %.0f: the first drawn tab is flush at the menu lane (%.1f, want %.1f)", ntabs, width, firstx, MENU_W))
+					}
+
+					// 6. THE OTHER SEAM, and the one that shipped broken: the rail's
 						// hit-test is only ever REACHED for x < win.tabs_right. Past it,
 						// WM_NCHITTEST returns HT_CAPTION and the press becomes an OS
 						// window drag that the program never sees (window.odin's
@@ -36009,6 +36048,224 @@ when NEWTPAD_TESTS {
 		// Each case is its own local proc holding one Document at a time
 		// (development-loop.md §6: test_mode_dispatch's frame is already large and
 		// blocktest has hit a real stack overflow twice this way).
+		// `newtpad reflowtest` -- UI spec 7's two missing palette commands: Unwrap
+		// Selected Lines and Reflow Paragraph at Wrap Column.
+		//
+		// One argument, non-zero on failure, in HANDOFF §7's list. These REWRITE THE
+		// BUFFER, so the cases that matter are the ones about what they must NOT
+		// touch: the block boundaries, the bytes outside the region, and the undo
+		// entry count.
+		if os.args[1] == "reflowtest" {
+			rf_run :: proc() -> int {
+				bad := 0
+				rf_chk :: proc(bad: ^int, ok: bool, label: string) {
+					if !ok {bad^ += 1}
+					fmt.printfln("  %-6s %s", "ok" if ok else "FAIL", label)
+				}
+				// The whole document as one string, for comparing against a literal.
+				rf_text :: proc(d: ^Document) -> string {
+					s := doc_debug_string(d)
+					return s
+				}
+				rf_doc :: proc(src: string) -> Document {
+					c := make([]u8, len(src))
+					copy(c, transmute([]u8)src)
+					d := doc_from_content(c, "fixture.md", .UTF8)
+					d.modified = false
+					return d
+				}
+				txt: plat.Text
+				plat.text_load_faces(&txt)
+				NL :: "\n"
+
+				// -- 1. unwrap joins a paragraph and stops at the blank line ---------
+				{
+					d := rf_doc("one two" + NL + "three four" + NL + NL + "second para" + NL)
+					defer doc_close(&d)
+					d.cursor, d.anchor = 0, 0
+					r := doc_reflow(&d, &txt, 0)
+					got := rf_text(&d)
+					defer delete(got)
+					want := "one two three four" + NL + NL + "second para" + NL
+					rf_chk(&bad, r == .Ok, fmt.tprintf("unwrap reports Ok (%v)", r))
+					rf_chk(&bad, got == want, fmt.tprintf("unwrap joins the caret's paragraph and stops at the blank line: %q", got))
+				}
+
+				// -- 2. it does NOT cross a block boundary ---------------------------
+				//
+				// This is the case the whole reflow_block_start predicate exists for.
+				// A heading, a list item, a blockquote, a fence or a table row is
+				// structure the user can see; joining prose into it destroys the
+				// document silently, and an undo is the only way back.
+				{
+					for marker in ([]string{"# Heading", "- item", "> quote", "| a | b |", "```odin", "1. first"}) {
+						d := rf_doc(fmt.tprintf("prose line%s%s%safter%s", NL, marker, NL, NL))
+						defer doc_close(&d)
+						d.cursor, d.anchor = 0, 0
+						doc_reflow(&d, &txt, 0)
+						got := rf_text(&d)
+						defer delete(got)
+						kept := strings.contains(got, fmt.tprintf("%s%s", marker, NL)) || strings.contains(got, fmt.tprintf("%s%s", NL, marker))
+						rf_chk(&bad, kept, fmt.tprintf("unwrap does not swallow %q: %q", marker, got))
+					}
+				}
+
+				// -- 3. reflow breaks at the column, measured in CELLS ----------------
+				{
+					d := rf_doc("aaaa bbbb cccc dddd eeee ffff gggg hhhh" + NL)
+					defer doc_close(&d)
+					d.cursor, d.anchor = 0, 0
+					r := doc_reflow(&d, &txt, 20)
+					got := rf_text(&d)
+					defer delete(got)
+					rf_chk(&bad, r == .Ok, fmt.tprintf("reflow reports Ok (%v)", r))
+					// EVERY line within the column, asserted as a maximum over the
+					// lines rather than by comparing one literal -- a literal would
+					// pass for the wrong reason if the breaker emitted a different but
+					// also-legal set of breaks.
+					worst := 0
+					nlines := 0
+					{
+						i := 0
+						for i <= len(got) {
+							e := i
+							for e < len(got) && got[e] != '\n' {e += 1}
+							if e > i {
+								nlines += 1
+								w := plat.text_cells(&txt, transmute([]u8)got[i:e], 0)
+								if w > worst {worst = w}
+							}
+							if e >= len(got) {break}
+							i = e + 1
+						}
+					}
+					rf_chk(&bad, worst <= 20, fmt.tprintf("no reflowed line exceeds the column (worst %d of 20)", worst))
+					rf_chk(&bad, nlines > 1, fmt.tprintf("...and it actually broke the line (%d lines)", nlines))
+					// The words survive, in order, with nothing lost or duplicated.
+					joined := strings.replace_all(got, NL, " ", context.temp_allocator) or_else got
+					rf_chk(&bad, strings.contains(joined, "aaaa bbbb") && strings.contains(joined, "gggg hhhh"), fmt.tprintf("...and no word was lost or reordered: %q", joined))
+				}
+
+				// -- 4. A WORD LONGER THAN THE COLUMN OVERHANGS, it does not loop -----
+				//
+				// The guard is `line_cells > ind_cells`: without it a word wider than
+				// the column would break onto a fresh line, still not fit, and break
+				// again forever. A URL is the real case.
+				{
+					d := rf_doc("see https://example.com/a/very/long/path/that/exceeds/twenty end" + NL)
+					defer doc_close(&d)
+					d.cursor, d.anchor = 0, 0
+					r := doc_reflow(&d, &txt, 20)
+					got := rf_text(&d)
+					defer delete(got)
+					rf_chk(&bad, r == .Ok, fmt.tprintf("an over-long word does not hang the reflow (%v)", r))
+					rf_chk(&bad, strings.contains(got, "https://example.com/a/very/long/path/that/exceeds/twenty"), fmt.tprintf("...and is not broken in the middle: %q", got))
+					rf_chk(&bad, !strings.contains(got, NL+NL), fmt.tprintf("...and produced no empty line: %q", got))
+				}
+
+				// -- 5. the indent of the first line is kept on every line ------------
+				//
+				// TWO spaces, not four. Four is an indented code block (and a
+				// deliberate hang in plain text), so reflow_block_start refuses it and
+				// the line is copied through untouched -- which made the first version
+				// of this case pass on ONE unmodified line, trivially carrying the
+				// indent it was asserting about. A vacuous green on the exact property
+				// under test, caught by reading the output rather than the verdict.
+				{
+					d := rf_doc("  alpha beta gamma delta epsilon zeta" + NL)
+					defer doc_close(&d)
+					d.cursor, d.anchor = 0, 0
+					doc_reflow(&d, &txt, 24)
+					got := rf_text(&d)
+					defer delete(got)
+					// The precondition the old fixture silently lost: it has to have
+					// broken at all for "every line" to mean more than one.
+					rf_chk(&bad, strings.count(got, NL) > 1, fmt.tprintf("precondition: an indented paragraph reflows at all (%q)", got))
+					lines_ok := true
+					{
+						i := 0
+						for i <= len(got) {
+							e := i
+							for e < len(got) && got[e] != '\n' {e += 1}
+							if e > i && !strings.has_prefix(got[i:e], "  ") {lines_ok = false}
+							if e >= len(got) {break}
+							i = e + 1
+						}
+					}
+					rf_chk(&bad, lines_ok, fmt.tprintf("every reflowed line keeps the first line's indent: %q", got))
+				}
+
+				// -- 6. ONE UNDO ENTRY, and undo restores the bytes exactly -----------
+				//
+				// The property comes from the single doc_replace_range, which is what
+				// doc_sort_lines' own comment identifies as the mechanism. A per-run
+				// loop would read one entry per paragraph and make Ctrl+Z useless on
+				// exactly the command most likely to be run by mistake.
+				{
+					src := "one two" + NL + "three four" + NL + NL + "five six" + NL + "seven" + NL
+					d := rf_doc(src)
+					defer doc_close(&d)
+					d.anchor, d.cursor = 0, d.pt.length
+					before := len(d.undo)
+					doc_reflow(&d, &txt, 0)
+					after := len(d.undo)
+					rf_chk(&bad, after == before + 1, fmt.tprintf("a multi-paragraph reflow pushes ONE undo entry (%d -> %d)", before, after))
+					doc_undo(&d)
+					got := rf_text(&d)
+					defer delete(got)
+					rf_chk(&bad, got == src, fmt.tprintf("...and undo restores the bytes exactly: %q", got))
+				}
+
+				// -- 7. a selection spanning structure rewrites only the prose --------
+				{
+					src := "para one line" + NL + "- a list item" + NL + "para two line" + NL
+					d := rf_doc(src)
+					defer doc_close(&d)
+					d.anchor, d.cursor = 0, d.pt.length
+					doc_reflow(&d, &txt, 0)
+					got := rf_text(&d)
+					defer delete(got)
+					rf_chk(&bad, strings.contains(got, "- a list item"), fmt.tprintf("the list item survives a whole-selection unwrap: %q", got))
+					rf_chk(&bad, !strings.contains(got, "line - a"), fmt.tprintf("...and nothing was joined across it: %q", got))
+				}
+
+				// -- 8. refusals -----------------------------------------------------
+				{
+					d := rf_doc("alpha" + NL + NL + "beta" + NL)
+					defer doc_close(&d)
+					// The caret on the blank line: nothing to act on, and it must say
+					// so rather than silently doing nothing.
+					d.cursor, d.anchor = 6, 6
+					r := doc_reflow(&d, &txt, 0)
+					// EXACTLY .Unchanged, not "one of two". The blank line IS the
+					// region, it survives reflow_block_start's copy-through byte for
+					// byte, and the output equals the input -- so the no-op guard fires
+					// before doc_batch_begin and no undo entry is pushed. Accepting
+					// `.No_Paragraph || .Unchanged` was slack of exactly the kind
+					// HANDOFF §7 names: it would have admitted a future change that
+					// started editing here.
+					rf_chk(&bad, r == .Unchanged, fmt.tprintf("a caret on a blank line changes nothing (%v)", r))
+					// An already-unwrapped paragraph is Unchanged, and crucially pushes
+					// NO undo entry -- an undo step that does nothing evicts a real one.
+					d.cursor, d.anchor = 0, 0
+					before := len(d.undo)
+					r2 := doc_reflow(&d, &txt, 0)
+					rf_chk(&bad, r2 == .Unchanged, fmt.tprintf("an already-joined paragraph is Unchanged (%v)", r2))
+					rf_chk(&bad, len(d.undo) == before, "...and pushes no undo entry")
+				}
+
+				// -- 9. the setting normalises both ways ------------------------------
+				rf_chk(&bad, reflow_col_normalise(0) == REFLOW_COL_DEFAULT, "a 0 reflow_col means the default, not one column")
+				rf_chk(&bad, reflow_col_normalise(-5) == REFLOW_COL_DEFAULT, "...and so does a negative")
+				rf_chk(&bad, reflow_col_normalise(5) == REFLOW_COL_MIN, "below the floor clamps up")
+				rf_chk(&bad, reflow_col_normalise(9999) == REFLOW_COL_MAX, "above the ceiling clamps down")
+				rf_chk(&bad, reflow_col_normalise(72) == 72, "a sane value survives")
+				return bad
+			}
+			fmt.println("reflowtest:")
+			return mode_done("reflowtest", rf_run())
+		}
+
 		if os.args[1] == "sortlinestest" {
 			sl_chk :: proc(bad: ^int, cond: bool, msg: string) {
 				fmt.printfln("  %-4s %s", "OK" if cond else "FAIL", msg)
