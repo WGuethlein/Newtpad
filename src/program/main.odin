@@ -11,6 +11,7 @@ import "core:strconv"
 import "core:time"
 import base "src:base"
 import plat "src:platform"
+import ui "src:ui"
 
 // The command line, resolved: which file to open, whether this is a torn-off
 // window, and where to put it.
@@ -512,6 +513,17 @@ main :: proc() {
 		active_before := app.active
 		cursor_before := doc.cursor
 
+		// AN ERROR IS DISMISSED BY THE NEXT THING YOU DO (Wyatt, 2026-08-05). UI
+		// spec 13 says errors hold the bar "until dismissed" and never says how;
+		// any keystroke or a click on the bar is the answer that leaves no dead
+		// state a user cannot get out of.
+		//
+		// BEFORE the input is drained, not after, and that ordering is the whole
+		// subtlety: a Ctrl+S that fails RAISES an error during this frame's
+		// dispatch, so clearing afterwards would wipe the error the keystroke just
+		// produced and the failure would flash for zero frames. Clear first, let
+		// dispatch set it again, and the one it set survives.
+		if window.char_count > 0 || window.key_count > 0 {app_error_dismiss(&app)}
 		// Drain input once per frame: typed characters route to the find field or
 		// the document; key chords resolve to a command in the active context.
 		for i in 0 ..< window.char_count {
@@ -737,7 +749,14 @@ main :: proc() {
 		// this the same pixels would start a byte-model drag on doc.top, and the
 		// preview would then be dragged around by the sync in row steps -- the
 		// model this task replaces, reachable through the bar alone.
-		if scrollbar_shown && doc.md_mode != .Preview && window.mouse_pressed && f32(window.mouse_x) >= scrollbar_lo && f32(window.mouse_x) < scrollbar_hi && window.mouse_y >= i32(CHROME_TOP) {
+		// ...and ABOVE the status bar. This had a top bound and no bottom one, so
+		// the bar's rightmost SCROLLBAR_W pixels started a jump-scroll instead of
+		// reaching the bar -- and it consumes mouse_pressed here, hundreds of lines
+		// before the status cells are hit-tested. Harmless while the last cell's
+		// box stopped 12px short of the window edge; §13's cells are flush to it, so
+		// that strip became the `Tab 4` cell's own padding and the error bar's
+		// dismissal target. The scrollbar has never had any business in that row.
+		if scrollbar_shown && doc.md_mode != .Preview && window.mouse_pressed && f32(window.mouse_x) >= scrollbar_lo && f32(window.mouse_x) < scrollbar_hi && window.mouse_y >= i32(CHROME_TOP) && f32(window.mouse_y) < f32(window.height) - doc_bottom_bar_h(doc) {
 			scrollbar_drag = true
 			vscroll_grab = vbar_grab_at(g_vbar_editor, f32(window.mouse_y))
 			window.mouse_pressed = false
@@ -1086,7 +1105,13 @@ main :: proc() {
 		// the press. UI spec 13: "Every cell is clickable."
 		if window.mouse_pressed {
 			scw := plat.text_char_width(&text, UI_SMALL_PX)
-			if c := status_cell_at(doc, &text, f32(window.width), f32(window.height), scw, f32(window.mouse_x), f32(window.mouse_y)); c != .None {
+			// A click on the bar dismisses an error first, and dispatches nothing:
+			// while an error holds the bar there are no cells under the pointer to
+			// hit (status_bar_layout returns none), so the click has exactly one
+			// meaning. UI spec 13: "until dismissed."
+			if f32(window.mouse_y) >= f32(window.height) - doc_bottom_bar_h(doc) && app_error_dismiss(&app) {
+				window.mouse_pressed = false
+			} else if c := status_cell_at(&app, doc, &text, f32(window.width), f32(window.height), scw, f32(window.mouse_x), f32(window.mouse_y)); c != .None {
 				command_dispatch(c, {}, &app, window, &text, srows)
 			}
 		}
@@ -2622,136 +2647,79 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 		}
 	}
 	{
-		// Either figure can be unknown on a huge file: both are capped so the status
-		// bar never spends an unbounded scan. Say what is known rather than printing
-		// a placeholder number that reads as fact.
-		ln := doc_cursor_line(doc)
-		cl := doc_cursor_col(doc, text)
-		lncol: string
-		switch {
-		case ln > 0 && cl > 0:
-			lncol = fmt.tprintf("Ln %d, Col %d", ln, cl)
-		case cl > 0:
-			lncol = fmt.tprintf("Col %d", cl)
-		case ln > 0:
-			lncol = fmt.tprintf("Ln %d", ln)
-		case:
-			lncol = "Ln -, Col -"
-		}
-		recovered := "  [RECOVERED COPY - file changed on disk, not the original]" if doc.recovered else ""
-		// Only ever shown for a modified document: a clean one is reloaded
-		// silently, so a marker here always means there is a real choice to make.
-		disk := ""
-		if doc.disk_gone {
-			disk = "  [FILE DELETED ON DISK - your text is still here; Save to write it back]"
-		} else if doc.disk_changed {
-			disk = "  [CHANGED ON DISK - you have unsaved edits. File > Reload to discard yours]"
-		}
-		indexing := "" if doc_index_done(doc) else fmt.tprintf("  (indexing %.0f%%)", doc_index_progress(doc) * 100)
-		// The atlas has no eviction: once full, further glyphs draw as nothing
-		// while the pen still advances, so text goes missing with no other
-		// symptom. Say so rather than let it look like a corrupt file.
-		atlas := "  [GLYPH CACHE FULL - some text may not draw; reduce zoom or font size]" if plat.text_atlas_full(text) else ""
-		// A dirty buffer too large to auto-back-up: unsaved edits are not
-		// crash-protected until saved (backing it up would freeze/OOM the app).
-		nobackup := "  [LARGE FILE - unsaved edits are NOT auto-backed up; Save to keep them]" if doc_backup_skipped(doc) else ""
-		mode := "    Wrap" if doc.wrap else ""
-		if doc.table {mode = "    Table (Ctrl+T)"}
-		switch doc.md_mode {
-		case .Off:
-		case .Preview:
-			mode = "    Markdown Preview (Ctrl+M)"
-		case .Split:
-			mode = "    Markdown Split (Ctrl+M)"
-		}
-		// The transient notice rides along on the same line while notice_live
-		// (see above).
-		notice := ""
-		if notice_live {
-			notice = fmt.tprintf("    %s", rc.app.notice)
-		}
-		// Two groups, not one sentence. UI spec 13: facts about POSITION on the
-		// left, facts about the FILE on the right, "a fixed home for each, so the
-		// eye learns where to look". Everything transient -- warnings, the disk
-		// state, the indexing progress, the notice -- rides with the left group,
-		// because that is the half that is already changing as you work.
-		//
-		// A selection replaces the line count while it exists, in the accent, per
-		// the same section: when you have selected something, how much you have
-		// selected is the number you want in that slot.
-		count := fmt.tprintf("%d lines", doc_line_count(doc))
-		selected := false
-		if lo, hi := doc_sel_range(doc); hi > lo {
-			count = fmt.tprintf("%d selected", hi - lo)
-			selected = true
-		}
-		left := status_left_text(doc, text)
-		// `mode` is not a cell: it names the VIEW, which the menus own, and there
-		// is no single obvious action for a click on it.
-		right := mode // reassigned by the drop order below
-
-		warn := doc.recovered || doc.disk_changed || doc.disk_gone || plat.text_atlas_full(text) || doc_backup_skipped(doc)
-		// Text_Muted, not Text_Dim. Text_Dim is the disabled-only tier at 2.9:1 --
-		// below the AA floor by design and labelled "never live text" in
-		// theme.odin -- and the status bar is live text on every frame. Same
-		// defect the tab labels carried.
-		col := g_theme[.Warning] if warn else g_theme[.Text_Muted]
-		base_y := h - sx(8)
 		cw := plat.text_char_width(text, UI_SMALL_PX)
-		plat.text_draw(gfx, text, left, sx(12), base_y, UI_SMALL_PX, g_theme[.Accent] if selected else col)
-		// The cells, from the one geometry the click also reads, with a hairline
-		// divider in each gap. UI spec 13: "Cells, not a sentence... a fixed home
-		// for each, so the eye learns where to look."
-		// UI spec 5's drop order, enforced rather than implied.
-		//
-		// The window has a floor now (WM_GETMINMAXINFO), but between that floor
-		// and a comfortable width nothing DROPPED in order -- the right-hand
-		// cells simply kept being drawn until they ran into the left group and
-		// the two overlapped into an unreadable middle. The spec's order is
-		// explicit: "Status cells drop right-to-left: Tab width -> LF -> UTF-8 ->
-		// language. Ln/Col and the line count always stay."
-		//
-		// Measured against what the LEFT group actually needs, not against a
-		// hardcoded breakpoint, so it holds at any DPI and any font.
-		// Already dropped: status_cells owns the order now, so this list IS what
-		// status_cell_at will hit-test. The drop used to run here, which made the
-		// draw and the hit-test two owners of one geometry -- a dropped cell stayed
-		// clickable and a click on empty space could fire `.Eol_CRLF`.
-		cbuf: [STATUS_CELL_MAX]Status_Cell
-		cells := status_cells(doc, text, w, cw, &cbuf)
-		{
-			need := sx(12) + f32(len(left)) * cw + sx(24)
-			// The view name still drops HERE, and that is not an oversight: it is
-			// not a cell and not clickable, so it cannot dispatch anything and
-			// cannot disagree with a hit-test that never looks at it. It goes
-			// before any cell does -- the least useful of the three and the widest.
-			if len(cells) < 2 || (len(cells) > 0 && cells[len(cells) - 1].x - sx(24) - f32(len(right)) * cw < need) {
-				right = ""
+		base_y := h - sx(8)
+		cbuf: [STATUS_CELL_MAX]ui.Button
+		// ONE producer for the whole bar. The draw used to build the left group
+		// here as a sentence and ask status_cells for the right one, which is two
+		// owners of one row -- the drop was measured in characters against a group
+		// placed in pixels, and the divider rule could not be stated at all because
+		// it spans both groups.
+		L := status_bar_layout(rc.app, doc, text, w, h, cw, &cbuf)
+
+		// An error takes the whole bar, in danger, until dismissed (UI spec 13).
+		// status_bar_layout returns no cells in that state, so there is nothing to
+		// draw underneath it and nothing clickable to disagree with.
+		if L.err != "" {
+			plat.quads_draw(gfx, quad_pipe, []plat.Quad{{pos = {0, h - doc_bottom_bar_h(doc)}, size = {w, doc_bottom_bar_h(doc)}, color = g_theme[.Danger]}})
+			plat.text_draw(gfx, text, L.err, sx(12), base_y, UI_SMALL_PX, g_theme[.Bg_Base])
+		} else {
+			// Text_Muted, not Text_Dim. Text_Dim is the disabled-only tier at 2.9:1
+			// -- below the AA floor by design and labelled "never live text" in
+			// theme.odin -- and the status bar is live text on every frame. Same
+			// defect the tab labels carried.
+			col := g_theme[.Warning] if L.warn else g_theme[.Text_Muted]
+			for c, i in L.cells {
+				cc := col
+				if i == L.accent {cc = g_theme[.Accent]} // the selection cell
+				if i == L.success {cc = g_theme[.Success]} // `Saved`
+				plat.text_draw(gfx, text, c.label, c.tx, base_y, UI_SMALL_PX, cc)
+				// A 1px border_subtle at every cell's LEFT edge except the bar's
+				// very first -- read off §13's mockup DOM, where the right group's
+				// leading cell carries one too. status_divider states the rule once
+				// so the draw cannot answer it differently from a test.
+				if status_divider(L, i) {
+					plat.quads_draw(gfx, quad_pipe, []plat.Quad{{pos = {snap(c.x), h - doc_bottom_bar_h(doc) + sx(6)}, size = {hairline(), doc_bottom_bar_h(doc) - sx(12)}, color = g_theme[.Border_Subtle]}})
+				}
+			}
+			// The variable-length run after the left group: disk state, indexing
+			// progress, the atlas warning. Not cells -- they are sentences, and
+			// several are data-safety warnings with no fixed home for the eye to
+			// learn, which is the argument §13 makes FOR cells.
+			if L.msg != "" {
+				plat.text_draw(gfx, text, L.msg, L.msg_x, base_y, UI_SMALL_PX, col)
+			}
+			// The view name still rides between the groups, and it is still not a
+			// cell: the menus own the view and there is no single obvious action for
+			// a click on it. It drops when the two groups would meet.
+			mode := "    Wrap" if doc.wrap else ""
+			if doc.table {mode = "    Table (Ctrl+T)"}
+			switch doc.md_mode {
+			case .Off:
+			case .Preview:
+				mode = "    Markdown Preview (Ctrl+M)"
+			case .Split:
+				mode = "    Markdown Split (Ctrl+M)"
+			}
+			if mode != "" {
+				// Flush right when the whole right group has dropped, rather than
+				// vanishing with it: the group going means there is MORE room for
+				// this, not less. The first version keyed the whole branch on a
+				// surviving cell and so lost the view name exactly when it was the
+				// only thing that still fitted.
+				rx := w - sx(12) - f32(len(mode)) * cw
+				if len(L.cells) > L.left_n {rx = L.cells[L.left_n].x - sx(12) - f32(len(mode)) * cw}
+				if rx > L.msg_x + f32(len(L.msg)) * cw + sx(12) {
+					plat.text_draw(gfx, text, mode, rx, base_y, UI_SMALL_PX, col)
+				}
+			}
+			// The centred transient (.Info): every [BRACKETED CAPS] note. Success and
+			// Error have their own homes above, so this is only ever a warning now.
+			if notice_live {
+				nt := rc.app.notice
+				plat.text_draw(gfx, text, nt, snap((w - f32(len(nt)) * cw) * 0.5), base_y, UI_SMALL_PX, g_theme[.Warning])
 			}
 		}
-		for c, i in cells {
-			plat.text_draw(gfx, text, c.label, c.x, base_y, UI_SMALL_PX, col)
-			// A divider between cells, never after the last one -- the cells are
-			// placed right to left, so the LAST in this list is the leftmost.
-			if i + 1 < len(cells) {
-				dx := cells[i + 1].x + cells[i + 1].w + sx(12)
-				plat.quads_draw(gfx, quad_pipe, []plat.Quad{{pos = {snap(dx), h - doc_bottom_bar_h(doc) + sx(6)}, size = {hairline(), doc_bottom_bar_h(doc) - sx(12)}, color = g_theme[.Border_Subtle]}})
-			}
-		}
-		// Whatever is left of the cells (the view name) keeps its own slot.
-		if right != "" {
-			rx := cells[len(cells) - 1].x - sx(24) - f32(len(right)) * cw if len(cells) > 0 else w - sx(12) - f32(len(right)) * cw
-			plat.text_draw(gfx, text, right, rx, base_y, UI_SMALL_PX, col)
-		}
-		// The transient notice sits between them, in Success when it is a
-		// confirmation and Warning otherwise -- "[SAVED]" is the one message that
-		// reports something going right.
-		if notice_live {
-			nt := rc.app.notice
-			ncol := g_theme[.Success] if (len(nt) >= 6 && nt[:6] == "[SAVED") else g_theme[.Warning]
-			plat.text_draw(gfx, text, nt, snap((w - f32(len(nt)) * cw) * 0.5), base_y, UI_SMALL_PX, ncol)
-		}
-		_ = notice
 	}
 
 	plat.gfx_end_frame(gfx, 1 if vsync else 0)

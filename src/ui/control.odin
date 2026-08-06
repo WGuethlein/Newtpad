@@ -92,6 +92,16 @@ rnd :: proc(v: f32, on: bool) -> f32 {
 	return f32(int(v + 0.5)) if on else v
 }
 
+// The width `button_layout` will actually produce for a given natural width,
+// rounding included.
+//
+// Exists because a caller that PLACES controls itself -- the status bar walks its
+// right group leftwards from the window edge -- has to step by the same number
+// this package will round to, or the box it steps past and the box it lays out
+// differ by up to a pixel and adjacent controls overlap. `rnd` is private and the
+// rounding does not depend on x, so this is the whole of what such a caller needs.
+snap_w :: proc(w: f32, m: Metrics) -> f32 {return rnd(w, m.snap)}
+
 // THE ONE PRODUCER. `x, y` is the box's top-left.
 button_layout :: proc(x, y: f32, label, chord: string, m: Metrics, tag := 0) -> Button {
 	b := Button {

@@ -8823,6 +8823,166 @@ and not their arity; it does now.
   makes the line matter overnight, which is what its comment is for.
 - `.Font` vs `.Settings` relative order is untestable by construction — both live on one `doc.kind`.
 
+## 6da. The status bar becomes cells, and the +N was never clickable (2026-08-05, v0.87.0, branch `fix/tab-overflow-and-status-cells`)
+
+§13's last three items, the `Status_Cell`-onto-`ui.Button` refactor §6cy left out, and one live bug
+Wyatt reported while choosing the batch. Built from the **mockup DOM**, not the prose — which caught two
+things the prose alone would have got wrong.
+
+### The `+N` overflow count has never been clickable
+
+*"+N but currently it doesn't work"* (Wyatt, live use). It never has.
+
+`WM_NCHITTEST` returns `HT_CLIENT` only for `x < win.tabs_right` and `HT_CAPTION` past it, so a press
+there is an OS window drag the program never sees. `tabs_right` walked the drawn tabs and the `+`
+button — and when tabs overflow, **both of those are placed inside `limit - over_w`, entirely to the
+LEFT of the indicator.** The count is drawn only when tabs overflow, which is exactly when it was
+unreachable: at 320px with three tabs the client region ended at **76** while the indicator spanned
+**130..182**.
+
+`tabseamtest` was green throughout, and its own header says why: it compares the rail as drawn against
+the rail as hit-tested — *within the rail*. It never compared either against the bound that decides
+whether the rail is **reached at all**. That bound is a platform field written from a program walk, and
+nothing owned the seam between them. It does now, asserted as the derivable value: the client region
+ends exactly at the indicator's right edge.
+
+**A register that compares pictures cannot find this.** §5's `+N` was filed as a decision to make, and
+the thing needing a decision was also broken.
+
+### §13: one producer for the whole bar
+
+The left group was a single text run. That cost two things beyond looking wrong: §13's divider rule
+spans the bar, so a producer owning only the right group could not state it; and the right group's DROP
+is measured against the left group's width, so while the left was a string the drop was measured in
+characters against a box in pixels.
+
+`status_bar_layout` now produces both groups as `ui.Button`s, and the draw, the click and the cursor all
+consume that one list. `Status_Cell` is gone — a labelled box with its label already placed IS
+`button_layout`'s job, and `tag` carries the `Command_Id` as an `int`, so `ui` still names nothing that
+lives above it.
+
+**Two corrections the mockup DOM produced, which the prose would not have:**
+
+1. The register said *"the first cell in each group has none"* about the dividers. **Wrong** — the right
+   group's leading cell (`Markdown`) carries a `border-left` too, floating mid-bar. The rule is "every
+   cell but the bar's very first", which is also simpler to test: a **count**, not a bound.
+2. §13's ⚠ — *"`status_cells` guards on `len(out) < 2`… three more cells overflow it silently"* — has
+   been **stale since v0.77.0** and survived four re-counts of that document. The fixed-array pointer
+   makes an undersized buffer a compile error. It mattered immediately: this change took the cell count
+   from 4 to 8.
+
+### Errors replace a modal, which is the point of the rule
+
+§13: *"Errors take the whole bar in danger until dismissed. **Nothing in this app should ever need a
+modal dialog.**"* The dialog that rule is aimed at was `report_save`'s `message_error` — a failed save
+put up a message box that had to be clicked before anything else could happen. It is now the bar.
+
+**Dismissal is any keystroke or a click on the bar** (Wyatt's call; the spec never says). Cleared
+**before** input is drained, not after, and that ordering is the whole subtlety: a `Ctrl+S` that fails
+raises the error during that same frame's dispatch, so clearing afterwards would wipe the error the
+keystroke just produced and the failure would flash for zero frames.
+
+Only the save failure converts in this batch. The other `[BRACKETED CAPS]` notes stay `.Info` — a sticky
+red bar for `[NO MATCHES TO REPLACE]` would be worse than what ships. Converting the rest is owed, one
+judgement per message.
+
+### Decisions taken
+
+| | Decision |
+|---|---|
+| §5 overflow | **`+N` stays**; the mockup's `‹ ›` scrolling rail is not built. |
+| §10 columns | **Leave the slack.** Stretching a 4-column CSV across 1280px reads worse, and the 8-40 character clamp already does the useful part. |
+| §2 type scale | **Keep the two sizes.** The 13 role/size pairs were largely how §2 separated chrome roles inside one PROPORTIONAL family; C4 killed that. |
+| Selection cell | The mockup's `42 selected, 3 lines` in accent, and **the size cell stays** — §13's prose replaces the line count and says nothing about the size. |
+| Left-group clicks | `Ln, Col` → Go To Line. The other two have no honest verb. |
+
+### Sabotages
+
+`statusbartest` is a new one-argument mode (in §7's list) with ~37 assertions, and the old metricstest
+block moved into it. Four sabotages, one at a time:
+
+| Sabotage | Result |
+|---|---|
+| Divider on the bar's first cell | 2 FAIL |
+| `Saved` given an ordinary drop priority | 1 FAIL (survived to 572px where the others reached 456) |
+| Clear the error *after* the drain instead of before | 1 FAIL |
+| Shift the left cells' boxes | 1 FAIL |
+
+**The fourth is the interesting one, because it did not fail the way I expected.** Shifting the box
+moves the label with it — `button_layout` derives one from the other — so the seam assertion could not
+see it and only the absolute-position check did. That is the refactor working: with one producer, box
+and label cannot diverge. The divergence that IS still possible is the *draw* reading `c.x` where it
+should read `c.tx`, and nothing catches that. Owed.
+
+### What the review found, which is where the value of this batch is
+
+The whole-diff review confirmed the reversal, the buffer bound, the drop maths, the memory handling
+and the `tabs_right` fix by re-deriving each — and then broke four things, two of them with probes it
+built and ran.
+
+**1. A failed save reached NOBODY on a non-`.Text` tab.** The producer's `doc.kind != .Text` early
+return sat *above* the error check, so on Settings or the font page the bar drew nothing — and
+`report_save`'s modal was already gone. It is reachable: `request_close_tab` is **not gated on the
+active tab** (the rail's `✕`, `.Tab_Close_This` whose own comment says *"a right-click does not
+activate here"*, `.Tab_Close_Others`), so a dirty file tab can be closed and saved while Settings is in
+front. **An error belongs to the window, not to the document, because the thing that failed may not be
+on screen.** `report_save`'s own header has said *"silence here is a data-loss bug"* the whole time.
+
+**2. Deleting every data-safety warning left the suite 37/37 green.** `status_message_run` returning
+`""` kills `[RECOVERED COPY]`, `[FILE DELETED ON DISK]`, `[CHANGED ON DISK]`, `[GLYPH CACHE FULL]` and
+`[LARGE FILE — unsaved edits are NOT auto-backed up]`. Nothing asserted `L.msg`, `L.msg_x` or `L.warn`:
+they are not cells, so the cell assertions could not see them, and they are the part of this bar whose
+absence actually costs a user something. **The block this mode replaced at least read the concatenated
+string.**
+
+**3. A one-pixel seam, at every scale but the one the test ran at.** The right group stepped by the
+UNROUNDED width while `button_layout` laid the box out at the ROUNDED one, and `rnd(a) + rnd(b) ≠
+rnd(a+b)`. Since `status_cell_at` returns the first cell containing the point, an overlap makes a
+cell's leftmost pixel column dispatch its **left neighbour's** command — on this row that includes a
+whole-buffer re-decode and a whole-buffer line-ending rewrite. **Exactly the accident the drop was
+moved into the producer to prevent, one pixel wide.** Invisible at `UI_SCALE 1` with an integer
+advance, which is where the first version of `statusbartest` ran. Fixed with `ui.snap_w`, and the mode
+now sweeps five scales × five fractional advances × every width from 320 to 1600.
+
+**4. A 4 MiB scan back on the drag path, inside the draw.** `doc_sel_line_count` memoised on the range,
+and a drag-select changes `hi` every frame — so it missed every frame at up to `STATUS_LINE_CAP`.
+`block.odin:709` records that exact scan being **measured at ~3 ms** and removed from that exact path.
+Its own `SEL_LINE_CAP` is 256 KiB now, and a selection past it reports bytes and no line count, which
+is `doc_cursor_line`'s contract. The memo also gained the buffer length, which its neighbour
+`doc_cursor_col` carries and `doc_cursor_line` does not — without it an undo restoring both endpoints
+leaves a stale count.
+
+Plus three smaller ones taken: the scrollbar drag had a top y bound and no bottom one, so with §13's
+cells flush to the window edge it swallowed the last cell's padding and the error bar's dismissal
+target; the view-name indicator vanished when the whole right group dropped, which is when there is
+*more* room for it, not less; and three comments claimed a pointer-cursor consumer that does not exist.
+
+Each fix was sabotage-verified on its own: the unsnapped width (1577 overlaps, worst at scale 2.00),
+the deleted warnings (2 FAIL), the kind gate ahead of the error check (2 FAIL).
+
+### What is not verified
+
+**The bar has not been seen at 1:1.** The geometry is asserted at the value level and a real offscreen
+frame renders clean through `drawcount`, but the computer-use app resolver does not find Newtpad (no
+Start-menu entry), so no capture was taken. Colours, the divider's height and whether the bar reads as
+crowded are owed to a live pass.
+
+### Owed
+
+- The draw could read `c.x` where it means `c.tx` and no test would notice.
+- The remaining `[BRACKETED CAPS]` notices are still `.Info`; several are real failures
+  (`[CUT FAILED …]`, `[REOPEN FAILED …]`, `[THEME NOT SAVED …]`) and should probably be `.Error`.
+- `.Tab_Close_Others` saves in a loop and each failure overwrites the last, so N failures produce one
+  message naming one file.
+- §13 wants **mono digits so `Ln 9 → Ln 10` does not shift the row**. Cell widths track label length, so
+  it still shifts cells 1–2 and every divider by one advance. A fixed-width slot per numeric cell is the
+  fix; not attempted here.
+- `status_cell_at` conflates "no cell here" with "a cell whose command is `.None`" — three cells carry
+  `.None`, so a tag-identity check passes for them regardless. The overlap sweep uses index identity
+  instead, which is what has teeth.
+- No pointer-cursor affordance on the cells, though §13 says every cell is clickable.
+- §13's "numbers in Neon, words in Argon" stays dead with C4.
+
 ## 7. Build environment (Windows, this machine)
 
 - **`build.bat` is the one build script.** `build.bat` = debug, **console subsystem** so the
@@ -8862,6 +9022,7 @@ and not their arity; it does now.
     `mdtest`, `mdviewtest`, `splittest`, `replacetest`, `findtest`, `regextest <mb>`, `metricstest`,
     `quadsdftest`, `scrollgrabtest`, `tabseamtest`, `lineidxtest [file]`, `selalltest`,
     `tablesorttest`, `mdjointest`, `mdfencetest`, `mdperftest`, `mdtabletest`, `blocktest`,
+    `statusbartest`,
     `teartest`, `surfacetest`, `jsontest`
   - Files / session: `savepathtest <dir>`, `savestreamtest`, `savefailtest <dir>`, `resavetest [file]`,
     `diskstamptest`, `sessiontest`, `sessionlosstest <file> [old]`, `watchtest [dir]`,
