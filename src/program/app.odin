@@ -67,6 +67,7 @@ App :: struct {
 	// notice_started until NOTICE_SECONDS later; see app_notice_active.
 	notice:         string,
 	notice_started: time.Tick,
+	notice_kind:    Notice_Kind, // zero is .Info, which is what every caller meant before this existed
 	// The manual update check (update.odin). At most one in flight; joined by
 	// app_destroy below, because a network worker that outlives the window
 	// writes into freed memory.
@@ -81,22 +82,68 @@ App :: struct {
 // start), so a never-set notice_started reads as already-expired for free.
 NOTICE_SECONDS :: 4.0
 
+// What a notice IS, which decides where it is drawn and how long it lives. One
+// severity on the existing transient rather than three parallel mechanisms --
+// there is one message slot and this says what is in it.
+//
+// UI spec 13 asks for two things the old single kind could not express: "Saved
+// for 1.5s in success, then gone" (a CELL, in the right group), and "errors take
+// the whole bar in danger UNTIL DISMISSED. Nothing in this app should ever need
+// a modal dialog." An error therefore has no timeout at all, which is the one
+// thing a purely time-based notice cannot represent.
+Notice_Kind :: enum u8 {
+	Info, // the centred transient, NOTICE_SECONDS, Warning -- every [BRACKETED CAPS] note
+	Success, // the `Saved` cell at the head of the right group, SAVED_SECONDS
+	Error, // the whole bar, Danger, until dismissed
+}
+
 // Set the transient status-bar message, replacing any previous one. notice is
 // always self-owned (only ever set here), so freeing it unconditionally before
 // the clone is safe — the zero value is "", and deleting an empty string is a
 // no-op, not a crash.
-app_note :: proc(a: ^App, msg: string) {
+app_note :: proc(a: ^App, msg: string, kind := Notice_Kind.Info) {
 	delete(a.notice)
 	a.notice = strings.clone(msg) // caller's msg is often temp-allocated
 	a.notice_started = time.tick_now()
+	a.notice_kind = kind
 }
+
+// A failure that must not be missed, and must not be a modal dialog. Stays until
+// the user does the next thing (main.odin clears it on any input, and a click on
+// the bar clears it too).
+app_error :: proc(a: ^App, msg: string) {app_note(a, msg, .Error)}
 
 // Whether the transient notice is still within its display window. One proc
 // so the draw call (main.odin) and anything asserting on it (test_modes.odin)
 // share the same definition of "still showing" instead of the draw call
 // re-deriving it inline, the way the frame-count version used to.
+//
+// .Info only. The other two kinds are drawn as cells or as the whole bar, and
+// each has its own liveness question below -- asking this about a .Success would
+// give it NOTICE_SECONDS instead of §13's 1.5, and asking it about an .Error
+// would expire something the spec says stays until dismissed.
 app_notice_active :: proc(a: ^App) -> bool {
-	return a.notice != "" && time.duration_seconds(time.tick_since(a.notice_started)) < NOTICE_SECONDS
+	return a.notice != "" && a.notice_kind == .Info && time.duration_seconds(time.tick_since(a.notice_started)) < NOTICE_SECONDS
+}
+
+// Whether the `Saved` cell is still showing. §13's 1.5s, not NOTICE_SECONDS.
+app_saved_active :: proc(a: ^App) -> bool {
+	return a.notice != "" && a.notice_kind == .Success && time.duration_seconds(time.tick_since(a.notice_started)) < SAVED_SECONDS
+}
+
+// Whether an error is holding the bar. No timeout by design.
+app_error_active :: proc(a: ^App) -> bool {
+	return a.notice != "" && a.notice_kind == .Error
+}
+
+// Dismiss one. Returns whether there was anything to dismiss, so a caller that
+// wants to CONSUME the click that cleared it can tell.
+app_error_dismiss :: proc(a: ^App) -> bool {
+	if !app_error_active(a) {return false}
+	delete(a.notice)
+	a.notice = ""
+	a.notice_kind = .Info
+	return true
 }
 
 // Whether the palette, the history panel or an open menu is painted OVER the

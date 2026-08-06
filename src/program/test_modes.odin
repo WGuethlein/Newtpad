@@ -19,6 +19,7 @@ import "core:unicode/utf8"
 import "core:unicode/utf16"
 import base "src:base"
 import plat "src:platform"
+import ui "src:ui"
 
 // The headless harness is `package main`, so without a gate every test mode
 // ships inside the customer's exe -- the single largest contributor to release
@@ -31382,169 +31383,285 @@ when NEWTPAD_TESTS {
 				od.find.regex = false
 			}
 
-			// Status cells are clickable, and each maps to its own command.
-			// They were two text runs with no dividers and nothing behind them.
-			{
-				sd: Document
-				sd.kind = .Text
+			return mode_done("metricstest", bad)
+		}
+
+		// `newtpad statusbartest` -- UI spec 13's bar, end to end: three cells on the
+		// left, the divider rule, the drop order, the selection cell, `Saved`, and an
+		// error taking the whole bar.
+		//
+		// Moved out of metricstest 2026-08-05, when the left group became cells and
+		// the producer grew to own the whole bar. One argument and non-zero on
+		// failure, per the keytest/resavetest rule, and in HANDOFF §7's list.
+		if os.args[1] == "statusbartest" {
+			sb_run :: proc() -> int {
+				bad := 0
+				sb_chk :: proc(bad: ^int, ok: bool, label: string) {
+					if !ok {bad^ += 1}
+					fmt.printfln("  %-6s %s", "ok" if ok else "FAIL", label)
+				}
+				// A real document, not a zeroed one: the size cell, the line count and
+				// the selection's line span are all read off the piece table, and a
+				// zero-length buffer silently removes the size cell from every case
+				// below -- which is how a block like this passes vacuously.
+				src := "alpha\nbeta\ngamma\ndelta\nepsilon\n"
+				cbytes := make([]u8, len(src))
+				copy(cbytes, transmute([]u8)src)
+				sd := doc_from_content(cbytes, "fixture.txt", .UTF8)
+				defer doc_close(&sd)
+				// doc_from_content leaves it dirty, and the dirty marker rides in the
+				// count cell -- so every label assertion below would carry a trailing
+				// " *". Cleared here and asserted on its own terms further down.
+				sd.modified = false
+				a: App
+				menu_init(&a.menu)
 				UI_SCALE = 1
 				W, H := f32(1280), f32(900)
 				cw := f32(7)
-				// status_cells reads the LEFT group's width to decide which cells
-				// drop, and status_left_text needs a real Text for the cursor column
-				// and the atlas warning. A zero Text would measure the left group at
-				// the wrong width and silently change which cells this block sees.
+				// A real Text: the producer needs it for the cursor column, the tab
+				// width cell and the atlas warning. A zero Text measures the left group
+				// at the wrong width and silently changes which cells this block sees.
 				mt: plat.Text
 				plat.text_load_faces(&mt)
-				sbuf: [STATUS_CELL_MAX]Status_Cell
-				cs := status_cells(&sd, &mt, W, cw, &sbuf)
-				// Four now, UI spec 13's `Markdown · UTF-8 · LF · Tab 4`. Cells come
-				// back right-to-left, so cs[0] is the RIGHTMOST -- which is why the
-				// two assertions below identify cells by COMMAND rather than by
-				// index. They used to read cs[0] as the line-ending cell, which was
-				// true with two cells and silently became `Tab 4` with four; an
-				// index into a list whose length is the thing under test is a
-				// stale assertion waiting to happen.
-				mt_chk(&bad, len(cs) == 4, fmt.tprintf("the right group has %d cells (want 4)", len(cs)))
-				eol_cell :: proc(cs: []Status_Cell) -> (Status_Cell, bool) {
-					for c in cs {
-						if c.cmd == .Eol_LF || c.cmd == .Eol_CRLF {return c, true}
+				buf: [STATUS_CELL_MAX]ui.Button
+				by := H - doc_bottom_bar_h(&sd) * 0.5 // the bar's vertical middle
+
+				// -- 1. the left group is three cells, and only one of them acts ------
+				L := status_bar_layout(&a, &sd, &mt, W, H, cw, &buf)
+				sb_chk(&bad, L.left_n == 3, fmt.tprintf("the left group is 3 cells (%d)", L.left_n))
+				cmds := 0
+				for i in 0 ..< L.left_n {
+					if Command_Id(L.cells[i].tag) != .None {cmds += 1}
+				}
+				sb_chk(&bad, cmds == 1 && Command_Id(L.cells[0].tag) == .Goto_Line, fmt.tprintf("only Ln/Col acts, and it opens Go To Line (%d with a command, first=%v)", cmds, Command_Id(L.cells[0].tag)))
+				sb_chk(&bad, len(L.cells) == L.left_n + 4, fmt.tprintf("plus the right group's four: %d cells total", len(L.cells)))
+				// The left group starts flush left at the padding, not at 0 -- the box
+				// begins at 0 and the LABEL is inset by it.
+				sb_chk(&bad, L.cells[0].x == 0 && L.cells[0].tx == sx(12), fmt.tprintf("the first box is flush left and its label is inset 12px (x=%.0f tx=%.0f)", L.cells[0].x, L.cells[0].tx))
+
+				// -- 2. the divider rule, as a COUNT rather than a bound --------------
+				//
+				// §13's mockup gives every cell `border-left: 1px solid #322d28` and
+				// only the bar's very first has none -- the right group's leading cell
+				// carries one, floating mid-bar. The register recorded it as "the first
+				// cell in each group has none", which is a different rule and would
+				// have dropped that one. Counted, so "some dividers exist" cannot pass.
+				divs := 0
+				for _, i in L.cells {
+					if status_divider(L, i) {divs += 1}
+				}
+				sb_chk(&bad, divs == len(L.cells) - 1, fmt.tprintf("a divider at every cell but the first (%d for %d cells)", divs, len(L.cells)))
+				sb_chk(&bad, !status_divider(L, 0), "...and specifically not on the first")
+				sb_chk(&bad, status_divider(L, L.left_n), "...and specifically ON the right group's leading cell")
+
+				// -- 3. the selection cell -------------------------------------------
+				sd.anchor, sd.cursor = 0, 11 // "alpha\nbeta\n"
+				L2 := status_bar_layout(&a, &sd, &mt, W, H, cw, &buf)
+				sb_chk(&bad, L2.accent == 1, fmt.tprintf("the selection cell is the second, in accent (accent=%d)", L2.accent))
+				sb_chk(&bad, L2.cells[1].label == "11 selected, 2 lines", fmt.tprintf("...and carries both numbers: %q", L2.cells[1].label))
+				accents := 0
+				for _, i in L2.cells {
+					if i == L2.accent {accents += 1}
+				}
+				sb_chk(&bad, accents == 1, fmt.tprintf("exactly one cell is accent (%d)", accents))
+				// A selection ending on a newline spans the lines it covers, not one
+				// more: the trailing \n terminates the second line rather than starting
+				// a third.
+				sd.anchor, sd.cursor = 0, 6 // "alpha\n"
+				L3 := status_bar_layout(&a, &sd, &mt, W, H, cw, &buf)
+				sb_chk(&bad, L3.cells[1].label == "6 selected, 1 lines", fmt.tprintf("a selection ending on \\n does not gain a line: %q", L3.cells[1].label))
+				// The dirty marker rides with the count it qualifies. §4 gives every tab
+				// a RESERVED dirty slot, so the fact is already on screen -- this is the
+				// one element of the bar §13's mockup does not account for, kept rather
+				// than removed as an unasked-for change.
+				sd.modified = true
+				Lm := status_bar_layout(&a, &sd, &mt, W, H, cw, &buf)
+				sb_chk(&bad, strings.has_suffix(Lm.cells[1].label, " *"), fmt.tprintf("a modified buffer marks the count cell: %q", Lm.cells[1].label))
+				sd.modified = false
+
+				// -- 4. the size cell survives a selection (Wyatt, 2026-08-05) --------
+				sb_chk(&bad, L2.left_n == 3, fmt.tprintf("the size cell survives a selection (%d left cells)", L2.left_n))
+				sd.anchor, sd.cursor = 0, 0
+				// ...and is dropped, not zeroed, on an empty buffer. "0 B" beside
+				// "1 lines" on a fresh scratch tab is noise, and the left group never
+				// drops, so anything put there is on screen forever.
+				{
+					ed: Document
+					ed.kind = .Text
+					Le := status_bar_layout(&a, &ed, &mt, W, H, cw, &buf)
+					sb_chk(&bad, Le.left_n == 2, fmt.tprintf("an empty buffer has no size cell (%d left cells)", Le.left_n))
+				}
+
+				// -- 5. `Saved` ------------------------------------------------------
+				app_note(&a, "Saved", .Success)
+				Ls := status_bar_layout(&a, &sd, &mt, W, H, cw, &buf)
+				sb_chk(&bad, Ls.success == Ls.left_n, fmt.tprintf("`Saved` is the right group's LEADING cell (success=%d, left_n=%d)", Ls.success, Ls.left_n))
+				sb_chk(&bad, Ls.success >= 0 && Ls.cells[Ls.success].label == "Saved", fmt.tprintf("...and says so: %q", Ls.cells[Ls.success].label if Ls.success >= 0 else ""))
+				sb_chk(&bad, len(Ls.cells) == len(L.cells) + 1, fmt.tprintf("...and is an extra cell, not a replacement (%d vs %d)", len(Ls.cells), len(L.cells)))
+				// Gone when its window closes. The zero Tick predates process start, so
+				// it reads as already-expired -- the same trick app_notice_active's own
+				// comment describes, and it avoids a 1.5s sleep in a test.
+				a.notice_started = {}
+				Lx := status_bar_layout(&a, &sd, &mt, W, H, cw, &buf)
+				sb_chk(&bad, Lx.success < 0 && len(Lx.cells) == len(L.cells), fmt.tprintf("...and is gone once its 1.5s is up (success=%d, %d cells)", Lx.success, len(Lx.cells)))
+				// It is .Success, so it must NOT also be drawn as the centred .Info
+				// notice -- that would put "Saved" on the bar twice.
+				app_note(&a, "Saved", .Success)
+				sb_chk(&bad, !app_notice_active(&a) && app_saved_active(&a), fmt.tprintf("a Success notice is not ALSO the centred transient (info=%v saved=%v)", app_notice_active(&a), app_saved_active(&a)))
+
+				// -- 6. `Saved` outlives every other cell as the window narrows -------
+				//
+				// §5 never ranked it because it did not exist. It is transient and
+				// self-clearing, so keeping it costs at most 1.5s of one other cell,
+				// while dropping it loses the confirmation on exactly the narrow window
+				// where the tab's asterisk is hardest to see.
+				{
+					last_saved, last_any := -1, -1
+					for wpx := 1600; wpx >= 320; wpx -= 4 {
+						Ln := status_bar_layout(&a, &sd, &mt, f32(wpx), H, cw, &buf)
+						if Ln.success >= 0 {last_saved = wpx}
+						if len(Ln.cells) > Ln.left_n {last_any = wpx}
+					}
+					sb_chk(&bad, last_saved >= 0 && last_saved <= last_any, fmt.tprintf("`Saved` survives to the narrowest width any right cell does (%d vs %d)", last_saved, last_any))
+				}
+				a.notice_started = {}
+				app_note(&a, "", .Info)
+
+				// -- 7. an error takes the WHOLE bar and suppresses every cell --------
+				app_error(&a, "Could not save: file is read-only")
+				Le := status_bar_layout(&a, &sd, &mt, W, H, cw, &buf)
+				sb_chk(&bad, Le.err == "Could not save: file is read-only", fmt.tprintf("the error holds the bar: %q", Le.err))
+				sb_chk(&bad, len(Le.cells) == 0, fmt.tprintf("...and no cell exists behind it (%d)", len(Le.cells)))
+				// So nothing is clickable there either -- the draw and the hit-test
+				// cannot disagree about cells that do not exist.
+				sb_chk(&bad, status_cell_at(&a, &sd, &mt, W, H, cw, W - 40, by) == .None, "...so a click on the bar dispatches nothing")
+				// No timeout: §13 says "until dismissed", and a notice that expired on
+				// its own would drop a failure the user never saw.
+				a.notice_started = {}
+				sb_chk(&bad, app_error_active(&a), "an error does not expire on a timer")
+				sb_chk(&bad, app_error_dismiss(&a), "...and dismissing it reports that it did something")
+				sb_chk(&bad, !app_error_active(&a) && !app_error_dismiss(&a), "...and a second dismissal is a no-op")
+
+				// -- 8. the frame loop clears an error BEFORE it drains input ---------
+				//
+				// A Ctrl+S that fails raises the error during that same frame's
+				// dispatch, so clearing afterwards would wipe the error the keystroke
+				// just produced and the failure would flash for zero frames. The frame
+				// loop has no message pump under test, so this is a source check for
+				// the same reason tablegridtest's F1 is one -- written as an ORDER
+				// between two landmarks, so a rename does not break it while moving the
+				// clear after the drain does.
+				{
+					msrc := #load("main.odin", string)
+					clear_at := strings.index(msrc, "app_error_dismiss(&app)}")
+					drain_at := strings.index(msrc, "for i in 0 ..< window.char_count {")
+					ordered := clear_at > 0 && drain_at > 0 && clear_at < drain_at
+					sb_chk(&bad, ordered, fmt.tprintf("the error is cleared before input is drained (clear=%d drain=%d)", clear_at, drain_at))
+				}
+
+				// -- 9. THE SEAM: what is drawn is what is clickable ------------------
+				//
+				// Sampled at both edges and the middle, because an off-by-one lives at
+				// an edge and nowhere else.
+				{
+					Lz := status_bar_layout(&a, &sd, &mt, W, H, cw, &buf)
+					hits, misses := 0, 0
+					for c in Lz.cells {
+						for px in ([]f32{c.x, c.x + c.w * 0.5, c.x + c.w - 1}) {
+							if status_cell_at(&a, &sd, &mt, W, H, cw, px, by) == Command_Id(c.tag) {
+								hits += 1
+							} else {
+								misses += 1
+							}
+						}
+					}
+					sb_chk(&bad, misses == 0, fmt.tprintf("every drawn cell hit-tests to its own command at both edges and the middle (%d/%d)", hits, hits + misses))
+					// Cells must not overlap, or one swallows the other's clicks. Every
+					// adjacent pair, left to right.
+					laps := 0
+					for i in 1 ..< len(Lz.cells) {
+						if Lz.cells[i].x < Lz.cells[i - 1].x + Lz.cells[i - 1].w {laps += 1}
+					}
+					sb_chk(&bad, laps == 0, fmt.tprintf("no two cells overlap (%d overlapping pair(s))", laps))
+					// Above the bar is not a cell -- the editor owns that pixel.
+					sb_chk(&bad, status_cell_at(&a, &sd, &mt, W, H, cw, Lz.cells[0].x + 2, H - doc_bottom_bar_h(&sd) - 4) == .None, "a click above the bar is not a cell")
+				}
+
+				// -- the drop order, carried over from metricstest ---------------------
+				//
+				// UI spec 5: "Tab width -> LF -> UTF-8 -> language", so the language
+				// survives longest, as §5's own 700px mockup shows (`Markdown · UTF-8`).
+				// Pinned as a sequence of surviving sets rather than one width, because
+				// the width at which each drop happens depends on the font and the left
+				// group.
+				eol_cell :: proc(L: Status_Bar) -> (ui.Button, bool) {
+					for c in L.cells {
+						if Command_Id(c.tag) == .Eol_LF || Command_Id(c.tag) == .Eol_CRLF {return c, true}
 					}
 					return {}, false
 				}
-				by := H - doc_bottom_bar_h(&sd) + doc_bottom_bar_h(&sd) * 0.5
-				hits := 0
-				for c in cs {
-					if status_cell_at(&sd, &mt, W, H, cw, c.x + c.w * 0.5, by) == c.cmd {hits += 1}
-				}
-				mt_chk(&bad, hits == len(cs), fmt.tprintf("every cell hit-tests to its own command (%d/%d)", hits, len(cs)))
-				// Cells must not overlap, or one swallows the other's clicks. Every
-				// adjacent pair, not just the first two.
-				{
-					laps := 0
-					for i in 1 ..< len(cs) {
-						if cs[i].x + cs[i].w > cs[i - 1].x {laps += 1}
-					}
-					mt_chk(&bad, laps == 0, fmt.tprintf("no two cells overlap (%d overlapping pair(s))", laps))
-				}
-				// Above the bar is not a cell -- the editor owns that pixel.
-				mt_chk(&bad, status_cell_at(&sd, &mt, W, H, cw, cs[0].x + 2, H - doc_bottom_bar_h(&sd) - 4) == .None, "a click above the bar is not a cell")
-				// The line-ending cell toggles TO the other value, so clicking it
-				// twice returns where it started rather than sticking.
-				sd.eol = .LF
-				e1, ok1 := eol_cell(status_cells(&sd, &mt, W, cw, &sbuf))
-				sd.eol = .CRLF
-				e2, ok2 := eol_cell(status_cells(&sd, &mt, W, cw, &sbuf))
-				mt_chk(&bad, ok1 && ok2 && e1.cmd != e2.cmd, fmt.tprintf("the line-ending cell offers the OTHER value (%v then %v)", e1.cmd, e2.cmd))
-				mt_chk(&bad, ok1 && e1.label == "LF" && ok2 && e2.label == "CRLF", fmt.tprintf("...and says which it currently is (%q then %q)", e1.label, e2.label))
-
-				// UI spec 5's drop ORDER, which this rewrite corrects: "Tab width ->
-				// LF -> UTF-8 -> language". The old code dropped the LEFTMOST cell
-				// first, i.e. the language, which is exactly backwards -- §5's own
-				// 700px mockup keeps `Markdown · UTF-8`. Pinned as a sequence of
-				// surviving sets rather than one width, because the widths at which
-				// each drop happens depend on the font and the left group.
 				{
 					sd.eol = .LF
 					seen: [dynamic]string
 					defer delete(seen)
 					last := -1
 					for wpx := 1600; wpx >= 320; wpx -= 4 {
-						cc := status_cells(&sd, &mt, f32(wpx), cw, &sbuf)
-						if len(cc) == last {continue}
-						last = len(cc)
-						// cs is right-to-left; the leftmost survivor is cc[len-1].
-						append(&seen, cc[len(cc) - 1].label if len(cc) > 0 else "-")
+						Lw := status_bar_layout(&a, &sd, &mt, f32(wpx), H, cw, &buf)
+						right := Lw.cells[Lw.left_n:]
+						if len(right) == last {continue}
+						last = len(right)
+						append(&seen, right[0].label if len(right) > 0 else "-")
 					}
-					// However many steps it takes, the leftmost survivor is always
-					// the language cell until nothing is left at all.
 					lang := highlight_language_name(sd.path)
 					good := true
 					for s in seen {
 						if s != lang && s != "-" {good = false}
 					}
-					mt_chk(&bad, good, fmt.tprintf("the language cell is the last to go as the window narrows (leftmost seen: %v, language=%q)", seen[:], lang))
-					// And the rightmost cell -- Tab width -- is the first to go.
-					wide := status_cells(&sd, &mt, 1600, cw, &sbuf)
-					mt_chk(&bad, len(wide) == 4 && wide[0].cmd == .Settings_Open && wide[0].label[:3] == "Tab", fmt.tprintf("Tab width is the rightmost cell, so it drops first (%q)", wide[0].label if len(wide) > 0 else ""))
+					sb_chk(&bad, good, fmt.tprintf("the language cell is the last to go as the window narrows (leading survivor seen: %v, language=%q)", seen[:], lang))
+					wide := status_bar_layout(&a, &sd, &mt, 1600, H, cw, &buf)
+					rw := wide.cells[wide.left_n:]
+					sb_chk(&bad, len(rw) == 4 && len(rw[3].label) >= 3 && rw[3].label[:3] == "Tab", fmt.tprintf("Tab width is the rightmost cell, so it drops first (%q)", rw[3].label if len(rw) == 4 else ""))
 				}
+				// The line-ending cell toggles TO the other value, so clicking it twice
+				// returns where it started rather than sticking.
+				sd.eol = .LF
+				e1, ok1 := eol_cell(status_bar_layout(&a, &sd, &mt, W, H, cw, &buf))
+				sd.eol = .CRLF
+				e2, ok2 := eol_cell(status_bar_layout(&a, &sd, &mt, W, H, cw, &buf))
+				sb_chk(&bad, ok1 && ok2 && e1.tag != e2.tag, fmt.tprintf("the line-ending cell offers the OTHER value (%v then %v)", Command_Id(e1.tag), Command_Id(e2.tag)))
+				sb_chk(&bad, ok1 && e1.label == "LF" && ok2 && e2.label == "CRLF", fmt.tprintf("...and says which it currently is (%q then %q)", e1.label, e2.label))
+				sd.eol = .LF
 
-				// Cells never collide with the left group, at any width. The
-				// window has a floor, but between the floor and a comfortable
-				// width nothing dropped IN ORDER -- the right group kept drawing
-				// until it ran into the left one and the two overlapped.
+				// A dropped cell is not clickable where it used to be. The fixture needs
+				// a genuinely long left group or nothing drops and this passes
+				// vacuously -- `recovered` adds a ~55-character warning, which is the
+				// realistic case: the bar is widest exactly when something has gone
+				// wrong.
 				{
-					sd.eol = .LF
-					left_w := f32(30) * cw // a plausible "Ln 124, Col 94    778 lines"
-					worst := f32(-1)
-					for wpx := 320; wpx <= 1600; wpx += 7 {
-						W2 := f32(wpx)
-						cc := status_cells(&sd, &mt, W2, cw, &sbuf)
-						need := sx(12) + left_w + sx(24)
-						for len(cc) > 0 && cc[len(cc) - 1].x < need {cc = cc[:len(cc) - 1]}
-						// Whatever survives must start clear of the left group.
-						for c in cc {
-							if c.x < need {worst = W2}
-						}
-					}
-					mt_chk(&bad, worst < 0, fmt.tprintf("no window width lets a cell collide with the left group (worst %.0f)", worst))
-					// And the order is right-to-left: at a width that drops one,
-					// the one dropped is the LEFTMOST of the group.
-					// THE DROP IS PART OF THE GEOMETRY, AND THE CLICK AGREES WITH IT.
-					//
-					// The assertion that used to sit here read "status_cells itself
-					// does not drop -- the caller does, so the geometry stays one
-					// thing", and it had it exactly backwards: the caller dropping is
-					// what made the geometry TWO things. The draw dropped cells and
-					// status_cell_at did not, so a dropped cell was invisible and
-					// still clickable, and a click where the LF cell had been fired
-					// `.Eol_CRLF` -- a whole-buffer rewrite from a click on blank
-					// space. It also passed vacuously: on a clean empty document the
-					// left group is short enough that nothing drops at 420 either.
-					//
-					// So: a fixture whose left group is genuinely long. `recovered`
-					// adds a ~55-character warning, which is the realistic case --
-					// the bar is widest exactly when something has gone wrong.
 					sd.recovered = true
 					defer sd.recovered = false
-					narrow := status_cells(&sd, &mt, 420, cw, &sbuf)
-					wide := status_cells(&sd, &mt, 1600, cw, &sbuf)
-					mt_chk(&bad, len(wide) > len(narrow), fmt.tprintf("a narrow window drops cells the wide one keeps (%d narrow vs %d wide)", len(narrow), len(wide)))
-					// The precondition, or everything below is about an empty list.
-					mt_chk(&bad, len(wide) > 0, fmt.tprintf("the wide window has cells at all (%d)", len(wide)))
-					// THE SEAM: every cell the wide window drops must be unclickable
-					// at the narrow width, at the exact x it occupied when it existed.
+					nbuf: [STATUS_CELL_MAX]ui.Button
+					narrow := status_bar_layout(&a, &sd, &mt, 420, H, cw, &nbuf)
+					wide := status_bar_layout(&a, &sd, &mt, 1600, H, cw, &buf)
+					sb_chk(&bad, len(wide.cells) > len(narrow.cells), fmt.tprintf("a narrow window drops cells the wide one keeps (%d narrow vs %d wide)", len(narrow.cells), len(wide.cells)))
 					leaked := Command_Id.None
 					leak_x := f32(0)
-					for c in wide {
+					for c in wide.cells {
 						still := false
-						for k in narrow {
-							if k.cmd == c.cmd {still = true}
+						for k in narrow.cells {
+							if k.tag == c.tag {still = true}
 						}
 						if still {continue}
-						by2 := H - doc_bottom_bar_h(&sd) * 0.5
-						if got := status_cell_at(&sd, &mt, 420, H, cw, c.x + c.w * 0.5, by2); got != .None {
+						if got := status_cell_at(&a, &sd, &mt, 420, H, cw, c.x + c.w * 0.5, by); got != .None {
 							leaked, leak_x = got, c.x
 						}
 					}
-					mt_chk(&bad, leaked == .None, fmt.tprintf("a dropped cell is not clickable where it used to be (x=%.0f dispatched %v)", leak_x, leaked))
-					// WHAT THIS PAIR CAN AND CANNOT CATCH, since the difference decides
-					// whether the next reader trusts it too far.
-					//
-					// The first assertion is the load-bearing one: delete the drop from
-					// status_cells and it fails (2 narrow vs 2 wide), which is what pins
-					// the drop inside the shared producer rather than in a caller.
-					//
-					// The leak assertion goes VACUOUS under that same sabotage -- with
-					// nothing dropped there is nothing to leak -- so it is a guard on the
-					// current design, not an independent check. And neither can see the
-					// DRAW: if someone re-adds a post-filter in main.odin the geometry is
-					// two things again and both of these still pass. Catching that needs
-					// the draw to report what it drew, drawcount-style. Owed.
+					sb_chk(&bad, leaked == .None, fmt.tprintf("a dropped cell is not clickable where it used to be (x=%.0f dispatched %v)", leak_x, leaked))
 				}
+				return bad
 			}
-
-			return mode_done("metricstest", bad)
+			fmt.println("statusbartest:")
+			return mode_done("statusbartest", sb_run())
 		}
 
 		// `newtpad tabseamtest` compares the tab rail as DRAWN against the tab rail

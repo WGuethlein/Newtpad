@@ -187,8 +187,10 @@ as the palette.)*
 ### §2 Metrics & type — 3 items
 - ~~[F] **Chrome family: Argon.**~~ **STRUCK by C4.**  See above. *The single highest-value item in this document.*
 - ~~[F] Font embedding (~1.1 MB, four faces) with Consolas fallback.~~ **STRUCK by C4.** 
-- [V] Per-role type scale — the spec names 13 distinct role/size pairs; the app has two UI sizes
-  (`UI_PX`, `UI_SMALL_PX`). Mostly moot until Argon lands, then worth one pass.
+- ~~[V] Per-role type scale — the spec names 13 distinct role/size pairs.~~ **STRUCK by DECISION
+  (Wyatt, 2026-08-05): keep the two sizes** (`UI_PX` 15, `UI_SMALL_PX` 13). The 13 pairs were largely
+  how §2 distinguished chrome roles inside one PROPORTIONAL family; with C4 rejecting Argon most of
+  that distinction is gone, and 13 sizes in one monospace face reads as noise.
 - [✓] Chrome metrics that already match: 40px rail, 30px tab, 132/220 tab clamp, reserved 8px dirty
   slot, 30px menu bar, 26px status bar, 28px menu row, 30px palette row, radii set.
 
@@ -207,9 +209,17 @@ as the palette.)*
 - [✓] Pill tabs, radii, per-tab `✕`, `+`, reserved dirty slot, caption buttons all match.
 
 ### §5 Narrow windows — 2 items
-- [V] Overflow is a `+N` indicator that opens the palette's tab list. The mockup specifies a
-  **scrolling rail with `‹` `›` chevrons** once tabs hit the 132px floor. Different mechanism, same
-  goal — worth a decision, not an automatic change.
+- ~~[V] Overflow is a `+N` indicator that opens the palette's tab list.~~ **DECIDED (Wyatt, 2026-08-05):
+  the `+N` stays**, the mockup's `‹` `›` scrolling rail is not built. One click reaches any tab by name
+  and by typing, which beats chevron-scrolling to hunt for one visually, and it reuses a surface that
+  already scrolls and filters.
+  **And it did not work — fixed in v0.87.0.** *"+N but currently it doesn't work"* (Wyatt, live use), and
+  it never had: `WM_NCHITTEST` returns `HT_CLIENT` only for `x < win.tabs_right`, `tabs_right` walked the
+  drawn tabs and the `+` button, and when tabs overflow BOTH of those are placed inside `limit - over_w`
+  — entirely to the LEFT of the indicator. The count is drawn only when tabs overflow, which is exactly
+  when it sat in the OS drag region: at 320px with three tabs the client region ended at 76 while the
+  indicator spanned 130..182. **A decision the register recorded as open was also a live bug, and the
+  register could not have seen it — it compares pictures.**
 - ~~[F] The `>_` drop at 460px and the menu-bar → `☰` collapse at 360px.~~ **SHIPPED v0.77.0 (360px; the 460px `>_` drop is still open).**  The `☰` metric exists
   (`ui_tabs.odin:50`); the behaviour rides on Show Menu Bar.
 - [✓] 318px floor honoured. Status cells drop at ~700px, and they drop by **measuring** the left
@@ -287,7 +297,9 @@ Remaining, all verified at 1:1:
 > | Weak header band | `table.odin:4182,4314` draw `Bg_Raised`, and `4321` draws the 1px `Border_Strong` rule §10 asks for, deliberately last so it survives descenders. |
 
 Remaining:
-- [V] Columns do not fill the pane — the grid stops partway and leaves the rest empty. §10's rule, as
+- ~~[V] Columns do not fill the pane~~ **STRUCK by DECISION (Wyatt, 2026-08-05): leave the slack.** A
+  4-column CSV stretched across 1280px puts huge gaps between related values and reads worse; the 8-40
+  character clamp already does the useful part. The original entry, for the record: §10's rule, as
   quoted in `markdown.odin:548`, is *"measure the first 200 rows, clamp each column to 8-40
   characters, distribute leftover width proportionally"*, and the mockup's columns are `fr` units that
   fill. **Unverified whether the code intends the slack**, and it is arguably right not to stretch a
@@ -329,13 +341,17 @@ Seam fixed (the drop lives in `status_cells`), and the selection count already r
 exactly as §13 asks — verified live (`Ln 3, Col 22   3 selected`).
 - ~~[F] `42.1 KB` file-size cell. [F] Language cell~~ **SHIPPED v0.74.0 (all three cells).**  — the right group shows the **view name**
   (`Markdown Split (Ctrl+M)`) where the mockup shows `Markdown`. [F] `Tab 4` cell.
-- [F] `Saved` as a **cell** in `success`; today it is a centred transient notice.
-- [V] The left group is one text run; the mockup is three cells, each `padding 0 12px` with a 1px
-  `border_subtle` on its left edge (the first cell in each group has none).
+- ~~[F] `Saved` as a **cell** in `success`; today it is a centred transient notice.~~ **SHIPPED v0.87.0.**
+- ~~[V] The left group is one text run; the mockup is three cells, each `padding 0 12px` with a 1px
+  `border_subtle` on its left edge~~ **SHIPPED v0.87.0.** *(The parenthetical it used to carry — "the first cell in each group has none" — was WRONG. The mockup DOM gives the right group's
+  leading cell a `border-left` too; the rule is "every cell but the bar's very first".)*
 - ~~[V] **Numbers in Neon, words in Argon**~~ **STRUCK by C4 (Argon rejected).**  — a two-font rule *inside* the bar. Blocked on §2.
-- [F] Errors take the whole bar in `danger`.
-- ⚠ `status_cells` guards on `len(out) < 2` and callers pass `[4]Status_Cell`. Three more cells
-  overflow it silently. Grow the buffer and check every call site first.
+- ~~[F] Errors take the whole bar in `danger`.~~ **SHIPPED v0.87.0** — and it replaced the modal message
+  box a failed save used to put up, which is the dialog §13's "nothing in this app should ever need a
+  modal dialog" is aimed at.
+- ~~⚠ `status_cells` guards on `len(out) < 2` and callers pass `[4]Status_Cell`.~~ **STRUCK — stale
+  since v0.77.0 (§6cq).** It takes a fixed-array POINTER, so an undersized buffer is a COMPILE error at
+  every call site. The warning survived four re-counts of this document unchecked.
 
 ### §15 The empty tab — 0 items
 `main.odin:2252` carries exactly the spec's three hints (`Ctrl+O open a file`, `Ctrl+P commands`,

@@ -1040,87 +1040,81 @@ doc_top_bar_h :: proc(doc: ^Document) -> f32 {
 // now -- the find bar moved to doc_top_bar_h. Document rows must stop above it,
 // or text is drawn behind the bar and clicks in that strip land on rows the user
 // cannot see.
-// The status bar's right-hand cells, as rects. ONE geometry, consumed by the
-// draw and by the click -- UI spec 13: "Every cell is clickable. Encoding opens
-// the encoding menu, LF toggles line endings."
+// The status bar's cells, as boxes. ONE geometry for the WHOLE bar, consumed by
+// the draw, the click and the cursor -- UI spec 13: "Cells, not a sentence. 12px
+// padding each side, a 1px border_subtle between."
 //
-// Right-hand only. The left group is position and file facts that nothing can
-// usefully do anything with (clicking "Ln 124" has no meaning), whereas every
-// cell on the right names a SETTING with an obvious action.
-Status_Cell :: struct {
-	label: string,
-	x, w:  f32,
-	cmd:   Command_Id,
+// BOTH GROUPS, from one producer, as of 2026-08-05. The left group used to be a
+// single text run, which cost two things. The divider rule spans the bar (§13's
+// mockup gives every cell a `border-left` except the very first, the right
+// group's leading cell included), so a producer that owned only the right group
+// could not state it. And the right group's DROP is measured against the left
+// group's width, so while the left was a string the drop was measured in
+// characters against a box in pixels.
+//
+// `ui.Button` rather than a local struct: a labelled box with its label already
+// placed IS `ui.button_layout`'s job, and `tag` carries the Command_Id (an `int`,
+// because `ui` must not name a type that lives above it). §6cy moved every other
+// control in the product onto it and deliberately skipped this one.
+Status_Bar :: struct {
+	cells:   []ui.Button, // the left group, then the right group, left to right
+	left_n:  int, // cells[:left_n] is the left group
+	accent:  int, // the selection cell, or -1
+	success: int, // the `Saved` cell, or -1
+	msg:     string, // the trailing warning run: disk state, indexing, atlas
+	msg_x:   f32,
+	warn:    bool, // the left group's colour
+	err:     string, // non-empty: the bar IS this, in Danger, and `cells` is empty
 }
 
-// Every cell the right group can hold at once, and the reason the buffer is a
-// FIXED ARRAY POINTER in status_cells' signature rather than a slice.
+// Every cell the bar can hold at once: three on the left, `Saved` plus four on
+// the right.
 //
-// It used to take `out: []Status_Cell` and every call site passed `[4]`. That is
-// fine while there are two cells and silently wrong the moment there are more:
-// status_cells fills up to len(out) and returns the prefix, so a fifth cell would
-// not overflow, not warn, and not appear -- it would simply never exist, in the
+// The buffer is a FIXED ARRAY POINTER in the signature rather than a slice, and
+// that is load-bearing. It used to take `out: []Status_Cell` and every call site
+// passed `[4]`. That is fine while there are two cells and silently wrong the
+// moment there are more: the producer fills up to len(out) and returns the
+// prefix, so a fifth cell would not overflow, not warn, and not appear -- in the
 // draw AND in the hit-test, identically, which is the one bug shape that leaves
-// no evidence. The four call sites (here, main.odin's draw, and two in
-// test_modes) would each have needed finding by hand.
-//
-// `^[STATUS_CELL_MAX]Status_Cell` makes an undersized buffer a COMPILE error at
-// every call site instead, which is the same argument key_names' total enumerated
-// array makes: the compiler is the only thing that reliably finds all four.
-STATUS_CELL_MAX :: 4
+// no evidence. `^[STATUS_CELL_MAX]ui.Button` makes an undersized buffer a
+// COMPILE error at every call site instead. That mattered again immediately:
+// this change took the count from 4 to 8.
+STATUS_CELL_MAX :: 8
 
-// Fills `out` and returns the used prefix. `cw` is the status font's advance.
-// The status bar's LEFT group, as one string. UI spec 13: facts about position,
-// plus everything transient, because that is the half already changing as you work.
-//
-// Extracted from the draw 2026-08-04. It is not cosmetic that this has one home:
-// the right-hand cells DROP when they would collide with this group, so its width
-// decides which cells exist -- and while the draw owned the string, the hit-test
-// could not know the width and so could not know which cells had dropped. It
-// walked all of them, and a click where a dropped cell used to be dispatched that
-// cell's command. On the LF cell that is `.Eol_CRLF`: a whole-buffer rewrite from
-// a click on empty space.
-//
-// Takes `text` only for the glyph-atlas warning, which is a property of the
-// renderer rather than the document.
-status_left_text :: proc(doc: ^Document, text: ^plat.Text) -> string {
-	ln := doc_cursor_line(doc)
-	cl := doc_cursor_col(doc, text)
-	lncol: string
-	switch {
-	case ln > 0 && cl > 0:
-		lncol = fmt.tprintf("Ln %d, Col %d", ln, cl)
-	case cl > 0:
-		lncol = fmt.tprintf("Col %d", cl)
-	case ln > 0:
-		lncol = fmt.tprintf("Ln %d", ln)
-	case:
-		lncol = "Ln -, Col -"
+// `Saved` shows for 1.5s, per §13: "Saved for 1.5s in success, then gone. No
+// toast, no dialog, no sound." Its own constant rather than NOTICE_SECONDS (4.0)
+// -- a confirmation you asked for wants less time on screen than a warning you
+// did not.
+SAVED_SECONDS :: 1.5
+
+// The status font's metrics as `ui` sees them. `pad` is §13's 12px, so the box,
+// the label origin and the divider all derive from one number.
+@(private = "file")
+status_metrics :: proc(doc: ^Document, cw: f32) -> ui.Metrics {
+	h := doc_bottom_bar_h(doc)
+	return ui.Metrics {
+		h = h,
+		pad = sx(12),
+		gap = 0,
+		label_cw = cw,
+		chord_cw = cw,
+		// The baseline the bar has always drawn on (`winh - sx(8)`), expressed
+		// from the bar's own top edge so `ui` never sees a window coordinate.
+		baseline = h - sx(8),
+		snap = true,
 	}
-	count := fmt.tprintf("%d lines", doc_line_count(doc))
-	if lo, hi := doc_sel_range(doc); hi > lo {count = fmt.tprintf("%d selected", hi - lo)}
-	// The size cell UI spec 13 puts third in the left group (`42.1 KB`). Measured
-	// off the piece table, so it tracks unsaved edits rather than what is on disk
-	// -- the number beside "778 lines" has to describe the same buffer that line
-	// count does, or the two disagree the moment you type.
-	//
-	// Dropped, not truncated, on an empty buffer: "0 B" beside "1 lines" on a fresh
-	// scratch tab is noise, and the left group is the one thing §5 never drops, so
-	// anything added here is on screen forever.
-	size := ""
-	if L := doc.pt.length; L > 0 {
-		switch {
-		case L >= 1024 * 1024 * 1024:
-			size = fmt.tprintf("    %.1f GB", f64(L) / (1024 * 1024 * 1024))
-		case L >= 1024 * 1024:
-			size = fmt.tprintf("    %.1f MB", f64(L) / (1024 * 1024))
-		case L >= 1024:
-			size = fmt.tprintf("    %.1f KB", f64(L) / 1024)
-		case:
-			size = fmt.tprintf("    %d B", L)
-		}
-	}
+}
+
+// The trailing run after the left group's three cells: everything transient and
+// variable-length. These are NOT cells -- they are sentences, several of them
+// are data-safety warnings, and none has a fixed home the eye can learn, which
+// is the whole argument §13 makes for cells. They keep riding with the left
+// group because that is the half already changing as you work.
+@(private = "file")
+status_message_run :: proc(doc: ^Document, text: ^plat.Text) -> string {
 	recovered := "  [RECOVERED COPY - file changed on disk, not the original]" if doc.recovered else ""
+	// Only ever shown for a modified document: a clean one is reloaded silently,
+	// so a marker here always means there is a real choice to make.
 	disk := ""
 	if doc.disk_gone {
 		disk = "  [FILE DELETED ON DISK - your text is still here; Save to write it back]"
@@ -1128,96 +1122,230 @@ status_left_text :: proc(doc: ^Document, text: ^plat.Text) -> string {
 		disk = "  [CHANGED ON DISK - you have unsaved edits. File > Reload to discard yours]"
 	}
 	indexing := "" if doc_index_done(doc) else fmt.tprintf("  (indexing %.0f%%)", doc_index_progress(doc) * 100)
+	// The atlas has no eviction: once full, further glyphs draw as nothing while
+	// the pen still advances, so text goes missing with no other symptom. Say so
+	// rather than let it look like a corrupt file.
 	atlas := "  [GLYPH CACHE FULL - some text may not draw; reduce zoom or font size]" if plat.text_atlas_full(text) else ""
+	// A dirty buffer too large to auto-back-up: unsaved edits are not
+	// crash-protected until saved (backing it up would freeze/OOM the app).
 	nobackup := "  [LARGE FILE - unsaved edits are NOT auto-backed up; Save to keep them]" if doc_backup_skipped(doc) else ""
-	return fmt.tprintf("%s    %s%s%s%s%s%s%s%s", lncol, count, " *" if doc.modified else "", size, recovered, disk, indexing, atlas, nobackup)
+	return fmt.tprintf("%s%s%s%s%s", recovered, disk, indexing, atlas, nobackup)
 }
 
-status_cells :: proc(doc: ^Document, text: ^plat.Text, winw, cw: f32, out: ^[STATUS_CELL_MAX]Status_Cell) -> []Status_Cell {
-	if doc == nil || doc.kind != .Text {return out[:0]}
+// Whether anything in that run is a warning rather than progress.
+status_warn :: proc(doc: ^Document, text: ^plat.Text) -> bool {
+	return doc.recovered || doc.disk_changed || doc.disk_gone || plat.text_atlas_full(text) || doc_backup_skipped(doc)
+}
 
-	// The candidates, LEFT TO RIGHT as the mockup reads them:
-	// `Markdown · UTF-8 · LF · Tab 4`.
+// The whole bar. Fills `out` and returns what is drawn.
+status_bar_layout :: proc(
+	app: ^App,
+	doc: ^Document,
+	text: ^plat.Text,
+	winw, winh, cw: f32,
+	out: ^[STATUS_CELL_MAX]ui.Button,
+) -> (
+	L: Status_Bar,
+) {
+	L.accent, L.success = -1, -1
+	L.cells = out[:0]
+	if doc == nil || doc.kind != .Text {return}
+
+	// An error takes the WHOLE bar and suppresses every cell -- §13: "Errors take
+	// the whole bar in danger until dismissed. Nothing in this app should ever
+	// need a modal dialog." Returned before anything is placed, so the draw and
+	// the hit-test cannot disagree about whether cells exist: there are none.
+	if app != nil && app.notice_kind == .Error && app.notice != "" {
+		L.err = app.notice
+		return
+	}
+
+	m := status_metrics(doc, cw)
+	y := winh - m.h
+
+	// -- the LEFT group: position, then the file's two counts ------------------
 	//
-	// Built in reading order and dropped from the END, which is the correction
-	// this rewrite exists for. The old code placed cells right-to-left and dropped
-	// `out[n-1]` -- the LEFTMOST -- so with the two cells it had, encoding went
-	// before line endings. UI spec 5 states the opposite: "Status cells drop
-	// right-to-left: Tab width -> LF -> UTF-8 -> language", and §5's own 700px
-	// mockup shows the survivors as `Markdown · UTF-8`, i.e. the language is the
-	// LAST thing to go, not the first. With two cells that was one wrong cell; with
-	// four it would have kept `Tab 4` on a narrow window and dropped the language.
+	// `Ln, Col` is the only one with a command. §13 says "every cell is
+	// clickable" and names only the right group's four; Go To Line is the obvious
+	// verb for this one, and the other two have no honest action. Inventing one
+	// would be the hidden cycle the language and tab-width cells already refused.
+	lncol: string
+	{
+		ln := doc_cursor_line(doc)
+		cl := doc_cursor_col(doc, text)
+		switch {
+		case ln > 0 && cl > 0:
+			lncol = fmt.tprintf("Ln %d, Col %d", ln, cl)
+		case cl > 0:
+			lncol = fmt.tprintf("Col %d", cl)
+		case ln > 0:
+			lncol = fmt.tprintf("Ln %d", ln)
+		case:
+			lncol = "Ln -, Col -"
+		}
+	}
+	// A selection replaces the LINE COUNT while it exists, in the accent -- §13,
+	// and the mockup's second row spells the text: `42 selected, 3 lines`. Both
+	// numbers, because "42 selected" alone cannot answer "how many lines is that".
+	count := fmt.tprintf("%d lines", doc_line_count(doc))
+	sel := false
+	if lo, hi := doc_sel_range(doc); hi > lo {
+		// The line count is dropped, not guessed, when the selection is past
+		// STATUS_LINE_CAP -- doc_sel_line_count returns 0 for "cannot state it" and
+		// the bar omits what it cannot state, exactly as it does for Ln/Col.
+		if nl := doc_sel_line_count(doc); nl > 0 {
+			count = fmt.tprintf("%d selected, %d lines", hi - lo, nl)
+		} else {
+			count = fmt.tprintf("%d selected", hi - lo)
+		}
+		sel = true
+	}
+	// The dirty marker stays with the count it qualifies. The mockup has no
+	// asterisk here (§4 gives every tab a RESERVED dirty slot, so the fact is
+	// already on screen and cannot shift the rail) -- kept anyway rather than
+	// removed as an unasked-for change, and it is the one thing in this bar the
+	// mockup does not account for.
+	if doc.modified {count = fmt.tprintf("%s *", count)}
+	// The size cell §13 puts third. Measured off the piece table, so it tracks
+	// unsaved edits rather than what is on disk -- the number beside "778 lines"
+	// has to describe the same buffer the line count does, or the two disagree the
+	// moment you type.
 	//
-	// Dropping the rightmost still relieves the collision, because the group is
-	// right-aligned: removing any cell moves the group's LEFT edge right by that
-	// cell's width. So placement has to happen after the drop, not before it --
-	// hence two passes rather than the old single right-to-left walk.
+	// Dropped, not truncated, on an empty buffer: "0 B" beside "1 lines" on a
+	// fresh scratch tab is noise, and the left group never drops, so anything put
+	// here is on screen forever.
+	//
+	// It SURVIVES a selection (Wyatt, 2026-08-05). The mockup's selection row
+	// happens to show two left cells, but §13's prose replaces the line count and
+	// says nothing about the size, and a file's size does not stop being true
+	// because something in it is selected.
+	size := ""
+	if l := doc.pt.length; l > 0 {
+		switch {
+		case l >= 1024 * 1024 * 1024:
+			size = fmt.tprintf("%.1f GB", f64(l) / (1024 * 1024 * 1024))
+		case l >= 1024 * 1024:
+			size = fmt.tprintf("%.1f MB", f64(l) / (1024 * 1024))
+		case l >= 1024:
+			size = fmt.tprintf("%.1f KB", f64(l) / 1024)
+		case:
+			size = fmt.tprintf("%d B", l)
+		}
+	}
+
+	n := 0
+	x := f32(0)
+	add :: proc(out: ^[STATUS_CELL_MAX]ui.Button, n: ^int, x: ^f32, label: string, cmd: Command_Id, m: ui.Metrics, y: f32) {
+		out[n^] = ui.button_layout(x^, y, label, "", m, int(cmd))
+		x^ += out[n^].w
+		n^ += 1
+	}
+	add(out, &n, &x, lncol, .Goto_Line, m, y)
+	add(out, &n, &x, count, .None, m, y)
+	if sel {L.accent = n - 1}
+	if size != "" {add(out, &n, &x, size, .None, m, y)}
+	L.left_n = n
+	L.msg_x = x + sx(4)
+	L.msg = status_message_run(doc, text)
+	L.warn = status_warn(doc, text)
+
+	// -- the RIGHT group -------------------------------------------------------
+	//
+	// Listed LEFT TO RIGHT as the mockup reads them: `Saved | Markdown | UTF-8 |
+	// LF | Tab 4`. The drop priorities are UI spec 5's order read straight off --
+	// "Tab width -> LF -> UTF-8 -> language" -- so the language survives longest,
+	// as §5's own 700px mockup shows (`Markdown · UTF-8`).
+	//
+	// `Saved` outranks even the language, and §5 never ruled on it because it did
+	// not exist. It is transient and self-clearing, so keeping it costs at most
+	// 1.5s of one other cell; dropping it loses the save confirmation outright, on
+	// exactly the narrow window where the tab's asterisk is hardest to see.
+	//
+	// Both `Markdown` and `Tab 4` dispatch .Settings_Open: neither the language
+	// nor the tab width is a two-state toggle the way encoding and line endings
+	// are, so there is nothing honest for a click to cycle. §13 asks that every
+	// cell be clickable, and a cell that takes you to where the setting lives
+	// satisfies that without inventing a hidden cycle through forty languages.
 	Cand :: struct {
-		label: string,
-		cmd:   Command_Id,
-		drop:  int,
+		label:   string,
+		cmd:     Command_Id,
+		drop:    int,
+		success: bool,
 	}
-	// Listed LEFT TO RIGHT as the mockup reads them: `Markdown | UTF-8 | LF | Tab 4`.
-	// The drop priorities are §5's order read straight off -- "Tab width -> LF ->
-	// UTF-8 -> language" -- so the language survives longest, as §5's own 700px
-	// mockup shows (`Markdown · UTF-8`).
-	//
-	// Both new cells dispatch .Settings_Open: neither language nor tab width is a
-	// two-state toggle the way encoding and line endings are, so there is nothing
-	// honest for a click to cycle. UI spec 13 asks that every cell be clickable, and
-	// a cell that takes you to where the setting lives satisfies that without
-	// inventing a hidden cycle through forty languages.
-	cands := [STATUS_CELL_MAX]Cand {
-		{highlight_language_name(doc.path), .Settings_Open, 1},
-		{enc_name(doc.enc), .Enc_UTF8 if doc.enc != .UTF8 else .Enc_UTF16LE, 2},
-		{base.line_ending_name(doc.eol), .Eol_CRLF if doc.eol == .LF else .Eol_LF, 3},
-		{fmt.tprintf("Tab %d", plat.text_tab_width(text)), .Settings_Open, 4},
+	cands: [STATUS_CELL_MAX]Cand
+	rn := 0
+	if app != nil && app.notice_kind == .Success && app_saved_active(app) {
+		cands[rn] = {app.notice, .None, 0, true}
+		rn += 1
 	}
+	cands[rn] = {highlight_language_name(doc.path), .Settings_Open, 1, false}
+	cands[rn + 1] = {enc_name(doc.enc), .Enc_UTF8 if doc.enc != .UTF8 else .Enc_UTF16LE, 2, false}
+	cands[rn + 2] = {base.line_ending_name(doc.eol), .Eol_CRLF if doc.eol == .LF else .Eol_LF, 3, false}
+	cands[rn + 3] = {fmt.tprintf("Tab %d", plat.text_tab_width(text)), .Settings_Open, 4, false}
+	rn += 4
 
 	// THE DROP LIVES HERE, not in the draw. Measured against what the left group
-	// actually needs rather than a hardcoded breakpoint, so it holds at any DPI and
-	// any font.
+	// and its message run actually need rather than a hardcoded breakpoint, so it
+	// holds at any DPI and any font.
 	//
-	// It used to run in main.odin AFTER this returned, which meant the draw and
-	// status_cell_at disagreed about which cells existed: a dropped cell was
-	// invisible and still clickable, and clicking where the LF cell had been fired
-	// `.Eol_CRLF` and rewrote the buffer. One producer now -- whatever this returns
-	// is what is drawn AND what is hit-tested.
+	// It used to run in main.odin AFTER the producer returned, which meant the
+	// draw and the hit-test disagreed about which cells existed: a dropped cell
+	// was invisible and still clickable, and clicking where the LF cell had been
+	// fired `.Eol_CRLF` -- a whole-buffer rewrite from a click on empty space.
 	//
-	// ui.pack owns the RULE. This used to hand-roll it -- a group_w helper and a
-	// walk that decremented a count -- which is the same rule the find bar then
-	// needed and would have written a second time. Decide-then-place is still what
-	// happens; it just happens in one place now, tested without a device.
+	// ui.pack owns the RULE: decide survival first, place second. That is what
+	// keeps the group flush right instead of leaving a hole where a dropped cell
+	// used to be, and what lets the drop order be intentional rather than
+	// positional.
 	items: [STATUS_CELL_MAX]ui.Item
-	for c, i in cands {
-		items[i] = {w = f32(len(c.label)) * cw, drop = c.drop, tag = i}
+	for i in 0 ..< rn {
+		items[i] = {w = ui.button_width(cands[i].label, "", m), drop = cands[i].drop, tag = i}
 	}
-	need := sx(12) + f32(len(status_left_text(doc, text))) * cw + sx(24)
+	need := L.msg_x + f32(len(L.msg)) * cw + sx(24)
 	keep: [STATUS_CELL_MAX]bool
-	ui.pack(items[:], max(0, winw - sx(12) - need), sx(24), keep[:])
+	ui.pack(items[:rn], max(0, winw - need), 0, keep[:rn])
 
-	// Now place the survivors right to left, so the group stays flush right and no
-	// gap is left where a dropped cell used to be.
-	n := 0
-	x := winw - sx(12)
-	#reverse for c, i in cands {
+	// Place the survivors right to left, so the group stays flush right.
+	rx := winw
+	for i := rn - 1; i >= 0; i -= 1 {
 		if !keep[i] {continue}
-		w := f32(len(c.label)) * cw
-		x -= w
-		out[n] = {label = c.label, x = x, w = w, cmd = c.cmd}
+		rx -= items[i].w
+		out[n] = ui.button_layout(rx, y, cands[i].label, "", m, int(cands[i].cmd))
+		if cands[i].success {L.success = n}
 		n += 1
-		x -= sx(24)
 	}
-	return out[:n]
+	// ...and reverse the right group back into left-to-right order, so `cells` is
+	// one list in reading order and the divider rule below is a plain "every cell
+	// but the first". Placing right-to-left and reading left-to-right in the same
+	// list is exactly the mixed-direction indexing that put a divider on the wrong
+	// side of the group before.
+	for i, j := L.left_n, n - 1; i < j; i, j = i + 1, j - 1 {
+		out[i], out[j] = out[j], out[i]
+		if L.success == i {L.success = j} else if L.success == j {L.success = i}
+	}
+	L.cells = out[:n]
+	return
+}
+
+// A divider sits at every cell's LEFT edge except the bar's very first.
+//
+// Read straight off §13's mockup DOM, where every cell carries `border-left: 1px
+// solid #322d28` and only `Ln 124, Col 94` does not -- the right group's leading
+// cell (`Markdown`) has one, floating mid-bar. The register recorded this as
+// "the first cell in each group has none", which is a different rule and would
+// have left the right group's leading divider out.
+status_divider :: proc(L: Status_Bar, i: int) -> bool {
+	return i > 0 && i < len(L.cells)
 }
 
 // The cell a click landed on, or .None.
-status_cell_at :: proc(doc: ^Document, text: ^plat.Text, winw, winh, cw, mx, my: f32) -> Command_Id {
+status_cell_at :: proc(app: ^App, doc: ^Document, text: ^plat.Text, winw, winh, cw, mx, my: f32) -> Command_Id {
 	if my < winh - doc_bottom_bar_h(doc) {return .None}
-	buf: [STATUS_CELL_MAX]Status_Cell
-	// Reads exactly what the draw drew, drop included -- see status_cells.
-	for c in status_cells(doc, text, winw, cw, &buf) {
-		if mx >= c.x && mx < c.x + c.w {return c.cmd}
+	buf: [STATUS_CELL_MAX]ui.Button
+	// Reads exactly what the draw drew, drop included -- see status_bar_layout.
+	L := status_bar_layout(app, doc, text, winw, winh, cw, &buf)
+	for c in L.cells {
+		if ui.button_hit(c, mx, my) {return Command_Id(c.tag)}
 	}
 	return .None
 }
@@ -1868,6 +1996,12 @@ Document :: struct {
 	max_cells_rev: u64,
 	status_cursor: int, // cursor pos the cached status line was computed for
 	status_line:   int, // 1-based line of the cursor (0 = beyond the cap / unknown)
+	// The same cache for the SELECTION's line span (doc_sel_line_count). Keyed on
+	// the range rather than the cursor: the status bar is produced up to three
+	// times a frame now (draw, hit-test, cursor) and this scan is capped, not free.
+	sel_lines_lo:  int,
+	sel_lines_hi:  int,
+	sel_lines:     int, // 0 = not computed / beyond the cap
 	// Same for the column, which was neither cached nor capped and cost an
 	// uncapped backward scan per frame. Keyed on length too, so an edit that
 	// leaves the caret where it is still invalidates.
@@ -4130,6 +4264,32 @@ doc_cursor_line :: proc(doc: ^Document) -> int {
 		doc.status_line = 1 + count_newlines(doc, 0, doc.cursor) if doc.cursor <= STATUS_LINE_CAP else 0
 	}
 	return doc.status_line
+}
+
+// Lines spanned by the selection, for §13's `42 selected, 3 lines`. 0 means "too
+// far to state", which is doc_cursor_line's contract above and for the same
+// reason: the status bar omits whichever number it cannot honestly produce
+// rather than printing a bounded scan's answer as though it saw everything --
+// development-loop §4's Shape A, which has cost this codebase seven bugs.
+//
+// MEMOIZED ON THE RANGE, which matters more here than it does for the cursor:
+// status_bar_layout is called by the draw, the hit-test and the pointer cursor,
+// so an unmemoized 4 MiB scan would run up to three times a frame while dragging
+// a selection instead of once.
+doc_sel_line_count :: proc(doc: ^Document) -> int {
+	lo, hi := doc_sel_range(doc)
+	if hi <= lo {return 0}
+	if hi - lo > STATUS_LINE_CAP {return 0}
+	if lo != doc.sel_lines_lo || hi != doc.sel_lines_hi || doc.sel_lines == 0 {
+		doc.sel_lines_lo, doc.sel_lines_hi = lo, hi
+		// A selection ending exactly on a newline spans the lines it covers, not
+		// one more: `abc\n` selected whole is ONE line, and the trailing \n is that
+		// line's terminator rather than evidence of a second.
+		n := count_newlines(doc, lo, hi - lo)
+		if hi > lo && byte_at(doc, hi - 1) == '\n' {n -= 1}
+		doc.sel_lines = 1 + max(0, n)
+	}
+	return doc.sel_lines
 }
 
 // 1-based cell column of the caret within its line, or 0 when the line start is

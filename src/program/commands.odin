@@ -603,12 +603,24 @@ command_chord :: proc(cmd: Command_Id, allocator := context.temp_allocator) -> s
 // Show a save failure. Silence here is a data-loss bug: the user believes the
 // file was written, and in a release build (-subsystem:windows) stderr is gone.
 @(private = "file")
-report_save :: proc(err: plat.Write_Error, path: string, w: ^plat.Window) -> bool {
+// UI spec 13: "Errors take the whole bar in danger until dismissed -- Could not
+// save: file is read-only. NOTHING IN THIS APP SHOULD EVER NEED A MODAL DIALOG."
+// This proc was the modal that rule names: a failed save put up a message box
+// that had to be clicked before anything else could happen.
+//
+// `app` may be nil -- several test modes drive the save path without one -- and
+// the message box is what happens then, because a failure that reaches nobody is
+// worse than a modal.
+report_save :: proc(app: ^App, err: plat.Write_Error, path: string, w: ^plat.Window) -> bool {
 	if err == .None {
 		fmt.printfln("Newtpad: saved %s", path)
 		return true
 	}
-	plat.message_error(w.hwnd if w != nil else nil, plat.write_error_text(err, path))
+	if app != nil {
+		app_error(app, plat.write_error_text(err, path))
+	} else {
+		plat.message_error(w.hwnd if w != nil else nil, plat.write_error_text(err, path))
+	}
 	return false
 }
 
@@ -639,13 +651,13 @@ save_checked :: proc(app: ^App, doc: ^Document, path: string, w: ^plat.Window) -
 			}
 		}
 	}
-	saved := report_save(doc_save_err(doc, path), path, w)
+	saved := report_save(app, doc_save_err(doc, path), path, w)
 	if saved && app != nil {
 		// UI spec 13: "Saved for 1.5s in success, then gone. No toast, no dialog,
 		// no sound." A save that succeeds currently says nothing at all, so the
 		// only confirmation is the asterisk disappearing from a tab you may not be
 		// looking at. app_note already owns the transient-message lifetime.
-		app_note(app, "[SAVED]")
+		app_note(app, "Saved", .Success)
 		// Saving the active theme's own file re-applies it -- this is the loop
 		// that makes tuning a theme possible without a rebuild. `path`, not
 		// doc.path: doc_save_err frees and reallocates doc.path.

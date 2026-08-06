@@ -1,7 +1,7 @@
 # UI spec gaps — start here
 
 The UI rework is a **V1 gate** (Wyatt, 2026-08-04; HANDOFF §6aa fork 1, reversed). This folder is its
-working state. **Current as of v0.85.0, 2026-08-05.**
+working state. **Current as of v0.87.0, 2026-08-05.**
 
 ---
 
@@ -61,7 +61,7 @@ Two more overrules of the spec, from live use on 2026-08-05:
 - **§9.3's 72ch measure is PROSE-only.** Tables and fenced code get the whole pane — capping a table
   makes its columns narrower and its cells wrap *more*, which is the opposite of what a measure is for.
 
-## State as of v0.85.0
+## State as of v0.87.0
 
 **21 items shipped across v0.74.0–v0.85.0**, ~24 remain. Highlights:
 
@@ -83,11 +83,15 @@ Two more overrules of the spec, from live use on 2026-08-05:
    whole per-event decision — cell-edit intercept, context priority, `resolve_key`, both `menu_close`
    rules — is `key_route` in `commands.odin`, and `keytest`/`metricstest` now drive it. Deleting the
    guard §6ct says leaves the suite green fails four assertions across two modes.
-2. **The preview vs Obsidian** — **deferred by Wyatt on 2026-08-05** ("push it off, there are other
+2. **§13 is done** (v0.87.0) — the left group is three cells, `Saved` is a `success` cell, errors take
+   the whole bar and replaced a modal. And the `+N` overflow count **had never been clickable**: it sat
+   past `win.tabs_right`, in the OS drag region, on exactly the widths where it is drawn.
+3. **The preview vs Obsidian** — **deferred by Wyatt on 2026-08-05** ("push it off, there are other
    issues"), and diagnosed in the sweep: a fence with no resolved lexer renders in the **proportional
    serif** face; ` ```powershell ` resolves no lexer though `.ps1` has one; no lang label. **Two of the
    three are ~2 lines.**
-3. The decision-needed three (§5 overflow, §10 column fill, §2 type scale) — cheaper to ask than to build.
+4. ~~The decision-needed three~~ — **all three decided 2026-08-05**: `+N` stays, table columns keep
+   their slack, the type scale stays at two sizes. See the sweep.
 
 ## Traps this work has hit, each more than once
 
