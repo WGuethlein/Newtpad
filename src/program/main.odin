@@ -1070,6 +1070,20 @@ main :: proc() {
 			// click-to-sync-scroll gesture above, so double-click-selects-a-word
 			// would be the same input meaning two things; word select is therefore
 			// not offered rather than made to fight the gesture that shipped first.
+			// The diagnostic runs BEFORE the gates, so a press that fails one is
+			// still reported -- a log that only records the presses which worked
+			// would be silent for exactly the bug it exists to find.
+			if DIAG_PREVIEW && window.mouse_pressed && doc.md_mode != .Off {
+				xg := f32(ed_right if doc.md_mode == .Split else 0)
+				dres := false
+				if _, dok := md_preview_pos_at(&gfx, &text, doc, px, f32(window.width), f32(window.height), app.settings.split_frac, f32(window.mouse_x), f32(window.mouse_y)); dok {dres = true}
+				diag_preview_press(
+					f32(window.mouse_x), f32(window.mouse_y), CHROME_TOP, ed_right, xg,
+					doc.md_mode, window.mouse_count, plat.key_ctrl_down(),
+					true, ro, f32(window.mouse_x) >= xg, window.mouse_count < 2, dres, doc.md_sel_on,
+					drags.vscroll, drags.hscroll, drags.preview, drags.divider, drags.col_resize, drags.menu_scroll,
+				)
+			}
 			if ro && f32(window.mouse_x) >= (ed_right if doc.md_mode == .Split else 0) {
 				if window.mouse_pressed && !plat.key_ctrl_down() && window.mouse_count < 2 {
 					if pos, pok := md_preview_pos_at(&gfx, &text, doc, px, f32(window.width), f32(window.height), app.settings.split_frac, f32(window.mouse_x), f32(window.mouse_y)); pok {
