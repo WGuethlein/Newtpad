@@ -426,27 +426,34 @@ before starting anything on this list.**
 | | Count |
 |---|---|
 | Shipped v0.74.0–v0.85.0 | **21** |
-| Struck as already built (verified) | **14** |
+| Struck as already built (verified) | **15** |
 | Struck by decision (C3–C6) | **6** |
 | **Remaining** | **~24** |
 
 Remaining, by weight rather than by count:
 
+**Rewritten 2026-08-06 after v0.90.0.** The list below had gone stale in the way this document's own
+header warns about — it still named §7, §13, §9's bar and all three decisions as open after they had
+shipped. **Quote this list, not a remembered one, and re-verify before starting anything on it.**
+
 - **§1 theme** ×4 — third (high-contrast) theme, `SPI_GETHIGHCONTRAST`, "Follow Windows", the `.theme`
   tab's colour swatches.
 - **§17 colour rules** ×3 — contrast warning on save, "N rules inactive on this file", `Bg_*` validation.
-- **§18** ×3 — extend the focus ring past tabs, the 50ms motion table, the reduce-motion setting.
-- **§11** ×4 — `Animations` row, `NEW` badges, `Ligatures`, a syntax-highlighted code sample on the font
-  page. Plus one **unverified**: does the selected row use `accent_wash` + a 2px bar?
-- **§9** ×2 + **3 deferred** — blockquote bar to accent, the deferred markdown tier (front matter,
-  footnotes, images, setext); and the fence face / `powershell` alias / lang label Wyatt deferred.
-- **§7** ×2 — the footer's live form, and two palette rows the mockup shows that do not exist
-  (`Unwrap Selected Lines`, `Reflow Paragraph at Wrap Column`).
-- **§13** ×3 — `Saved` as a cell, the left group as three bordered cells, errors taking the whole bar.
+- **§18** ×2 + **1 blocked** — the 50ms motion table and the reduce-motion setting; the focus ring is
+  **not a polish item** and needs a scope decision first (see §18 above).
+- **§11** ×3 — `Animations` row (pairs with §18's reduce-motion), `NEW` badges, `Ligatures` (needs
+  DirectWrite font-feature plumbing), and a syntax-highlighted code sample on the font page.
+  ~~Plus one unverified: does the selected row use `accent_wash` + a 2px bar?~~ **VERIFIED 2026-08-06:
+  it does** — `settings.odin:906` draws the wash and a `max(2, sx(2))` accent bar. **Fifteenth item
+  filed from reading.**
+- **§9** — the deferred markdown tier (front matter, footnotes, images, setext), and the fence face /
+  `powershell` alias / lang label **Wyatt deferred**.
+- **§16** ×1 — a per-extension DOCUMENT icon. The app icon shipped in v0.31.0.
+- ~~**§7**~~, ~~**§13**~~ — **both sections are DONE** (v0.87.0–v0.90.0).
+- ~~**Three needing a DECISION**~~ — **all three decided 2026-08-05/06**: `+N` stays, table columns keep
+  their slack, the type scale stays at two sizes.
 - ~~**§16** ×1 — the icon.~~ **STRUCK 2026-08-06 — shipped in v0.31.0 and covered by `icontest`.** What
   remains of §16 is a per-extension DOCUMENT icon, which is a different and smaller thing.
-- **Three needing a DECISION, not work:** §5's `+N` overflow vs the mockup's `‹ ›` scrolling rail;
-  §10's columns not filling the pane; §2's per-role type scale, now that Argon is struck.
 
 **And two bugs the sweep could never have seen**, both found by checking rather than reading: the font
 scan's 431 MB temp arena and the palette drawing labels a byte at a time. Neither was a mockup
