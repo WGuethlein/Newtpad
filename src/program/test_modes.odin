@@ -17517,9 +17517,18 @@ when NEWTPAD_TESTS {
 				//    nnorm check uses for the identical reason, and it is what is
 				//    left. The keyboard path and the command palette are the two
 				//    routes a user reaches a page key through.
+				//
+				//    THESE TWO STRINGS ARE LOAD-BEARING SOURCE TEXT, so a rename in
+				//    main.odin's frame loop breaks them and MUST be answered by editing
+				//    them here, never by loosening the count. It has happened once:
+				//    2026-08-05 extracted the loop's routing into key_route, `cmd`
+				//    became `r.cmd`, and this went red on the next sweep with the
+				//    guarded behaviour completely intact. That is the check working --
+				//    it cannot tell a rename from the regression, so it reports both,
+				//    and the answer is to re-read the call and re-state it exactly.
 				{
 					src := #load("main.odin", string)
-					nkey := strings.count(src, "command_dispatch(cmd, ev, &app, window, &text, srows)")
+					nkey := strings.count(src, "command_dispatch(r.cmd, ev, &app, window, &text, srows)")
 					npal := strings.count(src, "palette_execute(&app, window, &text, srows)")
 					chk(&bad, nkey == 1, fmt.tprintf("the keyboard path dispatches with the scroll model's count (%d matches for srows)", nkey))
 					chk(&bad, npal == 1, fmt.tprintf("...and so does the command palette (%d matches for srows)", npal))
