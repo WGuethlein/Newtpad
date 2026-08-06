@@ -1095,6 +1095,27 @@ STATUS_RIGHT_MAX :: 5 // Saved, language, encoding, line endings, tab width
 // did not.
 SAVED_SECONDS :: 1.5
 
+// Decimal digits in a non-negative count, floor 1. The width of a numeric slot.
+@(private = "file")
+digits :: proc(n: int) -> int {
+	d, v := 1, n
+	for v >= 10 {
+		v /= 10
+		d += 1
+	}
+	return d
+}
+
+// A number right-aligned in `w` cells, padded with spaces. Grows past the slot
+// rather than truncating: a wrong number is worse than a moved one.
+@(private = "file")
+rpad :: proc(n, w: int) -> string {
+	s := fmt.tprintf("%d", n)
+	if len(s) >= w {return s}
+	spaces := "                "
+	return fmt.tprintf("%s%s", spaces[:min(w - len(s), len(spaces))], s)
+}
+
 // The status font's metrics as `ui` sees them. `pad` is §13's 12px, so the box,
 // the label origin and the divider all derive from one number.
 @(private = "file")
@@ -1191,13 +1212,35 @@ status_bar_layout :: proc(
 	{
 		ln := doc_cursor_line(doc)
 		cl := doc_cursor_col(doc, text)
+		// RIGHT-ALIGNED IN A SLOT, so moving the caret does not resize the cell.
+		//
+		// §13: "Mono digits stop `Ln 9 → Ln 10` from shifting the whole row" -- a
+		// rule it states for a two-font reason that C4 killed, but the problem is
+		// real and is worse in cells than it was in the old single text run. Col
+		// changes on ORDINARY TYPING, and one more digit widened this cell, which
+		// pushed the two cells to its right AND all six dividers across by an
+		// advance. The run only ever moved trailing text; the dividers made it
+		// obvious.
+		//
+		// The Ln slot is sized from the DOCUMENT (its line count), so it changes
+		// when the file does and never while you move around inside it. Col has no
+		// document-wide bound that is cheap to know -- the longest line is a scan --
+		// so it gets a floor of 3 and grows past 999, which is a line you are not
+		// reading anyway.
+		// A FLOOR, not just the document's magnitude, and the floor is what makes
+		// this stable rather than merely stabler. doc_line_count GROWS while the
+		// background index runs, so sizing the slot from it alone re-widened the
+		// cell partway through opening a large file -- the same jitter one keystroke
+		// at a time, once per digit crossed. 4 covers 9999 lines, which is most
+		// files outright, and past that it only ever grows.
+		lnw := max(4, digits(doc_line_count(doc)))
 		switch {
 		case ln > 0 && cl > 0:
-			lncol = fmt.tprintf("Ln %d, Col %d", ln, cl)
+			lncol = fmt.tprintf("Ln %s, Col %s", rpad(ln, lnw), rpad(cl, 3))
 		case cl > 0:
-			lncol = fmt.tprintf("Col %d", cl)
+			lncol = fmt.tprintf("Col %s", rpad(cl, 3))
 		case ln > 0:
-			lncol = fmt.tprintf("Ln %d", ln)
+			lncol = fmt.tprintf("Ln %s", rpad(ln, lnw))
 		case:
 			lncol = "Ln -, Col -"
 		}
@@ -1237,6 +1280,10 @@ status_bar_layout :: proc(
 	// happens to show two left cells, but §13's prose replaces the line count and
 	// says nothing about the size, and a file's size does not stop being true
 	// because something in it is selected.
+	//
+	// Right-aligned in an 8-cell slot for the same reason Ln/Col is: `9.9 KB` ->
+	// `10.0 KB` while you type would otherwise move the cell's right edge and
+	// everything after it. 8 covers `999.9 GB`.
 	size := ""
 	if l := doc.pt.length; l > 0 {
 		switch {
@@ -1249,6 +1296,8 @@ status_bar_layout :: proc(
 		case:
 			size = fmt.tprintf("%d B", l)
 		}
+		spaces := "        "
+		if len(size) < len(spaces) {size = fmt.tprintf("%s%s", spaces[:len(spaces) - len(size)], size)}
 	}
 
 	n := 0

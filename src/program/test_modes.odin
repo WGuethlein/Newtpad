@@ -31439,6 +31439,69 @@ when NEWTPAD_TESTS {
 				// begins at 0 and the LABEL is inset by it.
 				sb_chk(&bad, L.cells[0].x == 0 && L.cells[0].tx == sx(12), fmt.tprintf("the first box is flush left and its label is inset 12px (x=%.0f tx=%.0f)", L.cells[0].x, L.cells[0].tx))
 
+				// -- 1b. THE CELLS DO NOT RESIZE AS THE CARET MOVES -------------------
+				//
+				// §13 wants "a fixed home for each, so your eye learns where to look".
+				// Col changes on ordinary typing, and while the numbers were printed
+				// unpadded one more digit widened cell 0, which pushed cells 1-2 AND
+				// all six dividers across by an advance. The old single text run only
+				// moved trailing text, so the cells made a pre-existing wobble obvious.
+				//
+				// Asserted as an EXACT EQUALITY of every box across a set of caret
+				// positions that cross digit boundaries in both Ln and Col -- not a
+				// tolerance, because the value is derivable and a tolerance is what
+				// something drifts into (HANDOFF §7).
+				{
+					wide := "x"
+					for _ in 0 ..< 200 {wide = fmt.tprintf("%sx", wide)}
+					big := fmt.tprintf("%s%c%s%c", wide, '\n', wide, '\n')
+					for _ in 0 ..< 4 {big = fmt.tprintf("%s%s", big, big)} // 32 long lines
+					bb := make([]u8, len(big))
+					copy(bb, transmute([]u8)big)
+					wd := doc_from_content(bb, "wide.txt", .UTF8)
+					defer doc_close(&wd)
+					wd.modified = false
+					// Let the index finish first. doc_line_count GROWS while the
+					// background worker runs, and the Ln slot is sized from it -- so a
+					// racing fixture measures a bar that is legitimately changing and
+					// reports it as the defect this asserts against. (The floor in
+					// status_bar_layout is what makes that stable in the product; this
+					// is about measuring the steady state.)
+					doc_index_start(&wd)
+					for !doc_index_done(&wd) && !doc_index_faulted(&wd) {time.sleep(time.Millisecond)}
+					ref: [STATUS_CELL_MAX]ui.Button
+					Lr := status_bar_layout(&a, &wd, &mt, W, H, cw, &ref)
+					moved, worst := 0, 0
+					// Caret positions straddling Col 9/10 and 99/100, on lines either
+					// side of Ln 9/10.
+					for pos in ([]int{0, 8, 9, 10, 98, 99, 100, 1200, 1210, 2100, 2110}) {
+						wd.cursor, wd.anchor = min(pos, wd.pt.length), min(pos, wd.pt.length)
+						pbuf: [STATUS_CELL_MAX]ui.Button
+						Lp := status_bar_layout(&a, &wd, &mt, W, H, cw, &pbuf)
+						if len(Lp.cells) != len(Lr.cells) {moved += 1; continue}
+						for c, i in Lp.cells {
+							if c.x != Lr.cells[i].x || c.w != Lr.cells[i].w {
+								moved += 1
+								worst = pos
+							}
+						}
+					}
+					sb_chk(&bad, moved == 0, fmt.tprintf("no cell moves or resizes as the caret crosses digit boundaries (%d, worst at byte %d)", moved, worst))
+					// ...and the slot is sized from the DOCUMENT, so a file with more
+					// lines gets a wider one. Otherwise "no movement" could be had by
+					// printing nothing.
+					// ...and past the floor the slot GROWS with the document, so "no
+					// movement" cannot be had by printing a constant. Compared against a
+					// synthetic line count above the floor rather than a real 10k-line
+					// fixture, which would cost a second of indexing for one number.
+					wd.cursor = 0
+					n1 := status_bar_layout(&a, &wd, &mt, W, H, cw, &ref).cells[0].w
+					wd.nl_delta += 20000
+					n2 := status_bar_layout(&a, &wd, &mt, W, H, cw, &ref).cells[0].w
+					wd.nl_delta -= 20000
+					sb_chk(&bad, n2 > n1, fmt.tprintf("...and past the floor the Ln slot grows with the document (%.0f wide at 5 digits vs %.0f at the floor)", n2, n1))
+				}
+
 				// -- 2. the divider rule, as a COUNT rather than a bound --------------
 				//
 				// §13's mockup gives every cell `border-left: 1px solid #322d28` and
