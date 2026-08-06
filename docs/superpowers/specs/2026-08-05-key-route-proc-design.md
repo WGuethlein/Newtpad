@@ -32,7 +32,7 @@ be called from a headless mode.
 All of `main.odin:597-689`'s per-event work except `command_dispatch` — Wyatt's call
 (2026-08-05), taking the widest of the three scopes offered:
 
-1. The cell-edit intercept (`doc.table && doc.table_editing && !ev.ctrl && !ev.alt`), eight
+1. The cell-edit intercept (`doc.table && doc.table_editing && !ev.ctrl && !ev.alt`), **nine**
    arms, each of which `continue`s the loop.
 2. The context if-chain: `.Font`/`.Settings` > `.History` > `.Menu` > `.Palette` > `.Find` >
    `.Editor`.

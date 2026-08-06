@@ -600,8 +600,26 @@ main :: proc() {
 			// version: none of it could be reached from a headless mode while it sat
 			// inline here, and §6ct's stuck Alt reveal was a bug in exactly that
 			// wiring. This loop now decides only whether to dispatch.
+			//
+			// PER ITERATION, and that is a use-after-free fix, not tidiness. `doc` is
+			// captured once per frame and was re-read only AFTER this loop, while
+			// command_dispatch derives its own (`doc := app_active(app)`) and never
+			// touches this one -- so key_route was the single consumer of a pointer a
+			// command run one keystroke earlier may have freed. Ctrl+W reaches
+			// app_close, which does `free(a.docs[slot])`; the next event in the SAME
+			// frame then hit `doc.table` on that box, and if the freed bytes read true
+			// with an unmodified key, table_edit_commit WROTE through it. Two events in
+			// one frame is ordinary -- holding Ctrl+W on auto-repeat is enough.
+			// Pre-existing and unchanged by the extraction; found by the review of it,
+			// because moving the deref into one named proc is what made it visible.
+			doc = app_active(&app)
 			r := key_route(&app, doc, ev, trows)
-			if r.consumed {continue} // the table's cell editor took it
+			// The cell editor took it. Defensive rather than load-bearing as things
+			// stand -- command_dispatch(.None, ...) is a no-op today, every one of its
+			// prologue's side effects being gated on `cmd != .None` -- but the first
+			// unconditional statement added to that prologue makes this line matter
+			// overnight, so it stays and this note explains what it is protecting.
+			if r.consumed {continue}
 			// srows, not rows: .Page_Up/.Page_Down (commands.odin) scroll by
 			// `rows - 1` and clamp against doc_max_top(rows) -- the vertical
 			// SCROLL MODEL's count, which is the grid's own budget in a grid and

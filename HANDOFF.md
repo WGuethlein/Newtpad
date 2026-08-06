@@ -8731,15 +8731,59 @@ this cannot. Hoisting `.Menu` above `.Settings` as a sabotage failed three `keyt
 `metricstest`'s §6ct block now routes a real key event on a real Settings page instead of calling
 `menu_close` itself, and its comment no longer has to admit the gap.
 
-### Three isolated sabotages, each with its own failure
+### Seven isolated sabotages, each with its own failure
+
+Applied and reverted one at a time, per the lesson from the locale/UTF-16 pair that masked each other.
+The first three were mine; the next three exist because the review **passed them green** and are the
+real value of this branch's review round; the seventh covers the fix below.
 
 | Sabotage | Result |
 |---|---|
-| Delete `if ctx != .Menu && app.menu.revealed` — **the deletion §6ct says leaves the suite green** | `keytest` 1 FAIL, `metricstest` 3 FAIL, both exit 1 |
+| Delete `if ctx != .Menu && app.menu.revealed` — **the deletion §6ct says leaves the suite green** | `keytest` 1 FAIL, `metricstest` 3 FAIL |
 | Hoist `.Menu` above the full-page surfaces | `keytest` 3 FAIL, `metricstest` 4 FAIL |
-| Drop `!ev.ctrl && !ev.alt` from the cell-edit guard | `keytest` 1 FAIL (`Ctrl+Esc` consumed and cancelled the edit) |
+| Drop `!ev.ctrl && !ev.alt` from the cell-edit guard | `keytest` 1 FAIL |
+| Narrow that guard to `(ctx == .Settings \|\| ctx == .Font)` — the instance form its own comment argues against | was **green**; now `keytest` 1 FAIL |
+| Drop only `!ev.alt`, keeping `!ev.ctrl` | was **green**; now `keytest` 1 FAIL |
+| Read Tab's `next_row` **after** a resorting commit — the arm's own documented Shape B bug | was **green in every table mode**; now `keytest` 1 FAIL |
+| Remove the per-iteration `doc` re-read | `keytest` 1 FAIL |
 
-Applied and reverted one at a time, per the lesson from the locale/UTF-16 pair that masked each other.
+### What the review found that the sabotages did not
+
+The whole-diff review confirmed the extraction is **verbatim** (it diffed the two regions and got code
+identical), and then broke the *coverage* four times. Three were the middle rows above. Each is now one
+more assertion:
+
+- **The reveal rule is a class, and nothing said so.** Narrowing it to the two contexts that outrank
+  `.Menu` today passed everything — and the history panel outranks `.Menu` too, so under the narrowed
+  rule an Alt tap with it open sticks the bar for the session. **§6ct verbatim, on a surface that already
+  ships.** The rule's comment argued exactly this and no test held it to it.
+- **`tablesorttest` covers the Tab arm by reimplementing it** — it calls `table_edit_commit(resort =
+  false)` and then `table_cell_at_index` in the order the arm calls them. That pins the callees and not
+  the wiring: **the same "pins what the exit does, not that anything reaches it" gap this branch exists
+  to close, one layer down.** The new case drives `key_route(.Tab)` on a real sorted grid and asserts the
+  *value* of the cell Tab opens (`"2"` if the row held, `"1"` if it moved).
+- **A guard with two halves needs two sabotages.** "Drop `!ev.ctrl && !ev.alt`" reads like coverage of
+  the guard and was coverage of one half.
+
+### A use-after-free the extraction made visible
+
+`main.odin` captured `doc` once per frame and re-read it only **after** the key loop. `Ctrl+W` reaches
+`app_close`, which does `free(a.docs[slot])` — and `command_dispatch` derives its own `doc :=
+app_active(app)` and never touches the caller's, so **`key_route` was the single consumer of a pointer a
+command run one keystroke earlier may have freed.** Its first statement is `doc.table`; if the freed
+bytes read true with an unmodified key, `table_edit_commit` *wrote* through it. Two key events in one
+frame is ordinary — holding Ctrl+W on auto-repeat is enough.
+
+Pre-existing and byte-identical on `main`; the extraction did not cause it, it gave it one call site and
+a name, which is how the review saw it. **Wyatt's call (2026-08-05): re-read `doc` per iteration in
+`main.odin`** — one line, the live call site can never pass a freed pointer, and `key_route` keeps a
+parameter the new Tab-arm case needs (it drives a standalone grid that is not the App's active document).
+
+Pinned two ways, because a source check alone would not have caught the free and a state check alone
+could not see the loop: **pointer identity** (`Ctrl+W` frees the box a frame-long capture holds — identity,
+not content comparison, per development-loop §3 on use-after-free), and an **order** check over
+`main.odin`'s source between two landmarks rather than one literal line, so a rename inside the loop does
+not break it while a re-read moved back out of it does.
 
 ### The negative assertion is the one that matters
 
@@ -8771,10 +8815,13 @@ and not their arity; it does now.
 
 - `Status_Cell` still carries its own geometry (`ui.pack`, not `ui.Button`) — unchanged from §6cy.
 - The preview-vs-Obsidian work stays **deferred by Wyatt**.
-- One observation, deliberately not acted on: within a frame, `doc` is stale after a mid-loop tab switch
-  while `.find.active` is read fresh through `app_active`, so two keys in one frame across `Ctrl+Tab`
-  resolve the second one's context from the *previous* document's `kind`. Pre-existing and rare. The
-  extraction preserved it exactly — this was a refactor — but it now has one call site and a name.
+- `Key_Route.ctx` is **undefined when `consumed`** — the cell-edit arms return before a context is
+  chosen and `Ctx`'s zero value is `.Editor`, so an intercepted key reads as an editor route. Nothing
+  reads it in that case today; the field says so. `Ctx.None = 0` is the fix if a caller ever needs to.
+- `if r.consumed {continue}` is defensive rather than load-bearing as things stand: every side effect in
+  `command_dispatch`'s prologue is gated on `cmd != .None`. The first unconditional statement added there
+  makes the line matter overnight, which is what its comment is for.
+- `.Font` vs `.Settings` relative order is untestable by construction — both live on one `doc.kind`.
 
 ## 7. Build environment (Windows, this machine)
 

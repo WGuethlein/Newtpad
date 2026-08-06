@@ -914,7 +914,12 @@ resolve_key :: proc(key: plat.Key, ctrl, alt: bool, ctx: Ctx) -> Command_Id {
 // What one key event resolves to, before command_dispatch runs it.
 Key_Route :: struct {
 	cmd:      Command_Id, // .None when nothing is bound, or when the cell editor took it
-	ctx:      Ctx, // the context the chord was resolved in
+	// UNDEFINED WHEN `consumed`. The cell-edit arms return before a context is
+	// chosen, and Ctx's zero value is .Editor -- so a consumed key reads as an
+	// editor route and is indistinguishable from a real one. Nothing reads it in
+	// that case today; a test asserting `.ctx == .Editor` on an intercepted key
+	// would be a guaranteed green that means nothing.
+	ctx:      Ctx,
 	consumed: bool, // the cell editor handled it; the caller must not dispatch
 }
 
