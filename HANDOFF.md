@@ -9057,6 +9057,87 @@ completeness", and which is a feature.
 - The selection cell still resizes as the selection grows. It is inherently variable and only while
   selecting, so it was left alone; a slot for it would have to be sized from the buffer.
 
+## 6dc. Two commands the palette promised, and two rail bugs from live use (2026-08-06, v0.89.0, branch `feat/reflow-and-unwrap`)
+
+### §16 was never missing — the fourteenth item filed from reading
+
+The register said *"No icon work exists."* The icon shipped in **v0.31.0** (§6at, titled *"Newtpad gets
+an icon"*): `src/platform/newtpad.ico` is committed, `tools/gen_icon` generates it, `newtpad.rc` embeds
+it as ICON resource id 1 — which is what gives the exe its Explorer and taskbar icon — and **`icontest`
+has been in §7's required sweep the whole time**, printing 39 `OK` lines that assert the seven sizes,
+the no-scaling rule, the `#F2EBE0` paper, the `#D99B62` caret and the two/three-line rule the entry
+called absent. Every sweep since v0.31.0 ran it.
+
+**The evidence was already running.** Before filing anything as absent, grep the mode list for it. What
+§16 genuinely still wants is a per-extension *document* icon, which is a different and smaller thing.
+
+### Unwrap and Reflow
+
+§7's palette mockup lists both by name; neither existed. One operation with two settings of the same
+dial. Wyatt's two calls: **the column is a setting** (default 80) rather than the view, because wrap has
+followed the window since v0.83.0 and a window-relative reflow is not repeatable across a resize; and
+**with no selection they act on the paragraph at the caret**.
+
+`reflow_block_start` is deliberately **not** `md_para_bounds`. That proc answers the preview's question
+and resolves lazy continuation, because CommonMark says a rendered paragraph swallows it. An edit needs
+the opposite bias: never silently merge two things the user can see as separate. A heading, list item,
+blockquote, fence or table row ends a run and is copied through byte for byte.
+
+One `doc_replace_range` for the whole region, so a multi-paragraph reflow is **one** undo entry.
+
+### The sabotage found a dead guard I had reasoned my way into
+
+The break decision carried `&& line_cells > ind_cells`, with a comment claiming it stopped a word wider
+than the column from breaking forever. **Deleting it left every assertion green** — and the reason is
+structural, not a gap in the test: the word is appended *after* the branch unconditionally, so a
+continuation line always holds a word by the time the next one is checked and the condition is
+invariantly true. A dead check, of the shape `development-loop` §1 lists among the defects that got
+through plan review. Removed, with the real explanation in its place.
+
+A second vacuous pass, caught by reading output rather than the verdict: the indent case used a
+**four-space** fixture, which `reflow_block_start` treats as an indented code block — so the line was
+copied through untouched and *"every line keeps the indent"* was trivially true of one unmodified line.
+Two spaces now, with a precondition asserting it broke at all.
+
+### Two live-use bugs, one of them mine
+
+Wyatt, with a screenshot: *"at certain sizes theres a large gab on the left"* and *"when in this exact
+size, theres nowhere on the top row that i can grab the window and move it"*.
+
+**The second is a regression from v0.87.0.** `WM_NCHITTEST` returns `HT_CLIENT` below `win.tabs_right`
+and `HT_CAPTION` above it. v0.87.0 correctly stretched `tabs_right` to cover the `+N` count — which sits
+flush at `limit - over_w`, so `tabs_right` became `limit` **exactly** and the caption region went to zero
+width. Before that fix the indicator was unclickable *and* the strip was draggable; the fix traded one
+for the other without noticing there was a trade. `TAB_DRAG_RESERVE_96` is subtracted in
+**`tabs_limit`** rather than special-cased in the hit-test, so every producer on the rail already
+respects it and `tabs_right` cannot reach it by construction.
+
+**The first**: `place` refuses to draw a tab that is not fully inside the strip — rightly, since one
+clipped at the left shows a truncated name with no marker — so an arbitrary scroll offset leaves the
+straddling tab undrawn and up to `TAB_MAX_W` of rail empty. `tabs_reveal_active` snaps to a tab
+boundary now.
+
+**Snapping UP, not down, and the existing test is what established that.** The first version snapped
+down and failed *"revealing brings the active tab on screen"*: snapping down moves the strip right,
+which pushes the active tab toward the far edge and can put it back past `span` — the reveal then
+silently fails on the tab you just switched to, which is worse than the hole. My comment had asserted
+the opposite.
+
+### Three more assertions refusing the change, all correct
+
+`menutest` — adding two rows made Edit's longest unbroken run six against §6's cap of four. They got
+their own divider, which they earn anyway: sort and dedupe **reorder** lines, these two **rewrap** them.
+`settingstest` — the round-trip fixture left `reflow_col` at zero, which the normaliser turns into the
+default on load; and its row loop moves the reset-style rows off their defaults so Enter is observable,
+with a comment saying *"Two rows"* that is now three. **The count in that comment was load-bearing.**
+
+### Owed
+
+- The `§18` focus-ring scope question is still open (see §6db).
+- Everything §6da and §6db owed that is still open.
+- A four-space-indented paragraph can never be reflowed: it reads as an indented code block. Correct for
+  markdown, arguable for plain prose, and left as the safe default.
+
 ## 7. Build environment (Windows, this machine)
 
 - **`build.bat` is the one build script.** `build.bat` = debug, **console subsystem** so the
