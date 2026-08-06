@@ -656,7 +656,7 @@ keymap_edit_current :: proc(app: ^App) -> bool {
 	if !os.exists(path) {
 		seed := keymap_seed_text(context.temp_allocator)
 		if os.write_entire_file(path, transmute([]u8)seed) != nil {
-			app_note(app, "[KEYS.TXT NOT WRITTEN - could not write to the settings folder]")
+			app_error(app, "Could not write keys.txt: the settings folder is not writable")
 			return false
 		}
 	}

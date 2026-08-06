@@ -369,9 +369,18 @@ No icon work exists. §16 names **16a "Caret on paper"** as recommended and give
 
 ### §18 Motion, focus, accessibility — 4 items
 - [V] **The focus ring exists and is correct** — `ui_tabs.odin:77-98`, 2px in `Focus_Ring`, 1px
-  outside, radius-matched. But it is drawn **only for tabs**. §18 wants it on menu-bar items, menu
-  rows, palette rows, settings rows, find fields and toggles, table headers, the `>_` button, caption
-  buttons and the split divider. Extending it is the natural companion to promoting `Find_Action`.
+  outside, radius-matched. But it is drawn **only for tabs**.
+  **RECLASSIFIED 2026-08-06 (v0.88.0): this is NOT a polish item and this entry quoted half a
+  sentence.** §18 continues: *"**If a thing can be reached with Tab, it draws the ring.**"* Nothing
+  can. `Tab` is bound in exactly two contexts — `.Editor` → `Insert_Tab`, `.Find` →
+  `Find_Field_Toggle` — and there is no chrome tab order at all; `kbd_tab_focus` is set only by
+  `Ctrl+Tab`/`Ctrl+PgUp`/`Ctrl+PgDn`. So extending the ring would either draw a SECOND keyboard
+  indicator on the four surfaces that already show selection as a fill (menu rows, palette rows,
+  settings rows), or draw an indicator for a state that can never occur on the six that are not
+  keyboard-reachable. **The blocker is reachability, not drawing.** The real item is a chrome focus
+  model — `Tab`/`Shift+Tab` over rail → menu bar → editor → find bar, `Esc` backing out one level,
+  which §18 also asks for under "keyboard completeness" — and that is a feature, not a pass.
+  **Needs a decision on scope before anyone starts it.**
 - [F] The 50ms motion table (5 places) — deliberately out, paired with the reduce-motion setting.
 - [F] Reduce-motion setting + `SPI_GETCLIENTAREAANIMATION`.
 - [F] Gamma-correct text blending — unverified; if absent, every measured ratio in §1 is optimistic.

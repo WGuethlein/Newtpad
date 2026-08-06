@@ -769,7 +769,7 @@ reopen_with_encoding :: proc(app: ^App, doc: ^Document, w: ^plat.Window, enc: ba
 		}
 	}
 	if !doc_reload_forced(doc, enc) {
-		app_note(app, "[REOPEN FAILED - the file could not be read]")
+		app_error(app, "Could not reload: the file could not be read")
 		return
 	}
 	app_note(app, fmt.tprintf("[REOPENED AS %s]", enc_name(enc)))
@@ -1583,7 +1583,7 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 					// Loud rather than a silent no-op: the only way this fails is
 					// the MD_COPY_MAX refusal, and a Ctrl+C that quietly does
 					// nothing reads as a broken clipboard.
-					app_note(app, "[SELECTION TOO LARGE TO COPY]")
+					app_error(app, "Could not copy: the selection is too large for the clipboard")
 				}
 			}
 			return
@@ -1635,7 +1635,7 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 			if plat.clipboard_set_text(w.hwnd, s) {
 				doc_backspace(doc) // deletes the selection
 			} else {
-				app_note(app, "[CUT FAILED - the clipboard could not be written; nothing was deleted]")
+				app_error(app, "Could not cut: the clipboard could not be written. Nothing was deleted")
 			}
 		}
 	case .Paste:
@@ -2321,11 +2321,35 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 		// skips whatever moved into the gap. It may also be CANCELLED -- an unsaved
 		// tab whose dialog the user dismisses stays open -- so this cannot assume it
 		// ends with exactly one tab left.
+		//
+		// ONE MESSAGE FOR THE WHOLE LOOP, and that is a change of kind rather than
+		// of wording. Every failing save inside request_close_tab raises an error on
+		// the App, and the App holds exactly one message -- so N failures used to
+		// leave the last one, naming one file, and the user was told about a single
+		// failure when several tabs had refused to close. Counted here and stated as
+		// a count; the individual reason is still whatever the last one gave, which
+		// is the honest thing a one-slot notice can say.
 		if app.menu.ctx_tab >= 0 && app.menu.ctx_tab < len(app.docs) {
 			keep := app.docs[app.menu.ctx_tab]
+			failed, last := 0, ""
 			for i := len(app.docs) - 1; i >= 0; i -= 1 {
 				if app.docs[i] == nil || app.docs[i] == keep {continue}
+				before := app.docs[i]
 				request_close_tab(app, i, w)
+				// Still there = it did not close. That covers a failed save AND a
+				// cancelled dialog, which is right: both mean "this tab is still
+				// open", and only the former left an error behind to report.
+				if i < len(app.docs) && app.docs[i] == before && app_error_active(app) {
+					failed += 1
+					// CLONED, not aliased. app.notice is heap-owned and app_note frees
+					// it before storing the next one, so holding the slice across
+					// another failing iteration would read freed memory -- and the
+					// summary below is built from it after the loop.
+					last = strings.clone(app.notice, context.temp_allocator)
+				}
+			}
+			if failed > 1 {
+				app_error(app, fmt.tprintf("%d tabs could not be closed. Last: %s", failed, last))
 			}
 		}
 	case .Open_Themes_Folder:

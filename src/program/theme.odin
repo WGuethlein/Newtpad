@@ -893,7 +893,7 @@ theme_export :: proc(from_name: string, t: Theme) -> (target: string, path: stri
 theme_edit_current :: proc(app: ^App) -> bool {
 	target, path, ok := theme_export(app.settings.theme_name, g_theme)
 	if !ok {
-		app_note(app, "[THEME NOT SAVED - could not write to the themes folder]")
+		app_error(app, "Could not save the theme: the themes folder is not writable")
 		return false
 	}
 	if app.settings.theme_name != target {

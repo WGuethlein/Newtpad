@@ -8983,6 +8983,80 @@ crowded are owed to a live pass.
 - No pointer-cursor affordance on the cells, though §13 says every cell is clickable.
 - §13's "numbers in Neon, words in Argon" stays dead with C4.
 
+## 6db. The cells stop moving, and six notices become errors (2026-08-06, v0.88.0, branch `feat/cell-stability-and-focus-ring`)
+
+What §6da owed, plus a premise failure in the next register item that is worth more than the code.
+
+### The bar wobbled, and cells made it obvious
+
+§13 asks for *"a fixed home for each, so your eye learns where to look"*. **`Col` changes on ordinary
+typing**, and while the numbers were printed unpadded one more digit widened cell 0 — pushing the two
+cells to its right *and all six dividers* across by an advance. The old single text run had the same
+wobble and only ever moved trailing text; turning the group into cells with dividers is what made a
+pre-existing defect visible. Numbers are right-aligned in a slot now.
+
+**The floor is the part that took a test to find.** Sizing the `Ln` slot from the document's line count
+alone is not stable: `doc_line_count` **grows while the background index runs**, so it re-widened the
+cell partway through opening a large file — the same jitter one keystroke at a time, once per digit
+crossed. `max(4, digits)` covers 9999 lines outright and only ever grows past that. I reasoned my way to
+the document-magnitude version and the assertion rejected it.
+
+The check is an exact equality of every box across caret positions straddling `Col 9/10`, `Col 99/100`
+and `Ln 9/10` — not a tolerance, because the value is derivable (HANDOFF §7). Sabotaging the padding
+fails it 27 times.
+
+### Six notices become errors
+
+An `.Error` is for *an operation the user asked for that did not happen and cost something*. Six qualify:
+the cut whose clipboard write failed (**nothing was deleted, and the user thinks it was**), the reload
+that could not read, the copy that was too large (the clipboard still holds something older, which is
+the dangerous case), and `keys.txt` / `rules.txt` / a theme that could not be written.
+
+**Everything else stays `.Info` deliberately.** A sticky red bar for `[NO DUPLICATE LINES]` or
+`[ALREADY FORMATTED]` would be worse than what ships. The distinction is failure versus refusal or
+report, and it has to be made one message at a time — a class rule would sweep up the twenty that are
+guidance. The six were rewritten from `[BRACKETED CAPS]` into sentences, matching
+`plat.write_error_text`, because the bar is a different surface from the centred transient.
+
+`Tab_Close_Others` reported **one** failure when several tabs refused to close: the App holds one message
+and each overwrote the last. It counts them now — and it clones the reason rather than aliasing
+`app.notice`, which the next failing iteration frees. **That was a use-after-free in the first version of
+this fix, in the same shape §6cz found in the frame loop.** Written down because I wrote it a day after
+fixing the other one.
+
+### §18's focus ring is not a polish item, and the register says it is
+
+Checked before building, and it does not survive the check. §18's rule is explicit:
+
+> Applies to: tabs, the `>_` button, caption buttons, menu-bar items, menu rows, palette rows, settings
+> rows, find fields and toggles, table headers, the split divider. **If a thing can be reached with Tab,
+> it draws the ring.**
+
+**Nothing can be reached with Tab.** `Tab` is bound in exactly two contexts — `.Editor` → `Insert_Tab`
+and `.Find` → `Find_Field_Toggle` — and there is no chrome tab order at all. `focus_ring_draw` has one
+production caller (`ui_tabs.odin:779`), and `kbd_tab_focus`, the flag gating it, is set only by
+`Ctrl+Tab`/`Ctrl+PgUp`/`Ctrl+PgDn`. Its own comment has said so since v0.22.0: *"a stand-in for a real
+chrome focus model… when that exists this becomes one case of it."*
+
+So the item as filed — "extend the focus ring past tabs" — would either draw a **second** keyboard
+indicator on the four surfaces that already have one (menu rows, palette rows and settings rows all
+show keyboard selection as a fill today), or draw an indicator for a state that **can never occur** on
+the six that are not keyboard-reachable at all. The blocker is reachability, not drawing, and §18 says
+so in the same sentence the register quoted half of.
+
+**Left unbuilt, and put to Wyatt as a scope question rather than silently skipped or silently
+half-built.** The real work is a chrome focus model with `Tab`/`Shift+Tab` over rail → menu bar →
+editor → find bar, plus `Esc` backing out one level — which §18 also asks for, under "keyboard
+completeness", and which is a feature.
+
+### Owed
+
+- Everything §6da owed that is still open: the `c.x`/`c.tx` draw gap, no pointer cursor on the cells.
+- `[KEYS.TXT NOT AVAILABLE]` and `[RULES.TXT NOT AVAILABLE]` are precondition failures left as `.Info`;
+  they are the closest calls in the twenty that stayed.
+- The selection cell still resizes as the selection grows. It is inherently variable and only while
+  selecting, so it was left alone; a slot for it would have to be sized from the buffer.
+
 ## 7. Build environment (Windows, this machine)
 
 - **`build.bat` is the one build script.** `build.bat` = debug, **console subsystem** so the
