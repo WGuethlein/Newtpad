@@ -31638,6 +31638,38 @@ when NEWTPAD_TESTS {
 							if L.over_on && L.plus_x + PLUS_W > L.over_x {clash = true}
 							ts_chk(&bad, !clash, fmt.tprintf("%d tabs @ %.0f: the + button clears the tabs and the overflow count", ntabs, width))
 						}
+
+						// 6. THE OTHER SEAM, and the one that shipped broken: the rail's
+						// hit-test is only ever REACHED for x < win.tabs_right. Past it,
+						// WM_NCHITTEST returns HT_CAPTION and the press becomes an OS
+						// window drag that the program never sees (window.odin's
+						// `case x < w.tabs_right: return HT_CLIENT`).
+						//
+						// So every control tabs_hit_test consumes must lie inside that
+						// bound -- and the "+N" overflow count did not. tabs_right walked
+						// the drawn tabs and the + button only, and when tabs overflow
+						// BOTH of those are placed inside `limit - over_w`, i.e. entirely
+						// to the LEFT of the indicator. The count exists only when tabs
+						// overflow, which is exactly when this is wrong, so clicking it
+						// dragged the window for as long as it has existed.
+						//
+						// Asserted as the derivable VALUE where there is one (the client
+						// region ends exactly at the indicator's right edge), not as a
+						// bound -- HANDOFF §7. Wyatt, live use, 2026-08-05: "+N but
+						// currently it doesn't work".
+						{
+							tr := tabs_right(&a, &win, &txt, width)
+							for r in L.tabs {
+								if !r.drawn {continue}
+								ts_chk(&bad, r.x + r.w <= tr + 0.5, fmt.tprintf("%d tabs @ %.0f: slot %d is inside the OS client region (%.0f <= %.0f)", ntabs, width, r.slot, r.x + r.w, tr))
+							}
+							if L.plus_on {
+								ts_chk(&bad, L.plus_x + PLUS_W <= tr + 0.5, fmt.tprintf("%d tabs @ %.0f: the + button is inside it (%.0f <= %.0f)", ntabs, width, L.plus_x + PLUS_W, tr))
+							}
+							if L.over_on {
+								ts_chk(&bad, tr == L.over_x + L.over_w, fmt.tprintf("%d tabs @ %.0f: the client region ends at the +N's right edge (%.0f, want %.0f)", ntabs, width, tr, L.over_x + L.over_w))
+							}
+						}
 					}
 				}
 				// Middle elision keeps both ends. End-elision is what this

@@ -353,7 +353,8 @@ tabs_hidden_count :: proc(app: ^App, win: ^plat.Window, t: ^plat.Text, width: f3
 	return tabs_layout(app, win, t, width).hidden
 }
 
-@(private = "file")
+// NOT file-private: tabseamtest asserts what this returns against the layout the
+// rail draws, because the two disagreeing is invisible from inside either one.
 tabs_right :: proc(app: ^App, win: ^plat.Window, t: ^plat.Text, width: f32) -> f32 {
 	// The sixth walker, and the least obvious: it feeds win.tabs_right, which
 	// WM_NCHITTEST uses to decide where dragging the WINDOW is allowed. It also
@@ -366,6 +367,21 @@ tabs_right :: proc(app: ^App, win: ^plat.Window, t: ^plat.Text, width: f32) -> f
 		if r.drawn {right = r.x + r.w + TAB_GAP}
 	}
 	if L.plus_on {right = L.plus_x + PLUS_W}
+	// The "+N" overflow count, which this walk missed entirely until 2026-08-05.
+	//
+	// It is the RIGHTMOST control on the rail and it is the one this proc must
+	// stretch to reach, because when it exists the tabs and the + button are both
+	// placed inside `limit - over_w` -- so every other term above lands strictly
+	// to its LEFT and the client region stopped short of it. Past that edge
+	// WM_NCHITTEST returns HT_CAPTION, so the press became an OS window drag and
+	// tabs_hit_test's overflow branch never ran. The count is drawn only when tabs
+	// overflow, which is exactly when it was unclickable: at 320px with 3 tabs the
+	// region ended at 76 while the indicator spanned 130..182.
+	//
+	// max, not assignment: the + button can be absent while tabs still overflow,
+	// and this must never pull the boundary back to the left of something the walk
+	// above already claimed. Wyatt, live use: "+N but currently it doesn't work".
+	if L.over_on {right = max(right, L.over_x + L.over_w)}
 	return min(right, L.limit)
 }
 
