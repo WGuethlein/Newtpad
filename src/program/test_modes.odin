@@ -472,6 +472,209 @@ when NEWTPAD_TESTS {
 			fmt.printfln("  %-6s the LEFT press is left alone, it has a terminal consumer (left=%v)", "ok" if okl else "FAIL", ow.mouse_pressed)
 		}
 
+		// THE FRAME LOOP'S KEY ROUTING, which is a proc as of 2026-08-05.
+		//
+		// Everything main.odin's key loop does with an event except run it lives in
+		// key_route (commands.odin): the table cell-edit intercept, the context
+		// priority, resolve_key, and the two menu_close rules. It was inline in the
+		// loop until now, so no mode could call it -- and §6ct's stuck Alt reveal was
+		// a bug in exactly that wiring, verified only by a live pass because its test
+		// could reach menu_close and not the decision to call it.
+		//
+		// THE PRIORITY IS TESTED BY PEELING, not by six independent setups. Every
+		// surface is switched on at once and then turned off from the top, so each
+		// assertion states which context BEATS the ones still active. A per-surface
+		// test would pass with the chain in any order; this one cannot.
+		//
+		// Its own local proc, following the `block_test_*` pattern development-loop.md
+		// §6 prescribes after `blocktest`'s real STATUS_STACK_OVERFLOW. It does NOT
+		// lower the peak here -- keytest_run's own `app` is still live in the frame
+		// that calls this -- so the win is that this frame is separate and does not
+		// grow the dispatcher's. Recorded because the pattern is easy to apply for a
+		// reason that does not hold.
+		kr_cases :: proc(bad: ^int) {
+			kr_chk :: proc(bad: ^int, got, want: Ctx, label: string) {
+				ok := got == want
+				if !ok {bad^ += 1}
+				fmt.printfln("  %-6s %-46s -> %v", "ok" if ok else "FAIL", label, got)
+			}
+			ka: App
+			menu_init(&ka.menu) // a zeroed App has menu.open == 0, i.e. "menu 0 is open"
+			app_new_scratch(&ka)
+			defer app_destroy(&ka)
+			kd := app_active(&ka)
+			ev :: proc(k: plat.Key, ctrl := false, alt := false) -> plat.Key_Event {
+				return {key = k, ctrl = ctrl, alt = alt}
+			}
+
+			kd.kind = .Font
+			ka.history.open = true
+			ka.menu.mode = true
+			ka.palette.active = true
+			find_open(kd, false)
+			kr_chk(bad, key_route(&ka, kd, ev(.Down), 0).ctx, .Font, "Font page outranks everything")
+			kd.kind = .Settings
+			kr_chk(bad, key_route(&ka, kd, ev(.Down), 0).ctx, .Settings, "Settings outranks history/menu/palette/find")
+			kd.kind = .Text
+			kr_chk(bad, key_route(&ka, kd, ev(.Down), 0).ctx, .History, "history outranks menu/palette/find")
+			ka.history.open = false
+			kr_chk(bad, key_route(&ka, kd, ev(.Down), 0).ctx, .Menu, "menu outranks palette/find")
+			ka.menu.mode = false
+			kr_chk(bad, key_route(&ka, kd, ev(.Down), 0).ctx, .Palette, "palette outranks find")
+			ka.palette.active = false
+			kr_chk(bad, key_route(&ka, kd, ev(.Down), 0).ctx, .Find, "find outranks the editor")
+			find_close(kd)
+			kr_chk(bad, key_route(&ka, kd, ev(.Down), 0).ctx, .Editor, "and the editor is the floor")
+
+			// §6ct, through the routing rather than beside it. On a full-page surface
+			// an Alt reveal used to survive every later key, because .Settings and
+			// .Font outrank .Menu and nothing else reached menu_close.
+			kd.kind = .Settings
+			ka.menu.revealed = true
+			r_pg := key_route(&ka, kd, ev(.Down), 0)
+			cleared := !ka.menu.revealed
+			if !cleared {bad^ += 1}
+			fmt.printfln("  %-6s %-46s -> ctx=%v revealed=%v", "ok" if cleared else "FAIL", "a key on the Settings page ends the reveal", r_pg.ctx, ka.menu.revealed)
+			// The NEGATIVE, without which "always call menu_close" would pass the line
+			// above: while the keys really are going to the menu, the reveal is what is
+			// holding the bar up and must survive.
+			kd.kind = .Text
+			ka.menu.mode = true
+			ka.menu.revealed = true
+			r_mn := key_route(&ka, kd, ev(.Down), 0)
+			kept := ka.menu.revealed && r_mn.ctx == .Menu && ka.menu.mode
+			if !kept {bad^ += 1}
+			fmt.printfln("  %-6s %-46s -> ctx=%v revealed=%v", "ok" if kept else "FAIL", "...but a key going TO the menu keeps it", r_mn.ctx, ka.menu.revealed)
+			// THE RULE IS A CLASS, AND THIS IS THE LINE THAT SAYS SO. Narrowing the
+			// guard to `(ctx == .Settings || ctx == .Font)` -- the exact form its own
+			// comment argues against -- passes every other assertion here. It is not
+			// hypothetical: the history panel ALSO outranks .Menu, so under the
+			// narrowed rule an Alt tap with it open sticks the bar for the session.
+			// §6ct verbatim, on a surface that already ships.
+			kd.kind = .Text
+			ka.history.open = true
+			ka.menu.mode = true
+			ka.menu.revealed = true
+			r_hi := key_route(&ka, kd, ev(.Down), 0)
+			hist_ok := r_hi.ctx == .History && !ka.menu.revealed
+			if !hist_ok {bad^ += 1}
+			fmt.printfln("  %-6s %-46s -> ctx=%v revealed=%v", "ok" if hist_ok else "FAIL", "...and the history panel ends it too, not just pages", r_hi.ctx, ka.menu.revealed)
+			ka.history.open = false
+			// A global chord taken with the menu open closes it first, and still
+			// resolves -- the close must not eat the command.
+			ka.menu.mode = true
+			r_gl := key_route(&ka, kd, ev(.S, ctrl = true), 0)
+			glob := r_gl.cmd == .Save && !menu_is_active(&ka)
+			if !glob {bad^ += 1}
+			fmt.printfln("  %-6s %-46s -> cmd=%v active=%v", "ok" if glob else "FAIL", "Ctrl+S with the menu open closes it AND saves", r_gl.cmd, menu_is_active(&ka))
+			// ...while a menu key leaves the menu open, or arrowing a dropdown would
+			// dismiss it on the first press.
+			ka.menu.mode = true
+			ka.menu.open = 0
+			r_mk := key_route(&ka, kd, ev(.Down), 0)
+			menu_key := is_menu_cmd(r_mk.cmd) && menu_is_active(&ka)
+			if !menu_key {bad^ += 1}
+			fmt.printfln("  %-6s %-46s -> cmd=%v active=%v", "ok" if menu_key else "FAIL", "...a menu key does not", r_mk.cmd, menu_is_active(&ka))
+			menu_close(&ka)
+
+			// The cell-edit intercept: it owns the editing keys while a cell is being
+			// edited, and only unmodified ones. Escape touches no buffer, so it can be
+			// driven on a synthetic edit state; the Tab arm gets a real grid below,
+			// because it is the arm with a rule of its own.
+			kd.table = true
+			kd.table_editing = true
+			r_esc := key_route(&ka, kd, ev(.Escape), 0)
+			esc_ok := r_esc.consumed && !kd.table_editing
+			if !esc_ok {bad^ += 1}
+			fmt.printfln("  %-6s %-46s -> consumed=%v editing=%v", "ok" if esc_ok else "FAIL", "Esc in a cell edit is consumed and cancels", r_esc.consumed, kd.table_editing)
+			kd.table_editing = true
+			r_ctrl := key_route(&ka, kd, ev(.Escape, ctrl = true), 0)
+			ctrl_ok := !r_ctrl.consumed && kd.table_editing
+			if !ctrl_ok {bad^ += 1}
+			fmt.printfln("  %-6s %-46s -> consumed=%v editing=%v", "ok" if ctrl_ok else "FAIL", "...but Ctrl+Esc is not -- the guard is !ctrl && !alt", r_ctrl.consumed, kd.table_editing)
+			// BOTH HALVES OF THE GUARD, separately: dropping only `!ev.alt` passes the
+			// ctrl line above. Its live effect would be Alt+Left/Right moving the cell
+			// caret instead of resolving to .Block_Extend_Left/Right.
+			r_alt := key_route(&ka, kd, ev(.Escape, alt = true), 0)
+			alt_ok := !r_alt.consumed && kd.table_editing
+			if !alt_ok {bad^ += 1}
+			fmt.printfln("  %-6s %-46s -> consumed=%v editing=%v", "ok" if alt_ok else "FAIL", "...and neither is Alt+Esc -- the other half", r_alt.consumed, kd.table_editing)
+			// A key the intercept does not name falls through to the ordinary routing
+			// even mid-edit. As-built, pinned so it is a decision and not a surprise.
+			r_up := key_route(&ka, kd, ev(.Up), 0)
+			up_ok := !r_up.consumed && r_up.cmd == .Cursor_Up
+			if !up_ok {bad^ += 1}
+			fmt.printfln("  %-6s %-46s -> consumed=%v cmd=%v", "ok" if up_ok else "FAIL", "Up is not an intercept arm, so it still routes", r_up.consumed, r_up.cmd)
+			kd.table, kd.table_editing = false, false
+
+			// THE TAB ARM, ON A REAL GRID, THROUGH THE ROUTING. tablesorttest covers
+			// this arm by REIMPLEMENTING it -- it calls table_edit_commit(resort =
+			// false) and then table_cell_at_index in the order the arm calls them --
+			// which pins the callees and not the wiring. That is the same distinction
+			// this whole proc exists to close, one layer down: applying the arm's own
+			// documented bug (read next_row AFTER a resorting commit) leaves every
+			// table mode green.
+			//
+			// Tab's rule: `next_row` is a VISIBLE row index captured BEFORE the
+			// commit, so the commit must not reorder or the index names a different
+			// row -- development-loop §4's Shape B. Sorted ascending the fixture reads
+			// a,3|b,1|c,2; retyping visible row 2's "c" to "aa" would sort it to
+			// position 1 if the commit resorted. The assertion is the VALUE of the
+			// cell Tab opens: "2" if the row stayed put, "1" if it moved.
+			td := ts_doc("k,v\nb,1\nc,2\na,3\n", 2)
+			defer doc_close(&td)
+			table_sort_set(&td, 0, false)
+			TROWS :: 8 // more rows than the fixture has; table_cell_at_index bounds-checks
+			eok, tr, tc, fs, fe, val := table_cell_at_index(&td, 2, 0, TROWS)
+			pre_ok := eok && val == "c"
+			if !pre_ok {bad^ += 1}
+			fmt.printfln("  %-6s %-46s -> %q", "ok" if pre_ok else "FAIL", "precondition: sorted, visible row 2 holds \"c\"", val)
+			table_edit_start(&td, tr, tc, fs, fe, val)
+			table_edit_end(&td)
+			for len(td.table_edit_buf) > 0 {table_edit_backspace(&td)}
+			for r in "aa" {table_edit_rune(&td, r)}
+			r_tab := key_route(&ka, &td, ev(.Tab), TROWS)
+			opened := string(td.table_edit_buf[:])
+			tab_ok := r_tab.consumed && td.table_editing && td.table_edit_col == 1 && opened == "2"
+			if !tab_ok {bad^ += 1}
+			fmt.printfln("  %-6s %-46s -> consumed=%v col=%d value=%q", "ok" if tab_ok else "FAIL", "Tab opens the next cell on the SAME visible row", r_tab.consumed, td.table_edit_col, opened)
+			table_edit_cancel(&td)
+
+			// THE POINTER THE FRAME LOOP HOLDS IS FREEABLE MID-LOOP, which is why
+			// main.odin re-reads `doc` on every iteration rather than once per frame.
+			// Ctrl+W reaches app_close's `free(a.docs[slot])`, and key_route's first
+			// statement dereferences the ^Document it is handed -- so before the fix,
+			// a second key event in the same frame read (and could write through) a
+			// freed box.
+			//
+			// POINTER IDENTITY, not a content comparison: the bug is a use-after-free,
+			// and freed contents can compare equal to anything. development-loop §3.
+			kdummy: plat.Window
+			ktext: plat.Text
+			command_dispatch(.Tab_New, {}, &ka, &kdummy, &ktext, 10)
+			held := app_active(&ka) // what a once-per-frame capture would still hold
+			slot := ka.active
+			command_dispatch(.Tab_Close, {}, &ka, &kdummy, &ktext, 10)
+			freed := ka.docs[slot] == nil && app_active(&ka) != held
+			if !freed {bad^ += 1}
+			fmt.printfln("  %-6s %-46s -> slot=%v now=%v", "ok" if freed else "FAIL", "Ctrl+W frees the doc a frame-long capture holds", ka.docs[slot] == nil, app_active(&ka) != held)
+			// ...and the loop re-reads BEFORE routing. main.odin's frame loop has no
+			// message pump under test, so this is a source check for the same reason
+			// tablegridtest's F1 is one -- and it is written as an ORDER between two
+			// landmarks rather than one literal line, so a rename inside the loop does
+			// not break it while a re-read moved back out of the loop does.
+			{
+				src := #load("main.odin", string)
+				loop := strings.index(src, "for i in 0 ..< window.key_count {")
+				route := strings.index(src[loop:], "key_route(") if loop >= 0 else -1
+				reread := strings.index(src[loop:], "doc = app_active(&app)") if loop >= 0 else -1
+				ordered := loop >= 0 && route > 0 && reread > 0 && reread < route
+				if !ordered {bad^ += 1}
+				fmt.printfln("  %-6s %-46s -> loop=%d reread=+%d route=+%d", "ok" if ordered else "FAIL", "...and the loop re-reads it before it routes", loop, reread, route)
+			}
+		}
+		kr_cases(&bad)
+
 		// NOT the only mode that exits non-zero -- 18 `os.exit(1)` sites live in this
 		// file as of this count (`grep -c` on the literal), and this branch alone
 		// added three of them (menutest, settingstest, tablesorttest). This one earns
@@ -17404,9 +17607,18 @@ when NEWTPAD_TESTS {
 				//    nnorm check uses for the identical reason, and it is what is
 				//    left. The keyboard path and the command palette are the two
 				//    routes a user reaches a page key through.
+				//
+				//    THESE TWO STRINGS ARE LOAD-BEARING SOURCE TEXT, so a rename in
+				//    main.odin's frame loop breaks them and MUST be answered by editing
+				//    them here, never by loosening the count. It has happened once:
+				//    2026-08-05 extracted the loop's routing into key_route, `cmd`
+				//    became `r.cmd`, and this went red on the next sweep with the
+				//    guarded behaviour completely intact. That is the check working --
+				//    it cannot tell a rename from the regression, so it reports both,
+				//    and the answer is to re-read the call and re-state it exactly.
 				{
 					src := #load("main.odin", string)
-					nkey := strings.count(src, "command_dispatch(cmd, ev, &app, window, &text, srows)")
+					nkey := strings.count(src, "command_dispatch(r.cmd, ev, &app, window, &text, srows)")
 					npal := strings.count(src, "palette_execute(&app, window, &text, srows)")
 					chk(&bad, nkey == 1, fmt.tprintf("the keyboard path dispatches with the scroll model's count (%d matches for srows)", nkey))
 					chk(&bad, npal == 1, fmt.tprintf("...and so does the command palette (%d matches for srows)", npal))
@@ -31097,24 +31309,28 @@ when NEWTPAD_TESTS {
 					// down for the rest of the session, holding content 30px lower, on
 					// a page where Alt reaches nothing. Only focus loss recovered it.
 					//
-					// WHAT THIS DOES AND DOES NOT COVER, because the difference is the
-					// bug itself. It drives menu_close directly, so it pins that the exit
-					// CLEARS both flags and that MENU_BAR_SHOWN follows. It does NOT prove
-					// the frame loop REACHES that exit -- the context selection is inline
-					// in main.odin and cannot be called from here, and reaching it was
-					// precisely what was broken. Deleting the frame-loop guard leaves this
-					// green; the wiring is covered by a live pass instead. Recorded rather
-					// than left implied, because a green test here reads like more than it
-					// is -- and extracting that context choice into a proc is what would
-					// make it testable.
+					// WHAT THIS COVERS, updated 2026-08-05. It used to drive menu_close
+					// directly and said so: that pinned what the exit DOES and could not
+					// pin that the frame loop REACHES it, which was the entire bug. The
+					// context selection was inline in main.odin and no mode could call it,
+					// so deleting the frame-loop guard left this green.
+					//
+					// key_route (commands.odin) is that selection, extracted. This now goes
+					// through it with a real key event on a real Settings page -- the
+					// context that outranks .Menu and so never reached menu_close -- and
+					// deleting the guard fails these three lines. The remaining uncovered
+					// step is one call in the loop body, down from the whole decision.
 					a2.menu.revealed = true
 					a2.menu.mode = true
 					menu_bar_apply(&a2, 900)
 					mt_chk(&bad, MENU_BAR_SHOWN, "precondition: Alt reveals the bar while the setting hides it")
-					// Exactly what the frame loop now does for any key whose context
-					// is not .Menu.
-					if a2.menu.revealed {menu_close(&a2)}
+					sd2 := app_active(&a2)
+					kind_was := sd2.kind
+					sd2.kind = .Settings
+					kr := key_route(&a2, sd2, plat.Key_Event{key = .Down}, 0)
+					sd2.kind = kind_was
 					menu_bar_apply(&a2, 900)
+					mt_chk(&bad, kr.ctx == .Settings, "the Settings page outranks .Menu even with menu mode on -- the condition that stuck the reveal")
 					mt_chk(&bad, !a2.menu.revealed, "a key routed outside the menus ends the reveal")
 					mt_chk(&bad, !MENU_BAR_SHOWN, "...and the bar goes back down with it")
 					mt_chk(&bad, !a2.menu.mode, "...and keyboard menu mode ends too, so mnemonics stop being underlined")

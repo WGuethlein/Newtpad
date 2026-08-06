@@ -911,6 +911,136 @@ resolve_key :: proc(key: plat.Key, ctrl, alt: bool, ctx: Ctx) -> Command_Id {
 	return .None
 }
 
+// What one key event resolves to, before command_dispatch runs it.
+Key_Route :: struct {
+	cmd:      Command_Id, // .None when nothing is bound, or when the cell editor took it
+	// UNDEFINED WHEN `consumed`. The cell-edit arms return before a context is
+	// chosen, and Ctx's zero value is .Editor -- so a consumed key reads as an
+	// editor route and is indistinguishable from a real one. Nothing reads it in
+	// that case today; a test asserting `.ctx == .Editor` on an intercepted key
+	// would be a guaranteed green that means nothing.
+	ctx:      Ctx,
+	consumed: bool, // the cell editor handled it; the caller must not dispatch
+}
+
+// Everything the frame loop does with a key event except run it. Lifted out of
+// main.odin's loop body on 2026-08-05; the loop is now `key_route` + `continue`
+// on consumed + `command_dispatch`.
+//
+// THE REASON IS A TEST, not tidiness. §6ct fixed an Alt reveal that stuck for the
+// whole session on the Settings and Font pages -- those contexts outrank .Menu
+// below, so after an Alt tap no later key was ever routed to .Menu and nothing
+// reached menu_close. Its test could only drive menu_close directly, which pins
+// what the exit DOES and not that the loop REACHES it, and reaching it was the
+// bug. The exit lives in the menu subsystem; the thing deciding whether the menu
+// subsystem sees a key at all lived inline in a frame loop no mode can call.
+//
+// So this performs the menu_close calls rather than returning "the caller should
+// close the menu": a decision here and its effect back in main.odin would rebuild
+// the exact seam §6ct came from. A test asserting app.menu.revealed after this
+// returns proves the chain; a test asserting a returned bool proves the decision
+// and nothing about the wiring.
+//
+// It takes no ^plat.Window and no ^plat.Text, which is what makes it reachable
+// from a headless mode with only an App and a Document -- every callee on these
+// paths is app/doc-only. command_dispatch is what needs the window, and it stays
+// in the loop.
+//
+// `doc` is a parameter rather than app_active(app) because the frame loop
+// captures it once per frame and re-reads it only AFTER the key loop, while the
+// .Find arm below reads app_active(app).find.active fresh. That asymmetry is
+// preserved exactly: this was an extraction, not a fix. It means two key events
+// in one frame across a Ctrl+Tab resolve the second one's context from the
+// PREVIOUS document's kind. Pre-existing, rare, and now in one place if it is
+// ever worth changing.
+key_route :: proc(app: ^App, doc: ^Document, ev: plat.Key_Event, trows: int) -> Key_Route {
+	// A cell edit in the table grid owns the editing keys (a mini text field),
+	// before they resolve to editor commands. Enter/Tab commit, Esc cancels; Tab
+	// then steps to the next cell on the same row.
+	if doc.table && doc.table_editing && !ev.ctrl && !ev.alt {
+		#partial switch ev.key {
+		case .Backspace:
+			table_edit_backspace(doc)
+			return {consumed = true}
+		case .Delete:
+			table_edit_delete(doc)
+			return {consumed = true}
+		case .Left:
+			table_edit_move(doc, -1)
+			return {consumed = true}
+		case .Right:
+			table_edit_move(doc, 1)
+			return {consumed = true}
+		case .Home:
+			table_edit_home(doc)
+			return {consumed = true}
+		case .End:
+			table_edit_end(doc)
+			return {consumed = true}
+		case .Escape:
+			table_edit_cancel(doc)
+			return {consumed = true}
+		case .Enter:
+			table_edit_commit(doc)
+			return {consumed = true}
+		case .Tab:
+			// COMMITS WITHOUT REORDERING, and `next_row` is why as much as
+			// the feel is: it is a VISIBLE row index, captured here and
+			// consumed after the commit, so a commit that re-sorted would
+			// leave it naming a different row entirely -- an index read in
+			// an order it was not taken in, which is the shape
+			// development-loop §4 calls Shape B. Tab means "the next cell in
+			// this row"; the row moves when it is left for good, by Enter or
+			// by a click elsewhere.
+			next_row, next_col := doc.table_edit_row, doc.table_edit_col + 1
+			table_edit_commit(doc, resort = false)
+			if ok, r, col, fs, fe, val := table_cell_at_index(doc, next_row, next_col, trows); ok {
+				table_edit_start(doc, r, col, fs, fe, val)
+			}
+			return {consumed = true}
+		case:
+		}
+	}
+	// Context is per-event; palette/find/menu/tab-switch can change it
+	// mid-loop. Priority: menu > palette > find > editor.
+	ctx := Ctx.Editor
+	if doc.kind == .Font {
+		ctx = .Font
+	} else if doc.kind == .Settings {
+		ctx = .Settings
+	} else if app.history.open {
+		ctx = .History
+	} else if menu_is_active(app) {
+		ctx = .Menu
+	} else if app.palette.active {
+		ctx = .Palette
+	} else if app_active(app).find.active {
+		ctx = .Find
+	}
+	cmd := resolve_key(ev.key, ev.ctrl, ev.alt, ctx)
+	// A global chord taken while the menu is open should close it first.
+	if ctx == .Menu && cmd != .None && !is_menu_cmd(cmd) {
+		menu_close(app)
+	}
+	// ...and a key that routed SOMEWHERE ELSE ENTIRELY ends an Alt reveal.
+	//
+	// The reveal is cleared by menu_close, and every dismissal used to reach it
+	// -- but .Font and .Settings outrank .Menu in the priority above, so on
+	// those pages an Alt tap revealed the bar and then NO later key was ever
+	// routed to .Menu to close it. The bar stayed down for the rest of the
+	// session, holding the content 30px lower, on a page where Alt has nothing
+	// to reach. Focus loss was the only way out.
+	//
+	// Written as "any key not going to the menus" rather than "not on the
+	// settings page": the bug was one instance of a class, and naming the two
+	// contexts that outrank .Menu today would go stale the moment a third
+	// full-page surface is added.
+	if ctx != .Menu && app.menu.revealed {
+		menu_close(app)
+	}
+	return {cmd = cmd, ctx = ctx}
+}
+
 // block_extend (block.odin) takes no ^App -- that file has never imported
 // the App type, keeping its layering the same as before this feature -- so
 // the one caller that has `app` in scope turns a refusal into the status
