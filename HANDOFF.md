@@ -9138,6 +9138,65 @@ with a comment saying *"Two rows"* that is now three. **The count in that commen
 - A four-space-indented paragraph can never be reflowed: it reads as an indented code block. Correct for
   markdown, arguable for plain prose, and left as the safe default.
 
+## 6dd. The owed status-bar bugs, and two register items (2026-08-06, v0.90.0, branch `fix/owed-status-bar-bugs`)
+
+Everything §6da and §6db left on the Owed list, plus §7's footer and §9's blockquote bar.
+
+### Three bugs that were on a list rather than fixed
+
+**The selection cell resized on every frame of a drag-select**, shuffling the size cell and its divider
+the whole time you dragged. Both numbers are slotted now — **floors of 4 and 2 rather than the
+document's magnitude**, because the maximum here is the buffer LENGTH and slotting to that would put
+eight spaces in front of a three-byte selection in a large file.
+
+**The cells act on click and did not change the pointer.** §13: *"Every cell is clickable. A status bar
+that only reports is half a status bar."* Same producer as the draw and the click, so the affordance
+appears over exactly the cells that act — including the ones that dropped at this width, which is the
+half a hardcoded row test would get wrong.
+
+**Both `ui.Button` draws take the label origin AND the baseline from the producer now.** The status draw
+was computing its own `base_y`; equal by construction, and a second place for it to be derived.
+
+### The assertion for the third was itself weak, and the sabotage is what showed it
+
+`main.odin` has **two** `ui.Button` draws — the find bar's action row and the status cells. The first
+version of the check looked for `c.label, c.tx,` *anywhere* in the file, so sabotaging the **status**
+draw left it green on the strength of the **find bar's**. It counts both now.
+
+That is the second time in two sessions that a source-text assertion was satisfied by the wrong call
+site. The pattern is worth naming: **a source check must identify WHICH call it is about**, by matching
+enough of the call to be unique, or it is an assertion about the file rather than about the code.
+
+### A use-after-free in a test, found by an exit code
+
+The new palette block reached for `a`, the mode's outer `App` — which `palettetest` destroys ~300 lines
+earlier. The mode exited **0xC0000005** with every printed line still reading `ok`. Same shape as the
+frame loop's own use-after-free in §6cz, and just as invisible from the verdict; the block builds its
+own `App` now. **A mode that crashes has no failing line to grep for — the exit code is the only
+evidence, which is exactly why §6bv made them load-bearing.**
+
+### §7's footer is a live form
+
+The mockup renders three runs once a prefix is typed — the prefix in accent, the argument in primary
+text, the hint dimmed: `: 124  go to line · type a number`. The legend answers *"what can I type here"*;
+once the user has answered that themselves, the footer should say what THIS will do and echo the
+argument, so a mistyped number is visible without looking back up at the input. The resting legend is a
+named constant so the draw and the test cannot drift into two spellings.
+
+### §9's blockquote bar
+
+Drawn in `Md_Quote` — which is the quote **text's** role, so the bar read as decoration. §9.4 gives it
+`border-left: 2px solid #d99b62`, the only `border-left` value in the section. Only the bar moved; the
+text stays muted, the same split the bullet glyph already uses.
+
+### Owed
+
+- The §18 focus-model scope question, still open (§6db).
+- `[KEYS.TXT NOT AVAILABLE]` / `[RULES.TXT NOT AVAILABLE]` are precondition failures still filed as
+  `.Info`; the closest calls among the twenty that stayed.
+- A four-space-indented paragraph still cannot be reflowed — it reads as an indented code block.
+- Nobody has seen any of this session's visual work at 1:1.
+
 ## 7. Build environment (Windows, this machine)
 
 - **`build.bat` is the one build script.** `build.bat` = debug, **console subsystem** so the

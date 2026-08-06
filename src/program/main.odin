@@ -1184,6 +1184,17 @@ main :: proc() {
 				// pixels that clear the sort and the pointer that agrees all come out
 				// of one rectangle.
 				want = .Hand
+			} else if status_cell_at(&app, doc, &text, f32(window.width), f32(window.height), plat.text_char_width(&text, UI_SMALL_PX), f32(cx), f32(cy)) != .None {
+				// The status bar's cells. Same producer as the draw and the click, so
+				// the pointer changes over exactly the cells that act and only there
+				// -- including the ones that DROPPED at this width, which is the half
+				// a hardcoded row test would get wrong.
+				//
+				// UI spec 13: "Every cell is clickable. A status bar that only reports
+				// is half a status bar." A cell that acts on click and does not change
+				// the pointer is the same argument the find bar's buttons already
+				// carry two branches down: nothing on screen says it can be clicked.
+				want = .Hand
 			} else if doc.find.active && find_action_at(doc, &text, f32(window.width), f32(cx), f32(cy)) != .None {
 				// Same geometry as the draw, the hover fill and the click. A
 				// button that looks pressable, fills on hover and does not change
@@ -2673,7 +2684,7 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 				cc := col
 				if i == L.accent {cc = g_theme[.Accent]} // the selection cell
 				if i == L.success {cc = g_theme[.Success]} // `Saved`
-				plat.text_draw(gfx, text, c.label, c.tx, base_y, UI_SMALL_PX, cc)
+				plat.text_draw(gfx, text, c.label, c.tx, c.ty, UI_SMALL_PX, cc)
 				// A 1px border_subtle at every cell's LEFT edge except the bar's
 				// very first -- read off §13's mockup DOM, where the right group's
 				// leading cell carries one too. status_divider states the rule once

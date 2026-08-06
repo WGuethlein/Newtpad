@@ -1254,10 +1254,18 @@ status_bar_layout :: proc(
 		// The line count is dropped, not guessed, when the selection is past
 		// STATUS_LINE_CAP -- doc_sel_line_count returns 0 for "cannot state it" and
 		// the bar omits what it cannot state, exactly as it does for Ln/Col.
+		// SLOTTED like Ln/Col, and for a worse case than Ln/Col had: both numbers
+		// change on EVERY FRAME of a drag-select, so an unpadded cell resized
+		// continuously and shuffled the size cell and its divider the whole time
+		// you were dragging. Floors rather than the document's magnitude, because
+		// the maximum here is the buffer LENGTH -- slotting to that would put eight
+		// spaces in front of a three-byte selection in a big file. A 4/2 floor
+		// covers every selection under 10,000 bytes and 100 lines without jitter and
+		// costs at most three spaces; past it the cell grows, once per digit.
 		if nl := doc_sel_line_count(doc); nl > 0 {
-			count = fmt.tprintf("%d selected, %d lines", hi - lo, nl)
+			count = fmt.tprintf("%s selected, %s lines", rpad(hi - lo, 4), rpad(nl, 2))
 		} else {
-			count = fmt.tprintf("%d selected", hi - lo)
+			count = fmt.tprintf("%s selected", rpad(hi - lo, 4))
 		}
 		sel = true
 	}
