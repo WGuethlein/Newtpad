@@ -38885,6 +38885,101 @@ when NEWTPAD_TESTS {
 		// re-flowed block and the cache holding across repeated md_layout_ensure
 		// calls. Hard breaks, lazy continuation and setext are later tasks in this
 		// batch and do not exist yet.
+		// `newtpad mdhittest` -- CAN THE MOUSE REACH THE PREVIEW AT ALL?
+		//
+		// Wyatt, live use 2026-08-06: *"i can't drag, right-click, etc, copy,
+		// anything on the preview"*. The preview is inert to the mouse, which is one
+		// bug and not three: main.odin's read-only block SWALLOWS every press over a
+		// preview (it zeroes mouse_pressed, mouse_middle_pressed and mouse_down so
+		// the caret cannot be placed there), and the only thing that acts on a press
+		// BEFORE the swallow is the selection start. If md_preview_pos_at does not
+		// resolve a position, the press is set aside and consumed and the surface is
+		// dead to everything.
+		//
+		// mdseltest cannot see this. It drives md_preview_sel_text_for_test, which
+		// takes a measure directly and never touches the pixel -> position mapping;
+		// its own comment says so. This drives the mapping the FRAME LOOP calls, with
+		// a real device, which is the only version of the question that matters.
+		if os.args[1] == "mdhittest" {
+			mh_run :: proc() -> int {
+				bad := 0
+				mh_chk :: proc(bad: ^int, ok: bool, label: string) {
+					if !ok {bad^ += 1}
+					fmt.printfln("  %-6s %s", "ok" if ok else "FAIL", label)
+				}
+				h: Headless_Gpu
+				if !headless_gpu_init(&h, 1280, 900, "mdhittest") {
+					mh_chk(&bad, false, "an offscreen device came up, so the hit-test could be driven")
+					return bad
+				}
+				defer headless_gpu_destroy(&h)
+
+				src := "# Heading\n\nA paragraph with enough words in it to occupy a line.\n\n- A list item\n\nAnother paragraph.\n"
+				content := make([]u8, len(src))
+				copy(content, transmute([]u8)src)
+				doc := doc_from_content(content, "hit.md", .UTF8)
+				defer doc_close(&doc)
+				px := f32(16)
+				W, H := f32(1280), f32(900)
+
+				// Both modes, because the gate differs between them: full Preview
+				// admits every column, Split only those right of the divider.
+				for mode in ([]Md_Mode{.Preview, .Split}) {
+					doc.md_mode = mode
+					doc.md_top = {}
+					x0, x1, ytop, ybot, box_ok := md_pane_box(&doc, W, H, 0.5)
+					mh_chk(&bad, box_ok, fmt.tprintf("%v: the pane has a box (%.0f..%.0f x %.0f..%.0f)", mode, x0, x1, ytop, ybot))
+					if !box_ok {continue}
+
+					// A point squarely inside the pane, a few lines down from the top
+					// so it lands on real content rather than on the top padding.
+					mx := x0 + (x1 - x0) * 0.25
+					hits, misses := 0, 0
+					first_miss := f32(-1)
+					for dy in ([]f32{8, 24, 40, 60, 80, 120, 160}) {
+						my := ytop + dy
+						if my >= ybot {continue}
+						if _, ok := md_preview_pos_at(&h.gfx, &h.text, &doc, px, W, H, 0.5, mx, my); ok {
+							hits += 1
+						} else {
+							misses += 1
+							if first_miss < 0 {first_miss = dy}
+						}
+					}
+					// THE WHOLE POINT. A preview that resolves no position anywhere is
+					// a preview you cannot select, drag, or copy from -- and because
+					// the press is swallowed either way, one that also eats the click.
+					mh_chk(&bad, hits > 0, fmt.tprintf("%v: a press inside the pane resolves a position (%d hit / %d missed)", mode, hits, misses))
+					mh_chk(&bad, misses == 0, fmt.tprintf("%v: EVERY probe down the pane resolves (first miss at +%.0fpx)", mode, first_miss))
+				}
+
+				// ...and a press outside the pane must NOT resolve, or the preview
+				// would claim presses belonging to the editor half or the bars.
+				doc.md_mode = .Split
+				x0, _, ytop, _, _ := md_pane_box(&doc, W, H, 0.5)
+				_, left_ok := md_preview_pos_at(&h.gfx, &h.text, &doc, px, W, H, 0.5, x0 - sx(20), ytop + 40)
+				mh_chk(&bad, !left_ok, "Split: a press left of the divider is not the preview's")
+
+				// A selection made through that mapping yields text, which is the
+				// thing the user is actually trying to do.
+				doc.md_mode = .Preview
+				bx0, bx1, bytop, bybot, _ := md_pane_box(&doc, W, H, 0.5)
+				a, aok := md_preview_pos_at(&h.gfx, &h.text, &doc, px, W, H, 0.5, bx0 + sx(4), bytop + 40)
+				b, bok := md_preview_pos_at(&h.gfx, &h.text, &doc, px, W, H, 0.5, bx1 - sx(40), min(bytop + 120, bybot - 1))
+				mh_chk(&bad, aok && bok, "two ends of a drag both resolve")
+				if aok && bok {
+					doc.md_sel_a, doc.md_sel_b = a, b
+					doc.md_sel_on = true
+					s, sok := md_preview_sel_text(&h.gfx, &h.text, &doc, px, W, H, 0.5)
+					mh_chk(&bad, sok && len(s) > 0, fmt.tprintf("...and the selection between them copies as text (%q)", s))
+					doc.md_sel_on = false
+				}
+				return bad
+			}
+			fmt.println("mdhittest:")
+			return mode_done("mdhittest", mh_run())
+		}
+
 		if os.args[1] == "mdjointest" {
 			para_join_test_run()
 			return true
