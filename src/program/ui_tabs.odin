@@ -69,9 +69,27 @@ PLUS_W := PLUS_W_96
 // past this: WM_NCHITTEST checks the caption buttons FIRST, so a tab drawn
 // underneath them is unreachable — and clicking where it appears to be sends
 // HT_CLOSE, which exits the app.
-@(private = "file")
+// A strip at the right end of the rail that NOTHING may occupy, so there is
+// always somewhere to grab the window.
+//
+// Wyatt, live use 2026-08-06: *"when in this exact size, theres nowhere on the top
+// row that i can grab the window and move it... i need to resize then move"*. That
+// is a REGRESSION FROM v0.87.0 and the exact cost of that fix. WM_NCHITTEST returns
+// HT_CLIENT below `win.tabs_right` and HT_CAPTION above it, and v0.87.0 correctly
+// stretched tabs_right to cover the "+N" overflow count -- which sits flush at
+// `limit - over_w`, so tabs_right became `limit` exactly and the caption region
+// went to zero width. Before the fix the indicator was unclickable AND the strip
+// was draggable; the fix traded one for the other without noticing there was a
+// trade.
+//
+// Reserving it in the LIMIT rather than special-casing the hit-test is what keeps
+// the two in agreement: every producer on this rail already respects `limit`, so
+// the tabs, the `+` and the count all stop short of the strip by construction and
+// tabs_right cannot reach it.
+TAB_DRAG_RESERVE_96 :: f32(40)
+
 tabs_limit :: proc(win: ^plat.Window, width: f32) -> f32 {
-	return max(MENU_W, width - 3 * f32(plat.window_caption_btn_w(win)))
+	return max(MENU_W, width - 3 * f32(plat.window_caption_btn_w(win)) - sx(TAB_DRAG_RESERVE_96))
 }
 
 // The keyboard focus ring: 2px in Focus_Ring, 1px outside the element, matching
@@ -333,7 +351,35 @@ tabs_reveal_active :: proc(app: ^App, win: ^plat.Window, t: ^plat.Text, width: f
 	sc := app.tab_scroll
 	if ax - sc < MENU_W {sc = ax - MENU_W} // off the left
 	if ax + aw - sc > span {sc = ax + aw - span} // off the right
-	app.tab_scroll = clamp(sc, 0, max(0, total - span))
+	sc = clamp(sc, 0, max(0, total - span))
+
+	// SNAPPED TO A TAB BOUNDARY, which is the fix for the hole on the left.
+	//
+	// Wyatt, live use 2026-08-06: *"at certain sizes theres a large gab on the
+	// left"*, with a screenshot showing `>_`, then empty rail, then the first tab.
+	// `place` refuses to draw a tab that is not FULLY inside the strip -- rightly,
+	// since a tab clipped at the left shows a truncated name with no marker that it
+	// is truncated -- so an arbitrary scroll offset leaves the straddling tab
+	// undrawn and its whole width empty. Up to TAB_MAX_W of nothing, which reads as
+	// a layout bug because it is one.
+	//
+	// UP, not down, and the existing "revealing brings the active tab on screen"
+	// assertion is what established that -- the first version snapped DOWN and
+	// failed it. Snapping down moves the strip RIGHT, which pushes the active tab
+	// toward the far edge and can put it back past `span`: the reveal then silently
+	// fails on the tab you just switched to, which is worse than the hole. Snapping
+	// up moves it LEFT, and it can never overshoot the active tab's own boundary
+	// because that boundary is itself a candidate and is the ceiling here.
+	if sc > 0 {
+		ceil := max(0, ax - MENU_W) // puts the ACTIVE tab flush at the lane
+		best := ceil
+		for r in L.tabs {
+			off := r.x - MENU_W // the scroll that puts this tab flush at the lane
+			if off >= sc - 0.5 && off < best {best = off}
+		}
+		sc = best
+	}
+	app.tab_scroll = sc
 }
 
 // The display index a pointer x falls on, for the reorder. Asks the layout

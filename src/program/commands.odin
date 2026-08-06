@@ -83,6 +83,8 @@ Command_Id :: enum u8 {
 	// -- no default chord, because adding one is a keys.txt line now.
 	Sort_Lines,
 	Sort_Lines_Desc,
+	Unwrap_Lines,
+	Reflow_Paragraph,
 	Remove_Duplicate_Lines,
 	Format_Document,
 	// The table header's context menu (menu.odin's table_header_menu_items).
@@ -282,6 +284,8 @@ command_table := [Command_Id]Command {
 	// The behaviour they described is not lost: it is in features.md, and the case
 	// that actually needs saying at the moment of choosing -- the 16 MB / 1,000,000
 	// line refusal -- is what command_disabled_hint puts in the accelerator column.
+	.Unwrap_Lines             = {"Unwrap Selected Lines", "Edit"},
+	.Reflow_Paragraph         = {"Reflow Paragraph at Wrap Column", "Edit"},
 	.Sort_Lines               = {"Sort Lines", "Edit"},
 	.Sort_Lines_Desc          = {"Sort Lines Descending", "Edit"},
 	.Remove_Duplicate_Lines   = {"Remove Duplicate Lines", "Edit"},
@@ -1238,11 +1242,11 @@ command_mutates_doc :: proc(cmd: Command_Id) -> bool {
 	     // Alt+Up/Down already is, and for the same reasons it has to be listed
 	     // here: table view must block it (the grid is read-only and a caret left
 	     // over from text view would rewrite the file underneath it), and a live
-	     // column rectangle has to be seen at all -- these three are the one entry
+	     // column rectangle has to be seen at all -- these five are the one entry
 	     // on this list that REFUSES under a rectangle rather than dropping it,
 	     // and they only get the chance because membership here is what routes
 	     // them through the block branch in command_dispatch.
-	     .Sort_Lines, .Sort_Lines_Desc, .Remove_Duplicate_Lines:
+	     .Sort_Lines, .Sort_Lines_Desc, .Remove_Duplicate_Lines, .Unwrap_Lines, .Reflow_Paragraph:
 		return true
 	// Changing the line ending rewrites the ENTIRE buffer -- doc_set_line_ending
 	// does pt_delete(0, length) followed by pt_insert -- so every line start after
@@ -1467,14 +1471,21 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 	// the opposite reason to the rest of it: not because they edit the rectangle,
 	// but because the collapse this branch performs is what made them dangerous.
 	// Every other command here acts at the caret or on one line, so flattening the
-	// selection first costs a line at worst; these three read the selection as
-	// their SCOPE, so a collapsed selection silently promoted them to the whole
+	// selection first costs a line at worst; these read the selection as their
+	// SCOPE, so a collapsed selection silently promoted them to the whole
 	// document. They refuse in sort_lines_dispatch instead, and reaching that
 	// refusal with the rectangle intact is the whole point of the exception.
+	//
+	// Unwrap_Lines / Reflow_Paragraph join them for the same reason with a
+	// different worst case: a collapsed selection does not promote them to the
+	// document (they fall back to the paragraph at the caret, which is bounded),
+	// but it does silently change WHICH paragraph they act on -- the rectangle's
+	// caret row rather than the rows the user drew. Refusing is the honest answer
+	// to a gesture that means a column and a command that only speaks paragraphs.
 	if doc != nil && block_active(doc) && command_mutates_doc(cmd) {
 		#partial switch cmd {
 		case .Backspace, .Delete_Fwd, .Cut, .Undo, .Redo, .Insert_Tab,
-		     .Sort_Lines, .Sort_Lines_Desc, .Remove_Duplicate_Lines:
+		     .Sort_Lines, .Sort_Lines_Desc, .Remove_Duplicate_Lines, .Unwrap_Lines, .Reflow_Paragraph:
 		case:
 			block_clear(doc)
 			// Belt and braces for the invariant block_collapse_linear
@@ -1776,6 +1787,10 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 		sort_lines_dispatch(app, doc, .Descending)
 	case .Remove_Duplicate_Lines:
 		sort_lines_dispatch(app, doc, .Dedupe)
+	case .Unwrap_Lines:
+		reflow_dispatch(app, doc, t, 0) // 0 columns: join, never break
+	case .Reflow_Paragraph:
+		reflow_dispatch(app, doc, t, app.settings.reflow_col)
 	case .Format_Document:
 		// VS Code's Format Document. Wyatt asked for it 2026-07-30 with a .log file
 		// that is one unreadable line and a tasks.json showing the wanted result,

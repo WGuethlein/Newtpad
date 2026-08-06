@@ -51,6 +51,7 @@ Settings :: struct {
 	// value is consumed and where a 0 would hang a measuring loop -- duplicating
 	// them here is how the two ends drift apart.
 	tab_width:       int,
+	reflow_col:      int,
 	font_family:     string, // family NAME, not a path — paths differ per machine
 	font_style:      plat.Font_Style,
 	// The chrome's family, separate from the document's. plat.Font_Set has had
@@ -295,6 +296,7 @@ settings_default :: proc() -> Settings {
 		font_size = int(BASE_PX_96),
 		zoom_pct = ZOOM_DEFAULT,
 		tab_width = plat.TAB_WIDTH_DEFAULT,
+		reflow_col = REFLOW_COL_DEFAULT,
 		font_family = "Consolas",
 		font_style = .Regular,
 		ui_font_family = "Cascadia Mono",
@@ -377,6 +379,15 @@ settings_load :: proc() -> Settings {
 			if n, pok := strconv.parse_int(parts[1]); pok {
 				s.tab_width = tab_width_normalise(n)
 			}
+		case "reflow_col":
+			// Same normaliser both ways, for the reason tab_width's comment above
+			// gives: a 0 -- or a settings.txt written by an older build, which has
+			// no such line at all -- has to mean the same thing coming in as it
+			// does going out, and here that is the default rather than a paragraph
+			// reflowed onto one column.
+			if n, pok := strconv.parse_int(parts[1]); pok {
+				s.reflow_col = reflow_col_normalise(n)
+			}
 		case "font_family":
 			s.font_family = strings.clone(parts[1])
 		case "show_menu_bar":
@@ -448,19 +459,21 @@ settings_serialize :: proc(s: Settings, allocator := context.temp_allocator) -> 
 	if s.zoom_pct == 0 {s.zoom_pct = ZOOM_DEFAULT}
 	s.zoom_pct = clamp(s.zoom_pct, ZOOM_STEPS[0], ZOOM_STEPS[len(ZOOM_STEPS) - 1])
 	s.tab_width = tab_width_normalise(s.tab_width)
+	s.reflow_col = reflow_col_normalise(s.reflow_col)
 	// Zero means "never set" (a literal built without this field, or a struct
 	// that predates it) rather than a deliberate 0.0 fraction, which SPLIT_MIN
 	// would silently misrepresent as a real user choice.
 	if s.split_frac == 0 {s.split_frac = SPLIT_DEFAULT}
 	s.split_frac = clamp(s.split_frac, SPLIT_MIN, SPLIT_MAX)
 	body := fmt.tprintf(
-		"newtpad-settings 1\nrestore_session %d\nshow_menu_bar %d\nwrap_default %d\nfont_size %d\nzoom_pct %d\ntab_width %d\nfont_family %s\nfont_style %d\nui_font_family %s\nlink_style %d\nsplit_frac %.4f\nmd_default %d\ntable_default %d\ntable_header_mode %d\nremember_views %d\ncaret_blink %d\ncurrent_line %d\ngutter %d\npreview_font %s\ntheme_name %s\n",
+		"newtpad-settings 1\nrestore_session %d\nshow_menu_bar %d\nwrap_default %d\nfont_size %d\nzoom_pct %d\ntab_width %d\nreflow_col %d\nfont_family %s\nfont_style %d\nui_font_family %s\nlink_style %d\nsplit_frac %.4f\nmd_default %d\ntable_default %d\ntable_header_mode %d\nremember_views %d\ncaret_blink %d\ncurrent_line %d\ngutter %d\npreview_font %s\ntheme_name %s\n",
 		1 if s.restore_session else 0,
 		1 if s.show_menu_bar else 0,
 		1 if s.wrap_default else 0,
 		s.font_size,
 		s.zoom_pct,
 		s.tab_width,
+		s.reflow_col,
 		s.font_family if s.font_family != "" else "Consolas",
 		int(s.font_style),
 		s.ui_font_family if s.ui_font_family != "" else "Cascadia Mono",
@@ -517,6 +530,7 @@ Setting_Id :: enum u8 {
 	Current_Line,
 	Preview_Font,
 	Show_Menu_Bar,
+	Reflow_Col,
 }
 
 Setting_Row :: struct {
@@ -545,6 +559,7 @@ SETTINGS_ROWS := []Setting_Row {
 
 	{.Wrap_Default, "Editor", "Word wrap new documents", "Long lines fold to the window width instead of running off"},
 	{.Tab_Width, "", "Tab width", "Columns a Tab advances to; Left/Right adjust, Enter resets to 4"},
+	{.Reflow_Col, "", "Reflow column", "Width Reflow Paragraph wraps to; the editor's own wrap follows the window"},
 	{.Gutter, "", "Line numbers", "A gutter down the left; the current line's number stands out"},
 	{.Caret_Blink, "", "Blink the caret", "A steady caret is easier on some eyes; the blink is 500ms"},
 	{.Current_Line, "", "Highlight the current line", "A 3% tint on the line the caret is on"},
@@ -769,6 +784,15 @@ settings_toggle_row :: proc(rc: ^Render_Ctx, row, dir: int) {
 			step := dir if dir != 0 else 1
 			s.ui_font_family = font_choices[(cur + step + len(font_choices)) % len(font_choices)]
 		}
+	case .Reflow_Col:
+		// Stepped in FOURS, not ones. The useful range is 60-120 and a user who
+		// wants 72 from 80 should not press Left eight times; Enter resets to the
+		// default, the affordance Zoom and Tab width already share.
+		if dir == 0 {
+			s.reflow_col = REFLOW_COL_DEFAULT
+		} else {
+			s.reflow_col = clamp(s.reflow_col + dir * 4, REFLOW_COL_MIN, REFLOW_COL_MAX)
+		}
 	case .Tab_Width:
 		// Stepped, not cycled: 16 values is too many to reach by pressing Enter,
 		// and the useful ones (2, 4, 8) are all within a few Rights of each
@@ -907,6 +931,8 @@ settings_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, t: ^plat.Text, ap
 			val = app.settings.theme_name
 		case .Tab_Width:
 			val = fmt.tprintf("%d", app.settings.tab_width)
+		case .Reflow_Col:
+			val = fmt.tprintf("%d", app.settings.reflow_col)
 		case .Ui_Font:
 			val = app.settings.ui_font_family
 		case .Gutter:

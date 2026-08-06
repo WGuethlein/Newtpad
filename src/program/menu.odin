@@ -425,6 +425,14 @@ menu_item_label :: proc(app: ^App, it: Menu_Item) -> string {
 		d := app_active(app)
 		if d == nil || !doc_has_sel(d) {return ""} // whole document: the plain title
 		return fmt.tprintf("%s (Selection)", command_table[it.cmd].title)
+	case .Unwrap_Lines, .Reflow_Paragraph:
+		// The mirror of the three above, and the suffix has to differ because the
+		// no-selection SCOPE differs: those default to the whole document, these to
+		// the paragraph at the caret. A shared "(Selection)" would have implied the
+		// same fallback for both.
+		d := app_active(app)
+		if d == nil || !doc_has_sel(d) {return fmt.tprintf("%s (Paragraph)", command_table[it.cmd].title)}
+		return fmt.tprintf("%s (Selection)", command_table[it.cmd].title)
 	}
 	if it.cmd != .Table_Filter_Toggle {return ""}
 	d := app_active(app)
@@ -541,6 +549,16 @@ menus := []Menu {
 			{cmd = .Sort_Lines, enabled = has_doc},
 			{cmd = .Sort_Lines_Desc, enabled = has_doc},
 			{cmd = .Remove_Duplicate_Lines, enabled = has_doc},
+			// A DIVIDER, because appending these two made Edit's longest unbroken
+			// run six rows and UI spec 6 caps it at four -- caught by menutest, which
+			// is the assertion doing exactly its job. They earn their own group
+			// anyway: sort and dedupe REORDER lines, these two REWRAP them.
+			//
+			// UI spec 7's palette mockup lists both by name, and 7's own rule is that
+			// every command in the palette is also in a menu.
+			{cmd = .None},
+			{cmd = .Unwrap_Lines, enabled = has_doc},
+			{cmd = .Reflow_Paragraph, enabled = has_doc},
 			// Live on any text document, not just a .json: the request was
 			// illustrated with a .log file, and an extension gate excluded it. See
 			// doc_can_json. Pressing it on something that is not JSON says so and
