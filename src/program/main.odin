@@ -749,7 +749,14 @@ main :: proc() {
 		// this the same pixels would start a byte-model drag on doc.top, and the
 		// preview would then be dragged around by the sync in row steps -- the
 		// model this task replaces, reachable through the bar alone.
-		if scrollbar_shown && doc.md_mode != .Preview && window.mouse_pressed && f32(window.mouse_x) >= scrollbar_lo && f32(window.mouse_x) < scrollbar_hi && window.mouse_y >= i32(CHROME_TOP) {
+		// ...and ABOVE the status bar. This had a top bound and no bottom one, so
+		// the bar's rightmost SCROLLBAR_W pixels started a jump-scroll instead of
+		// reaching the bar -- and it consumes mouse_pressed here, hundreds of lines
+		// before the status cells are hit-tested. Harmless while the last cell's
+		// box stopped 12px short of the window edge; §13's cells are flush to it, so
+		// that strip became the `Tab 4` cell's own padding and the error bar's
+		// dismissal target. The scrollbar has never had any business in that row.
+		if scrollbar_shown && doc.md_mode != .Preview && window.mouse_pressed && f32(window.mouse_x) >= scrollbar_lo && f32(window.mouse_x) < scrollbar_hi && window.mouse_y >= i32(CHROME_TOP) && f32(window.mouse_y) < f32(window.height) - doc_bottom_bar_h(doc) {
 			scrollbar_drag = true
 			vscroll_grab = vbar_grab_at(g_vbar_editor, f32(window.mouse_y))
 			window.mouse_pressed = false
@@ -2694,8 +2701,14 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 			case .Split:
 				mode = "    Markdown Split (Ctrl+M)"
 			}
-			if mode != "" && len(L.cells) > L.left_n {
-				rx := L.cells[L.left_n].x - sx(12) - f32(len(mode)) * cw
+			if mode != "" {
+				// Flush right when the whole right group has dropped, rather than
+				// vanishing with it: the group going means there is MORE room for
+				// this, not less. The first version keyed the whole branch on a
+				// surviving cell and so lost the view name exactly when it was the
+				// only thing that still fitted.
+				rx := w - sx(12) - f32(len(mode)) * cw
+				if len(L.cells) > L.left_n {rx = L.cells[L.left_n].x - sx(12) - f32(len(mode)) * cw}
 				if rx > L.msg_x + f32(len(L.msg)) * cw + sx(12) {
 					plat.text_draw(gfx, text, mode, rx, base_y, UI_SMALL_PX, col)
 				}

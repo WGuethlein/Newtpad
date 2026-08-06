@@ -133,7 +133,7 @@ app_saved_active :: proc(a: ^App) -> bool {
 
 // Whether an error is holding the bar. No timeout by design.
 app_error_active :: proc(a: ^App) -> bool {
-	return a.notice != "" && a.notice_kind == .Error
+	return a != nil && a.notice != "" && a.notice_kind == .Error
 }
 
 // Dismiss one. Returns whether there was anything to dismiss, so a caller that

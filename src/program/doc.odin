@@ -1041,7 +1041,7 @@ doc_top_bar_h :: proc(doc: ^Document) -> f32 {
 // or text is drawn behind the bar and clicks in that strip land on rows the user
 // cannot see.
 // The status bar's cells, as boxes. ONE geometry for the WHOLE bar, consumed by
-// the draw, the click and the cursor -- UI spec 13: "Cells, not a sentence. 12px
+// the draw and the click -- UI spec 13: "Cells, not a sentence. 12px
 // padding each side, a 1px border_subtle between."
 //
 // BOTH GROUPS, from one producer, as of 2026-08-05. The left group used to be a
@@ -1080,6 +1080,14 @@ Status_Bar :: struct {
 // COMPILE error at every call site instead. That mattered again immediately:
 // this change took the count from 4 to 8.
 STATUS_CELL_MAX :: 8
+
+// ...and the buffer is EXACTLY saturated, so the compile error above only fires
+// for an undersized buffer at a CALL SITE -- a fourth left cell or a sixth right
+// one would be a runtime bounds panic instead. Stated as an assert so the count
+// is checked by the compiler rather than by this comment.
+STATUS_LEFT_MAX :: 3 // Ln/Col, the count, the size
+STATUS_RIGHT_MAX :: 5 // Saved, language, encoding, line endings, tab width
+#assert(STATUS_LEFT_MAX + STATUS_RIGHT_MAX <= STATUS_CELL_MAX)
 
 // `Saved` shows for 1.5s, per §13: "Saved for 1.5s in success, then gone. No
 // toast, no dialog, no sound." Its own constant rather than NOTICE_SECONDS (4.0)
@@ -1149,16 +1157,26 @@ status_bar_layout :: proc(
 ) {
 	L.accent, L.success = -1, -1
 	L.cells = out[:0]
-	if doc == nil || doc.kind != .Text {return}
 
 	// An error takes the WHOLE bar and suppresses every cell -- §13: "Errors take
 	// the whole bar in danger until dismissed. Nothing in this app should ever
 	// need a modal dialog." Returned before anything is placed, so the draw and
 	// the hit-test cannot disagree about whether cells exist: there are none.
-	if app != nil && app.notice_kind == .Error && app.notice != "" {
+	//
+	// AHEAD OF THE DOCUMENT-KIND GATE, and that ordering is a data-safety rule
+	// rather than a tidiness one. It sat BELOW the gate for one review round, and
+	// the consequence was a save failure that reached nobody: request_close_tab is
+	// not gated on the ACTIVE tab (ui_tabs.odin's ✕, .Tab_Close_This whose own
+	// comment says "a right-click does not activate here", .Tab_Close_Others), so
+	// a dirty file tab can be closed and saved while Settings or the font page is
+	// in front -- and on those the producer returned early, the bar drew nothing,
+	// and report_save's modal was already gone. An error belongs to the WINDOW,
+	// not to the document, because the thing that failed may not be on screen.
+	if app_error_active(app) {
 		L.err = app.notice
 		return
 	}
+	if doc == nil || doc.kind != .Text {return}
 
 	m := status_metrics(doc, cw)
 	y := winh - m.h
@@ -1297,9 +1315,25 @@ status_bar_layout :: proc(
 	// keeps the group flush right instead of leaving a hole where a dropped cell
 	// used to be, and what lets the drop order be intentional rather than
 	// positional.
+	// THE PACKED WIDTH MUST BE THE WIDTH THAT GETS PLACED, rounding included.
+	//
+	// `m.snap` is on, so button_layout returns `rnd(button_width(...))`, and
+	// `rnd(a) + rnd(b) != rnd(a + b)`. Stepping `rx` by the UNROUNDED width while
+	// the box is laid out at the ROUNDED one puts adjacent cells up to a pixel
+	// apart -- and since status_cell_at returns the FIRST cell containing the
+	// point in left-to-right order, an overlap makes a cell's leftmost pixel
+	// column dispatch its LEFT NEIGHBOUR's command. On this row that neighbour set
+	// is `Markdown | UTF-8 | LF | Tab 4`, so the mis-fires include a whole-buffer
+	// re-decode and a whole-buffer line-ending rewrite: exactly the accident the
+	// drop was moved into this producer to prevent, one pixel wide.
+	//
+	// Invisible at UI_SCALE 1 with an integer advance, which is where the first
+	// version of statusbartest ran. The rounding is independent of x, so pre-
+	// rounding here gives pack and the placement below the same number
+	// button_layout will produce.
 	items: [STATUS_CELL_MAX]ui.Item
 	for i in 0 ..< rn {
-		items[i] = {w = ui.button_width(cands[i].label, "", m), drop = cands[i].drop, tag = i}
+		items[i] = {w = ui.snap_w(ui.button_width(cands[i].label, "", m), m), drop = cands[i].drop, tag = i}
 	}
 	need := L.msg_x + f32(len(L.msg)) * cw + sx(24)
 	keep: [STATUS_CELL_MAX]bool
@@ -1996,11 +2030,12 @@ Document :: struct {
 	max_cells_rev: u64,
 	status_cursor: int, // cursor pos the cached status line was computed for
 	status_line:   int, // 1-based line of the cursor (0 = beyond the cap / unknown)
-	// The same cache for the SELECTION's line span (doc_sel_line_count). Keyed on
-	// the range rather than the cursor: the status bar is produced up to three
-	// times a frame now (draw, hit-test, cursor) and this scan is capped, not free.
+	// The same cache for the SELECTION's line span (doc_sel_line_count). The bar is
+	// produced by the draw every frame and by the hit-test on a press, and the scan
+	// behind it is capped rather than free -- see SEL_LINE_CAP.
 	sel_lines_lo:  int,
 	sel_lines_hi:  int,
+	sel_lines_len: int, // pt.length the count was taken at; an edit invalidates it
 	sel_lines:     int, // 0 = not computed / beyond the cap
 	// Same for the column, which was neither cached nor capped and cost an
 	// uncapped backward scan per frame. Keyed on length too, so an edit that
@@ -4272,16 +4307,33 @@ doc_cursor_line :: proc(doc: ^Document) -> int {
 // rather than printing a bounded scan's answer as though it saw everything --
 // development-loop §4's Shape A, which has cost this codebase seven bugs.
 //
-// MEMOIZED ON THE RANGE, which matters more here than it does for the cursor:
-// status_bar_layout is called by the draw, the hit-test and the pointer cursor,
-// so an unmemoized 4 MiB scan would run up to three times a frame while dragging
-// a selection instead of once.
+// ITS OWN CAP, far below STATUS_LINE_CAP's 4 MiB, and the reason is a measurement
+// this project already paid for. block.odin:709 records replacing a doc_cursor_line
+// that counted newlines from byte 0 "(up to STATUS_LINE_CAP = 4 MiB, MEASURED
+// ~3ms) on every mouse-move frame". This runs from status_bar_layout, i.e. from
+// the DRAW -- and the memo below keys on the range, so a drag-select misses it on
+// every single frame as `hi` grows. At 4 MiB that is ~3ms a frame (18% of a 60 Hz
+// budget) rising with the selection, which makes the drag O(n^2) overall and puts
+// back the exact scan block.odin removed.
+//
+// 256 KiB is ~1/16th of that. A selection past it reports its BYTE count and no
+// line count, which is doc_cursor_line's contract -- omit what you cannot state
+// rather than print a bounded scan's answer as though it saw everything
+// (development-loop §4, Shape A).
+SEL_LINE_CAP :: 256 * 1024
+
+// MEMOIZED ON THE RANGE AND THE BUFFER LENGTH. The length term is what
+// doc_cursor_col's cache three procs up carries and doc_cursor_line's does not:
+// "keyed on length too, so an edit that leaves the caret where it is still
+// invalidates". Without it, an undo that restores both endpoints, or a same-length
+// Replace All, leaves a stale line count on screen.
 doc_sel_line_count :: proc(doc: ^Document) -> int {
 	lo, hi := doc_sel_range(doc)
 	if hi <= lo {return 0}
-	if hi - lo > STATUS_LINE_CAP {return 0}
-	if lo != doc.sel_lines_lo || hi != doc.sel_lines_hi || doc.sel_lines == 0 {
+	if hi - lo > SEL_LINE_CAP {return 0}
+	if lo != doc.sel_lines_lo || hi != doc.sel_lines_hi || doc.sel_lines_len != doc.pt.length || doc.sel_lines == 0 {
 		doc.sel_lines_lo, doc.sel_lines_hi = lo, hi
+		doc.sel_lines_len = doc.pt.length
 		// A selection ending exactly on a newline spans the lines it covers, not
 		// one more: `abc\n` selected whole is ONE line, and the trailing \n is that
 		// line's terminator rather than evidence of a second.

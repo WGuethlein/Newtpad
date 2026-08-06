@@ -31529,6 +31529,21 @@ when NEWTPAD_TESTS {
 
 				// -- 7. an error takes the WHOLE bar and suppresses every cell --------
 				app_error(&a, "Could not save: file is read-only")
+				// FIRST, ON A NON-TEXT TAB, because that is where it was invisible.
+				// The kind gate used to run before the error check, so on Settings or
+				// the font page the producer returned early, the bar drew nothing, and
+				// report_save's modal was already gone. request_close_tab is not gated
+				// on the ACTIVE tab -- the rail's ✕, .Tab_Close_This and
+				// .Tab_Close_Others all reach it -- so a dirty file tab can be saved
+				// and fail while Settings is in front, and the failure reached nobody.
+				{
+					for k in ([]Tab_Kind{.Settings, .Font}) {
+						nk: Document
+						nk.kind = k
+						Lk := status_bar_layout(&a, &nk, &mt, W, H, cw, &buf)
+						sb_chk(&bad, Lk.err != "", fmt.tprintf("an error is visible on a %v tab too -- it belongs to the window, not the document", k))
+					}
+				}
 				Le := status_bar_layout(&a, &sd, &mt, W, H, cw, &buf)
 				sb_chk(&bad, Le.err == "Could not save: file is read-only", fmt.tprintf("the error holds the bar: %q", Le.err))
 				sb_chk(&bad, len(Le.cells) == 0, fmt.tprintf("...and no cell exists behind it (%d)", len(Le.cells)))
@@ -31559,6 +31574,40 @@ when NEWTPAD_TESTS {
 					sb_chk(&bad, ordered, fmt.tprintf("the error is cleared before input is drained (clear=%d drain=%d)", clear_at, drain_at))
 				}
 
+				// -- 8b. THE WARNING RUN EXISTS AND IS FLAGGED ------------------------
+				//
+				// Five data-safety messages live in `L.msg` -- [RECOVERED COPY], [FILE
+				// DELETED ON DISK], [CHANGED ON DISK], [GLYPH CACHE FULL], [LARGE FILE
+				// - unsaved edits are NOT auto-backed up] -- plus the indexing
+				// progress. NOTHING asserted any of them when this mode was first
+				// written: replacing status_message_run's body with `return ""` deleted
+				// every one and the mode stayed 37/37 green. They are not cells, so the
+				// cell assertions cannot see them, and they are the part of this bar
+				// whose absence actually costs a user something.
+				{
+					sd.disk_changed = true
+					Lw := status_bar_layout(&a, &sd, &mt, W, H, cw, &buf)
+					sb_chk(&bad, strings.contains(Lw.msg, "CHANGED ON DISK"), fmt.tprintf("the disk-changed warning reaches the bar: %q", Lw.msg))
+					sb_chk(&bad, Lw.warn, "...and colours the group as a warning")
+					// Placed after the left group, not on top of it.
+					last := Lw.cells[Lw.left_n - 1]
+					sb_chk(&bad, Lw.msg_x >= last.x + last.w, fmt.tprintf("...and starts clear of the last left cell (%.0f >= %.0f)", Lw.msg_x, last.x + last.w))
+					// It also has to push the drop: a long warning is exactly when the
+					// right group has to give way, and the bar is widest when something
+					// has gone wrong.
+					sd.recovered = true
+					Lr := status_bar_layout(&a, &sd, &mt, 700, H, cw, &buf)
+					sd.recovered = false
+					sd.disk_changed = false
+					Lc := status_bar_layout(&a, &sd, &mt, 700, H, cw, &buf)
+					sb_chk(&bad, len(Lr.cells) < len(Lc.cells), fmt.tprintf("a long warning drops right-group cells (%d with vs %d without)", len(Lr.cells), len(Lc.cells)))
+					// A clean document carries no WARNING. `(indexing N%)` is progress,
+					// not a warning, and a synthetic fixture never runs the indexer --
+					// so this asks for the absence of a bracketed warning rather than
+					// an empty run, which would only have been true by accident.
+					sb_chk(&bad, !Lc.warn && !strings.contains(Lc.msg, "["), fmt.tprintf("...and a clean document has neither (warn=%v msg=%q)", Lc.warn, Lc.msg))
+				}
+
 				// -- 9. THE SEAM: what is drawn is what is clickable ------------------
 				//
 				// Sampled at both edges and the middle, because an off-by-one lives at
@@ -31576,6 +31625,37 @@ when NEWTPAD_TESTS {
 						}
 					}
 					sb_chk(&bad, misses == 0, fmt.tprintf("every drawn cell hit-tests to its own command at both edges and the middle (%d/%d)", hits, hits + misses))
+					// BY INDEX, NOT BY COMMAND, AND AT A FRACTIONAL ADVANCE. Three of
+					// the cells carry .None and two more share .Settings_Open, so a
+					// tag comparison passes for a third of the samples whatever the
+					// geometry does -- and at UI_SCALE 1 with cw=7 every width is an
+					// integer, which is the one configuration where the rounding this
+					// is checking cannot diverge at all.
+					//
+					// The bug it caught: the right group stepped by the UNROUNDED
+					// width while button_layout laid the box out at the ROUNDED one,
+					// so adjacent cells overlapped by up to a pixel and a cell's
+					// first pixel column dispatched its LEFT NEIGHBOUR's command --
+					// including a whole-buffer re-decode and a line-ending rewrite.
+					saved_scale := UI_SCALE
+					laps2, worst_w, worst_s := 0, 0, f32(0)
+					for scale in ([]f32{1, 1.25, 1.5, 1.75, 2}) {
+						UI_SCALE = scale
+						for fcw in ([]f32{6.0, 6.6, 7.34, 8.13, 9.87}) {
+							for wpx := 320; wpx <= 1600; wpx += 3 {
+								fbuf: [STATUS_CELL_MAX]ui.Button
+								Lf := status_bar_layout(&a, &sd, &mt, f32(wpx), H, fcw, &fbuf)
+								for i in 1 ..< len(Lf.cells) {
+									if Lf.cells[i].x < Lf.cells[i - 1].x + Lf.cells[i - 1].w {
+										laps2 += 1
+										worst_w, worst_s = wpx, scale
+									}
+								}
+							}
+						}
+					}
+					UI_SCALE = saved_scale
+					sb_chk(&bad, laps2 == 0, fmt.tprintf("no cell overlaps its neighbour at any scale or advance (%d, worst w=%d scale=%.2f)", laps2, worst_w, worst_s))
 					// Cells must not overlap, or one swallows the other's clicks. Every
 					// adjacent pair, left to right.
 					laps := 0

@@ -8914,6 +8914,52 @@ see it and only the absolute-position check did. That is the refactor working: w
 and label cannot diverge. The divergence that IS still possible is the *draw* reading `c.x` where it
 should read `c.tx`, and nothing catches that. Owed.
 
+### What the review found, which is where the value of this batch is
+
+The whole-diff review confirmed the reversal, the buffer bound, the drop maths, the memory handling
+and the `tabs_right` fix by re-deriving each — and then broke four things, two of them with probes it
+built and ran.
+
+**1. A failed save reached NOBODY on a non-`.Text` tab.** The producer's `doc.kind != .Text` early
+return sat *above* the error check, so on Settings or the font page the bar drew nothing — and
+`report_save`'s modal was already gone. It is reachable: `request_close_tab` is **not gated on the
+active tab** (the rail's `✕`, `.Tab_Close_This` whose own comment says *"a right-click does not
+activate here"*, `.Tab_Close_Others`), so a dirty file tab can be closed and saved while Settings is in
+front. **An error belongs to the window, not to the document, because the thing that failed may not be
+on screen.** `report_save`'s own header has said *"silence here is a data-loss bug"* the whole time.
+
+**2. Deleting every data-safety warning left the suite 37/37 green.** `status_message_run` returning
+`""` kills `[RECOVERED COPY]`, `[FILE DELETED ON DISK]`, `[CHANGED ON DISK]`, `[GLYPH CACHE FULL]` and
+`[LARGE FILE — unsaved edits are NOT auto-backed up]`. Nothing asserted `L.msg`, `L.msg_x` or `L.warn`:
+they are not cells, so the cell assertions could not see them, and they are the part of this bar whose
+absence actually costs a user something. **The block this mode replaced at least read the concatenated
+string.**
+
+**3. A one-pixel seam, at every scale but the one the test ran at.** The right group stepped by the
+UNROUNDED width while `button_layout` laid the box out at the ROUNDED one, and `rnd(a) + rnd(b) ≠
+rnd(a+b)`. Since `status_cell_at` returns the first cell containing the point, an overlap makes a
+cell's leftmost pixel column dispatch its **left neighbour's** command — on this row that includes a
+whole-buffer re-decode and a whole-buffer line-ending rewrite. **Exactly the accident the drop was
+moved into the producer to prevent, one pixel wide.** Invisible at `UI_SCALE 1` with an integer
+advance, which is where the first version of `statusbartest` ran. Fixed with `ui.snap_w`, and the mode
+now sweeps five scales × five fractional advances × every width from 320 to 1600.
+
+**4. A 4 MiB scan back on the drag path, inside the draw.** `doc_sel_line_count` memoised on the range,
+and a drag-select changes `hi` every frame — so it missed every frame at up to `STATUS_LINE_CAP`.
+`block.odin:709` records that exact scan being **measured at ~3 ms** and removed from that exact path.
+Its own `SEL_LINE_CAP` is 256 KiB now, and a selection past it reports bytes and no line count, which
+is `doc_cursor_line`'s contract. The memo also gained the buffer length, which its neighbour
+`doc_cursor_col` carries and `doc_cursor_line` does not — without it an undo restoring both endpoints
+leaves a stale count.
+
+Plus three smaller ones taken: the scrollbar drag had a top y bound and no bottom one, so with §13's
+cells flush to the window edge it swallowed the last cell's padding and the error bar's dismissal
+target; the view-name indicator vanished when the whole right group dropped, which is when there is
+*more* room for it, not less; and three comments claimed a pointer-cursor consumer that does not exist.
+
+Each fix was sabotage-verified on its own: the unsnapped width (1577 overlaps, worst at scale 2.00),
+the deleted warnings (2 FAIL), the kind gate ahead of the error check (2 FAIL).
+
 ### What is not verified
 
 **The bar has not been seen at 1:1.** The geometry is asserted at the value level and a real offscreen
@@ -8924,7 +8970,17 @@ crowded are owed to a live pass.
 ### Owed
 
 - The draw could read `c.x` where it means `c.tx` and no test would notice.
-- The remaining `[BRACKETED CAPS]` notices are still `.Info`; several are real failures.
+- The remaining `[BRACKETED CAPS]` notices are still `.Info`; several are real failures
+  (`[CUT FAILED …]`, `[REOPEN FAILED …]`, `[THEME NOT SAVED …]`) and should probably be `.Error`.
+- `.Tab_Close_Others` saves in a loop and each failure overwrites the last, so N failures produce one
+  message naming one file.
+- §13 wants **mono digits so `Ln 9 → Ln 10` does not shift the row**. Cell widths track label length, so
+  it still shifts cells 1–2 and every divider by one advance. A fixed-width slot per numeric cell is the
+  fix; not attempted here.
+- `status_cell_at` conflates "no cell here" with "a cell whose command is `.None`" — three cells carry
+  `.None`, so a tag-identity check passes for them regardless. The overlap sweep uses index identity
+  instead, which is what has teeth.
+- No pointer-cursor affordance on the cells, though §13 says every cell is clickable.
 - §13's "numbers in Neon, words in Argon" stays dead with C4.
 
 ## 7. Build environment (Windows, this machine)
