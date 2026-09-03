@@ -12278,7 +12278,19 @@ when NEWTPAD_TESTS {
 				// A second producer of these positions, yes -- deliberately, and only
 				// in the test: it drives plat.shape_spans directly, so it can disagree
 				// with the layout only if the layout stopped going through the shaper.
-				task_ind := m.task_box + m.list_indent * 0.25
+				// The PROSE indent md_layout_build gives a top-level task item, which
+				// C7 changed: the item's content is the anchor now (Obsidian's 3ch) and
+				// the checkbox hangs to its left, where before the marker sat at the
+				// nesting depth and the prose was pushed a further step right. The old
+				// expression here mirrored that one, and mirroring is what it is: a
+				// second producer of the layout's number, which is why it had to be
+				// edited in lockstep. It stays a mirror only because nothing in this
+				// mode can reach a Md_Layout -- md_layout_ensure needs a walk -- and the
+				// sample window has to be placed before anything is rendered.
+				//
+				// md_list's depth is 0 for a top-level item (`depth /= 2` over the
+				// leading spaces), so level is 0 here and no list_step is added.
+				task_ind := m.list_indent
 				probe_spans := []plat.Shape_Span{
 					{text = "IIII ", px = m.body, set = .Body},
 					{text = "II", px = m.code, set = .Doc},
@@ -14557,7 +14569,19 @@ when NEWTPAD_TESTS {
 			UI_SCALE = 2
 			m2 := md_metrics(t, 16)
 			mchk(&bad, m1.body == m2.body && m1.head[1] == m2.head[1], "type sizes are multiples of S, not of UI_SCALE")
-			mchk(&bad, m2.list_indent > m1.list_indent && m2.fence_pad > m1.fence_pad && m2.pad_left > m1.pad_left, "the fixed-pixel insets (24/12/40px) DO scale with the UI")
+			mchk(&bad, m2.fence_pad > m1.fence_pad && m2.pad_left > m1.pad_left && m2.quote_inset > m1.quote_inset, "the fixed-pixel decorations DO scale with the UI")
+			// LIST INDENTATION CHANGED SIDES, and that is the fix rather than a
+			// regression. §9.2 item 5 said "24px per list level", so it was sx(24)
+			// and moved with the MONITOR only: a reader who raised the preview font
+			// size got the same 24px under twice the text. Obsidian denominates it in
+			// text instead -- `3ch` for the first level, 2.25em below it -- so it now
+			// belongs on the S side of this very split, with the type sizes.
+			//
+			// Both halves asserted. "Does not move with UI" alone would pass against
+			// a constant, which is the obvious way to get this wrong.
+			mchk(&bad, m1.list_indent == m2.list_indent && m1.list_step == m2.list_step, "list indentation is TEXT-derived, so UI_SCALE alone does not move it")
+			m3 := md_metrics(t, 32)
+			mchk(&bad, m3.list_indent > m2.list_indent && m3.list_step > m2.list_step && m3.list_hang > m2.list_hang, "...but doubling S does move it, so it is not merely a constant")
 			return
 		}
 
@@ -15189,12 +15213,26 @@ when NEWTPAD_TESTS {
 
 			// --- (2) UI_SCALE is part of the key (H1b) ---------------------------
 			//
-			// `indent` bakes sx()-scaled insets at BUILD time (a list's 24px per
-			// level, a quote's 16px, a fenced block's 12px pad). A monitor change
-			// with no window-size change moves every one of them while `measure`,
-			// `px`, `src`, `start`, `end` and `theme` all stay put -- so without
-			// ui_scale in the key every cached block keeps the old DPI's insets and
-			// the preview's left edge is wrong until something else evicts it.
+			// `indent` bakes sx()-scaled insets at BUILD time (a quote's 24px per
+			// level, a fenced block's 16px pad). A monitor change with no
+			// window-size change moves every one of them while `measure`, `px`,
+			// `src`, `start`, `end` and `theme` all stay put -- so without ui_scale
+			// in the key every cached block keeps the old DPI's insets and the
+			// preview's left edge is wrong until something else evicts it.
+			//
+			// THE OBSERVABLE IS A BLOCKQUOTE'S INSET, and it used to be a LIST's.
+			// C7 moved list indentation onto the TEXT -- Obsidian's 3ch and 2.25em
+			// rather than a flat 24px -- so at a fixed S it no longer moves with
+			// UI_SCALE at all, and this case would have kept passing while watching
+			// a quantity that had stopped varying. A quote's inset is still sx(24)
+			// (--size-4-6) and is still baked into `indent`, so this is the same
+			// test with a term that still moves.
+			//
+			// Written down rather than quietly swapped: a cache-key test whose
+			// observable stops varying does not fail, it passes VACUOUSLY, and the
+			// next change to the spacing model should look here first. The
+			// `m2.quote_inset > m1.quote_inset` line below is the guard against
+			// exactly that -- it asserts the observable is still an observable.
 			//
 			// Probed through markdown_links because a link rect's x IS the block's
 			// glyph origin (md_block_origin), which is exactly the quantity `indent`
@@ -15203,7 +15241,7 @@ when NEWTPAD_TESTS {
 				// The label is NOT "x": `- [x]` is GFM task-list syntax, so
 				// `- [x](url)` classifies as a checked task whose content is
 				// "(url) ..." and the link disappears before md_inline sees it.
-				doc := mk("- [see](http://ui.example) item text\n", "ui.md")
+				doc := mk("> [see](http://ui.example) quoted text\n", "ui.md")
 				defer doc_close(&doc)
 				first_x :: proc(hits: []Md_Link_Hit, url: string) -> (x: f32, ok: bool) {
 					for hh in hits {
@@ -15233,13 +15271,13 @@ when NEWTPAD_TESTS {
 				// both scales: a paragraph is capped either way, so the indent really
 				// is what moves.
 				kchk(&bad, meas1 > m1.measure && meas2 > m2.measure, fmt.tprintf("ui scale: the prose cap binds at BOTH scales (pane %.0f vs %.0f, %.0f vs %.0f)", meas1, m1.measure, meas2, m2.measure))
-				kchk(&bad, m2.list_indent > m1.list_indent, fmt.tprintf("ui scale: ...while the list indent really does move (%.0f -> %.0f)", m1.list_indent, m2.list_indent))
+				kchk(&bad, m2.quote_inset > m1.quote_inset, fmt.tprintf("ui scale: ...while the quote inset really does move (%.0f -> %.0f)", m1.quote_inset, m2.quote_inset))
 				xa, oka := first_x(h1, "http://ui.example")
 				xb, okb := first_x(h2, "http://ui.example")
-				kchk(&bad, oka && okb, fmt.tprintf("ui scale: the list item's link is placed at both scales (%d rects at 100%%, %d at 200%%)", len(h1), len(h2)))
+				kchk(&bad, oka && okb, fmt.tprintf("ui scale: the quote's link is placed at both scales (%d rects at 100%%, %d at 200%%)", len(h1), len(h2)))
 				if oka && okb {
-					kchk(&bad, abs(xa - (cx1 + m1.list_indent)) <= 1, fmt.tprintf("ui scale: at 100%% the item's prose starts at one list indent (%.1f vs %.1f)", xa, cx1 + m1.list_indent))
-					kchk(&bad, abs(xb - (cx2 + m2.list_indent)) <= 1, fmt.tprintf("ui scale: at 200%% it starts at the SCALED indent, not the cached one (%.1f vs %.1f)", xb, cx2 + m2.list_indent))
+					kchk(&bad, abs(xa - (cx1 + m1.quote_inset)) <= 1, fmt.tprintf("ui scale: at 100%% the quote's prose starts at one quote inset (%.1f vs %.1f)", xa, cx1 + m1.quote_inset))
+					kchk(&bad, abs(xb - (cx2 + m2.quote_inset)) <= 1, fmt.tprintf("ui scale: at 200%% it starts at the SCALED inset, not the cached one (%.1f vs %.1f)", xb, cx2 + m2.quote_inset))
 				}
 			}
 
@@ -15677,7 +15715,7 @@ when NEWTPAD_TESTS {
 				{"h3", "### block text", one_line(&h, "block text", m.head[3], measure, m.head_lead[3], bold), m.head_above[3], m.head_below[3], false, true},
 				{"h4", "#### block text", one_line(&h, "block text", m.head[4], measure, m.head_lead[4], bold), m.head_above[4], m.head_below[4], false, true},
 				{"fenced code", "```\ncode\n```", fence_h, m.fence_above, m.fence_below, false, false},
-				{"thematic break", "***", hairline(), m.rule_gap, m.rule_gap, false, false},
+				{"thematic break", "***", m.rule_h, m.rule_gap, m.rule_gap, false, false},
 			}
 			leads := []struct {
 				what:  string,
@@ -15753,6 +15791,104 @@ when NEWTPAD_TESTS {
 					)
 				}
 			}
+			// THE FIXED-PIXEL DECORATIONS, BY VALUE. Nothing asserted these: the
+			// scale table above covers only the S-derived rows, and the UI_SCALE case
+			// asserts they MOVE without ever saying what they are. Sabotaging
+			// quote_inset 24 -> 16 and the thematic break 2px -> hairline left the
+			// whole mode green, which is how this gap was found rather than guessed.
+			//
+			// Values, not bounds. Each is one of Obsidian's spacing tokens and each
+			// is exactly derivable, so a bound here would be the slack the register
+			// warns about.
+			for _, i in ([]int{0}) {
+				_ = i
+				dec := []struct {
+					got:  f32,
+					want: f32,
+					what: string,
+				} {
+					{m.rule_gap, sx(24), "thematic break gap 24px"},
+					{m.rule_h, sx(2), "thematic break 2px thick (--hr-thickness)"},
+					{m.fence_pad, sx(12), "fence vertical pad 12px (--size-4-3)"},
+					{m.fence_pad_x, sx(16), "fence horizontal pad 16px (--size-4-4)"},
+					{m.code_radius, sx(4), "inline code radius 4px (--radius-s)"},
+					{m.fence_radius, sx(4), "fence radius 4px (the SAME --radius-s)"},
+					{m.quote_inset, sx(24), "blockquote inset 24px (--size-4-6)"},
+					{m.quote_bar_w, sx(2), "blockquote bar 2px (--blockquote-border-thickness)"},
+					{m.task_box, sx(14), "checkbox 14px"},
+				}
+				wrongd, firstd := 0, ""
+				for d in dec {
+					if d.got != d.want {
+						wrongd += 1
+						if firstd == "" {firstd = fmt.tprintf("%s: got %.1f want %.1f", d.what, d.got, d.want)}
+					}
+				}
+				gchk(&bad, wrongd == 0, fmt.tprintf("the fixed-pixel decorations are Obsidian's tokens (%d wrong; %s)", wrongd, firstd))
+				// The two radii are the SAME token and must move together. Asserted
+				// separately because they were 3 and 6 before -- two numbers that
+				// looked deliberate and were not -- and equality is the actual claim.
+				gchk(&bad, m.code_radius == m.fence_radius, fmt.tprintf("...and both radii are one token, not two (%.1f vs %.1f)", m.code_radius, m.fence_radius))
+			}
+
+			// THE THEMATIC BREAK IS m.rule_h TALL, asserted EXACTLY and on the block
+			// rather than on the metric. The metric check above only says rule_h is 2px;
+			// it says nothing about whether the Rule case uses it, and sabotaging
+			// `e.h = m.rule_h` back to `hairline()` left this mode green twice over --
+			// once because the gap table above named hairline() as the expected height
+			// (the test agreeing with the bug), and once because that table compares
+			// with a +/-1px tolerance, which is exactly the 2-against-1 difference the
+			// sabotage makes. An assertion whose slack is the size of the defect is the
+			// register's named trap, so this one is an equality on the value.
+			{
+				src := "***\n"
+				content := make([]u8, len(src))
+				copy(content, src)
+				rdoc := doc_from_content(content, "r.md", .UTF8)
+				defer doc_close(&rdoc)
+				rlay := md_layout_build_for_test(&h.gfx, &h.text, &rdoc, &m, 0, measure)
+				defer md_layout_free(&rlay)
+				gchk(
+					&bad, rlay.cls.kind == .Rule && rlay.h == m.rule_h,
+					fmt.tprintf("a thematic break is --hr-thickness tall, not a hairline (kind %v, h %.1f, want %.1f; hairline is %.1f)", rlay.cls.kind, rlay.h, m.rule_h, hairline()),
+				)
+			}
+
+			// THE LIST MARKER HANGS OFF THE PROSE, rather than the prose sitting a
+			// whole indent step right of the marker. Obsidian anchors the item's
+			// CONTENT (3ch, then 2.25em per level) and floats the bullet back out of
+			// it by 0.8em; ours put the marker at the nesting depth and pushed the
+			// text a further full step, so a bullet sat almost a tab from its words.
+			//
+			// Driven through md_layout_build_for_test because `marker` and `indent`
+			// are Md_Layout fields, not metrics -- md_metrics cannot see this, which
+			// is why the metric assertions above do not cover it.
+			{
+				list_lay :: proc(h: ^Headless_Gpu, m: ^Md_Metrics, src: string, measure: f32) -> (indent, marker: f32) {
+					content := make([]u8, len(src))
+					copy(content, src)
+					doc := doc_from_content(content, "l.md", .UTF8)
+					defer doc_close(&doc)
+					lay := md_layout_build_for_test(&h.gfx, &h.text, &doc, m, 0, measure)
+					defer md_layout_free(&lay)
+					return lay.indent, lay.marker
+				}
+				i0, mk0 := list_lay(&h, &m, "- item text\n", measure)
+				gchk(
+					&bad, abs(i0 - m.list_indent) <= 0.5,
+					fmt.tprintf("list: a top-level item's PROSE sits at 3ch (%.1f vs %.1f)", i0, m.list_indent),
+				)
+				gchk(
+					&bad, abs((i0 - mk0) - m.list_hang) <= 0.5,
+					fmt.tprintf("list: ...and its bullet hangs 0.8em to the LEFT of it (gap %.1f, want %.1f)", i0 - mk0, m.list_hang),
+				)
+				i1, _ := list_lay(&h, &m, "  - nested item\n", measure)
+				gchk(
+					&bad, abs(i1 - (m.list_indent + m.list_step)) <= 0.5,
+					fmt.tprintf("list: one level down adds --list-indent (2.25em), not another 3ch (%.1f vs %.1f)", i1, m.list_indent + m.list_step),
+				)
+			}
+
 			// THE REQUESTED BODY LEADING IS ACTUALLY WHAT COMES OUT, and until now
 			// nothing checked it. Md_Metrics.body_lead's own comment says it is a
 			// FLOOR rather than the leading you get -- the shaper clamps up for a

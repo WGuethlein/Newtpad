@@ -1776,16 +1776,42 @@ Md_Metrics :: struct {
 	quote_below:  f32, // 0.8 S
 	fence_above:  f32, // 1.0 S
 	fence_below:  f32, // 1.0 S
-	// Fixed pixel quantities from 9.2/9.3, DPI-scaled rather than S-scaled: they
-	// are decorations, not type.
+	// Fixed pixel quantities, DPI-scaled rather than S-scaled: they are
+	// decorations, not type. Values from Obsidian's own tokens under C7, with
+	// what §9.2/9.3 asked for noted where the two differ.
 	rule_gap:     f32, // 24px above and below a thematic break (9.2 item 10)
-	fence_pad:    f32, // 12px inside a fenced block
-	code_radius:  f32, // 3px behind an inline code span
-	fence_radius: f32, // 6px on the fenced block
-	quote_inset:  f32, // 16px per blockquote level (9.2 item 7)
-	list_indent:  f32, // 24px per list level (9.2 item 5)
+	rule_h:       f32, // 2px -- --hr-thickness. Was a bare hairline() at the draw.
+	fence_pad:    f32, // 12px VERTICAL inside a fenced block -- --size-4-3
+	fence_pad_x:  f32, // 16px HORIZONTAL -- --size-4-4. Obsidian's fence padding
+	// is not square (`padding: var(--size-4-3) var(--size-4-4)`) and ours used one
+	// number for both axes.
+	code_radius:  f32, // 4px behind an inline code span -- --radius-s. Was 3.
+	// 0.3 em of the CODE size, from `code { padding: 0.15em 0.3em }`. S-derived
+	// rather than DPI-derived because it is a property of the TEXT it sits behind:
+	// a code span at 0.8 S wants proportionally less air than one at 2 S.
+	code_pad_x:   f32,
+	fence_radius: f32, // 4px on the fenced block -- the SAME --radius-s token. Was
+	// 6, which read as the rounder, softer corner of the two and is most of why a
+	// fence looked unlike Obsidian's at a glance.
+	quote_inset:  f32, // 24px per blockquote level -- --size-4-6. Was 16 (9.2 item 7).
+	quote_bar_w:  f32, // 2px -- --blockquote-border-thickness. Was max(sx(2), 2)
+	// spelled at the draw, which is the same number with no name.
 	task_box:     f32, // 14px checkbox (9.2 item 9)
 	pad_left:     f32, // 40px left padding (9.3 measure line)
+	// LIST INDENTATION IS S-DERIVED, NOT DPI-DERIVED, and that is a fix rather
+	// than a port. §9.2 item 5 said "24px per list level" and sx(24) scales with
+	// the MONITOR, so a reader who raised the preview font size got the same 24px
+	// indent under twice the text -- the marker crowded the prose it belongs to.
+	// Obsidian denominates both in text: `ul > li { margin-inline-start: 3ch }`
+	// for the first level and --list-indent (--indent-unit 0.5625em x
+	// --indent-size 4 = 2.25em) for each level under it.
+	list_indent:  f32, // FIRST level: 3ch of the body face
+	list_step:    f32, // each level below the first: 2.25 S
+	// 0.8 em, the bullet's hang: `.list-bullet { margin-inline-start: -0.8em }`.
+	// The marker sits this far LEFT of its item's prose, rather than the prose
+	// sitting a whole indent step right of the marker, which is what put a
+	// bullet's text almost a tab away from it.
+	list_hang:    f32,
 	// 72ch, where a `ch` is the body face's advance for '0' at body size -- CSS's
 	// own definition, and the only one that makes "72ch" mean a column of 72
 	// characters in a proportional face.
@@ -1891,14 +1917,25 @@ md_metrics :: proc(t: ^plat.Text, s: f32) -> (m: Md_Metrics) {
 	m.quote_above, m.quote_below = md_scale(s, 1.00), md_scale(s, 1.00)
 	m.fence_above, m.fence_below = md_scale(s, 1.00), md_scale(s, 1.00)
 	m.rule_gap = sx(24)
+	m.rule_h = sx(2)
 	m.fence_pad = sx(12)
-	m.code_radius = sx(3)
-	m.fence_radius = sx(6)
-	m.quote_inset = sx(16)
-	m.list_indent = sx(24)
+	m.fence_pad_x = sx(16)
+	m.code_radius = sx(4)
+	m.code_pad_x = md_scale(m.code, 0.30)
+	m.fence_radius = sx(4)
+	m.quote_inset = sx(24)
+	m.quote_bar_w = sx(2)
 	m.task_box = sx(14)
 	m.pad_left = sx(40)
-	m.measure = 72 * plat.text_advance(nil, t, '0', m.body, .Body)
+	// A `ch` is the body face's advance for '0' -- CSS's own definition, and the
+	// same one m.measure below uses. Read once: text_advance is a cache lookup,
+	// but two call sites for one quantity is the thing the one-producer rule is
+	// about, not the cost.
+	ch := plat.text_advance(nil, t, '0', m.body, .Body)
+	m.list_indent = 3 * ch // `ul > li { margin-inline-start: 3ch }`
+	m.list_step = md_scale(s, 2.25) // --indent-unit 0.5625em * --indent-size 4
+	m.list_hang = md_scale(s, 0.80) // .list-bullet's -0.8em
+	m.measure = 72 * ch
 	m.ui_scale, m.theme, m.faces = UI_SCALE, md_theme_gen(), plat.text_face_gen(t)
 	return
 }
@@ -3536,7 +3573,10 @@ md_layout_build :: proc(
 		}
 		return
 	case .Rule:
-		e.h = hairline()
+		// --hr-thickness: 2px. A hairline before, which at 100% is one physical
+		// pixel and reads as a scratch rather than a divider. The DRAW reads lay.h
+		// for its own height, so this is still the one producer of both.
+		e.h = m.rule_h
 		e.above, e.below = m.rule_gap, m.rule_gap
 		return
 	case .Fence_Open:
@@ -3603,7 +3643,7 @@ md_layout_build :: proc(
 		// inset applied at the draw and not at the layout would put the underline
 		// and the hit-test 12px apart -- which is the whole failure this task
 		// exists to make impossible.
-		e.indent = m.fence_pad
+		e.indent = m.fence_pad_x
 	case .Heading:
 		px = m.head[clamp(e.cls.level, 1, 6)]
 		// Per-level, from m.head_lead -- NOT line_height(), which is the editor
@@ -3632,16 +3672,31 @@ md_layout_build :: proc(
 		// re-derives them.
 		md_join_run(doc, &e, p, line_end, buf[:])
 	case .List:
-		e.indent = f32(e.cls.level) * m.list_indent
-		// The bullet / checkbox sits at the item's nesting depth; the PROSE is
-		// indented one step further. Both come out of here, so md_block_draw has
-		// no expression of its own to keep in step (2026-07-29 review, L2).
-		e.marker = e.indent
+		// THE PROSE IS THE ANCHOR AND THE MARKER HANGS OFF IT, which is the reverse
+		// of what this did. Obsidian positions the item's CONTENT -- `ul > li
+		// { margin-inline-start: 3ch }`, then --list-indent (2.25em) per level
+		// below -- and floats the bullet back out of it by 0.8em
+		// (`.list-bullet { margin-inline-start: -0.8em }`).
+		//
+		// Ours put the MARKER at the nesting depth and pushed the prose a whole
+		// further indent step right, so a bullet sat almost a tab from the words it
+		// belongs to, and every nested level compounded it. Same two numbers, one
+		// producer, opposite sense.
+		// LEVEL IS 0-BASED -- md_list returns `depth = leading spaces / 2`, so a
+		// top-level item is 0. Hence `list_indent + level * list_step` and not
+		// `level * list_indent`: EVERY item gets Obsidian's 3ch, and each nesting
+		// level adds --list-indent (2.25em) on top, which is how the cumulative CSS
+		// indent of a `ul` inside an `li` comes out.
+		e.indent = m.list_indent + f32(e.cls.level) * m.list_step
+		// Both come out of here, so md_block_draw has no expression of its own to
+		// keep in step (2026-07-29 review, L2).
 		e.below = m.list_gap
 		if e.cls.task {
-			e.indent += m.task_box + m.list_indent * 0.25
+			// The checkbox is wider than a bullet glyph, so it hangs by its own
+			// width plus the same 0.8em gap the bullet leaves between mark and text.
+			e.marker = max(0, e.indent - m.task_box - m.list_hang * 0.5)
 		} else {
-			e.indent += m.list_indent
+			e.marker = max(0, e.indent - m.list_hang)
 		}
 		if e.cls.task_done {base_col, mute = md_task_prose_style(true)}
 		// A lazily continued list item, on exactly the same terms as .Quote above:
@@ -5923,7 +5978,7 @@ md_block_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text,
 			// it read as decoration in the muted quote colour, which is the TEXT's
 			// role. The text stays Md_Quote; only the bar moves, the same split the
 			// bullet glyph already uses (accent mark, ordinary body text).
-			plat.quads_draw(gfx, qp, []plat.Quad{{pos = {cx + f32(d) * step, ytop}, size = {max(sx(2), 2), ad.h}, color = g_theme[.Accent]}})
+			plat.quads_draw(gfx, qp, []plat.Quad{{pos = {cx + f32(d) * step, ytop}, size = {max(m.quote_bar_w, 2), ad.h}, color = g_theme[.Accent]}})
 		}
 	case .List:
 		lx := cx + lay.marker // md_layout_build's own number, not a second copy
@@ -5978,7 +6033,11 @@ md_block_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text,
 		bx, by := x + b.x, ytop + b.y
 		if .Code in sp.style && .Link not_in sp.style {
 			r := m.code_radius
-			pad := max(1, m.code_radius * 0.5)
+			// 0.3 em of the CODE size -- Obsidian's `code { padding: 0.15em 0.3em }`.
+			// It used to be half the corner radius, which is a coincidence rather than
+			// a reason: the two moved together whenever the radius was tuned, and at
+			// radius 3 that left 1.5px, so a code span touched the words either side.
+			pad := max(1, m.code_pad_x)
 			plat.quads_draw(gfx, qp, []plat.Quad{{pos = {bx - pad, by}, size = {b.w + pad * 2, b.h}, color = g_theme[.Md_Code_Bg], radius = {r, r, r, r}}})
 		}
 	}
