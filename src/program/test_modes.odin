@@ -3534,7 +3534,17 @@ when NEWTPAD_TESTS {
 
 		sb := strings.builder_make()
 		defer strings.builder_destroy(&sb)
-		for para in 0 ..< 3 {
+		// SIX paragraphs, not three. The descent below is 60 steps of 40 px = 2400 px
+		// and it must still be climbing when it stops, or it clamps at the max anchor
+		// and spends its remaining steps inside one block -- which is exactly what
+		// `seen_blocks >= 3` exists to catch, and what three paragraphs started doing
+		// when C7 cut body leading from 1.65 S to 1.50 S. Three paragraphs came to
+		// ~1650 px, so the ceiling sat inside the SECOND block and the descent saw two.
+		//
+		// The fixture is sized with headroom rather than to just clear the bound: a
+		// fixture that only just fits is one the next spacing change breaks again,
+		// and the bound is not the thing under test.
+		for para in 0 ..< 6 {
 			for i in 0 ..< 40 {fmt.sbprintf(&sb, "paragraph %d line %02d of hard wrapped prose\n", para, i)}
 			strings.write_string(&sb, "\n")
 		}
@@ -12794,15 +12804,37 @@ when NEWTPAD_TESTS {
 				// body-sized budget is the WRONG budget for this block, which is what
 				// `!=` says. The direction that reproduces the original defect is
 				// covered by the separate check after the loop.
+				//
+				// H6 IS NOW DEGENERATE ON PURPOSE, and that is asserted rather than
+				// skipped. Under C7's Obsidian scale --h6-size is 1em and
+				// --h6-line-height is --line-height-normal, the same 1.5 body prose
+				// gets, so an h6 block is EXACTLY a body block and differs only in
+				// weight (600 against 400 -- and even that collapses to our bold,
+				// spec §3.2). It was non-degenerate before only because body leading
+				// was 1.65 against a heading's 1.5, and that gap was the thing C7
+				// removed. Excluding h6 silently would let head[6] or head_lead[6]
+				// drift unnoticed; asserting the equality is the same check pointed
+				// the other way, and it fails if either moves.
+				//
+				// The leading here is m.head_lead[lvl], not line_height() -- the
+				// comment above says "the same shaper the layout uses" and the layout
+				// stopped using line_height() for headings with C7.
 				cx, measure := md_content_span(&m, x0, x1)
 				_ = cx
-				hh := plat.shape_run(&h.gfx, &h.text, "Hgjpqy", m.head[lvl], measure, line_height(m.head[lvl]), .Body, context.temp_allocator).height
+				hh := plat.shape_run(&h.gfx, &h.text, "Hgjpqy", m.head[lvl], measure, m.head_lead[lvl], .Body, context.temp_allocator).height
 				bh := plat.shape_run(&h.gfx, &h.text, "body", m.body, measure, m.body_lead, .Body, context.temp_allocator).height
 				if hh > bh {taller += 1}
-				hchk(
-					&bad, hh != bh,
-					fmt.tprintf("h%d: fixture is non-degenerate -- its block is %.0fpx against a body block's %.0f", lvl, hh, bh),
-				)
+				if lvl == 6 {
+					hchk(
+						&bad, hh == bh,
+						fmt.tprintf("h6 is EXACTLY a body block by design (1em, --line-height-normal): %.0fpx against %.0f", hh, bh),
+					)
+				} else {
+					hchk(
+						&bad, hh != bh,
+						fmt.tprintf("h%d: fixture is non-degenerate -- its block is %.0fpx against a body block's %.0f", lvl, hh, bh),
+					)
+				}
 
 				// Sweep every ybot across the window where the heading goes from
 				// "admitted" to "not admitted", plus a margin either side. At every
@@ -14398,32 +14430,54 @@ when NEWTPAD_TESTS {
 						want: f32,
 						what: string,
 					} {
-						{m.head[1], r(s, 1.85), "h1 1.85 S"},
-						{m.head[2], r(s, 1.50), "h2 1.50 S"},
-						{m.head[3], r(s, 1.25), "h3 1.25 S"},
-						{m.head[4], r(s, 1.10), "h4 1.10 S"},
-						{m.head[5], r(s, 1.00), "h5 1.00 S"},
-						{m.head[6], r(s, 1.00), "h6 1.00 S"},
+						// OBSIDIAN'S SCALE, not §9.3's -- decision C7. Read from its
+						// own app.css (--h1-size: 1.618em and down), so these are the
+						// ratios the application we are measured against uses, not a
+						// house scale. §9.3's 1.85/1.50/1.25/1.10 was far more
+						// contrasty and is the rejected one.
+						{m.head[1], r(s, 1.618), "h1 1.618 S"},
+						{m.head[2], r(s, 1.462), "h2 1.462 S"},
+						{m.head[3], r(s, 1.318), "h3 1.318 S"},
+						{m.head[4], r(s, 1.188), "h4 1.188 S"},
+						{m.head[5], r(s, 1.076), "h5 1.076 S"},
+						{m.head[6], r(s, 1.000), "h6 1.000 S"},
 						{m.body, r(s, 1.00), "paragraph 1.00 S"},
-						{m.code, r(s, 0.92), "code 0.92 S"},
-						{m.table, r(s, 0.95), "table 0.95 S"},
+						{m.code, r(s, 0.80), "code 0.80 S (--font-smallest)"},
+						{m.table, r(s, 1.00), "table 1.00 S (--table-text-size)"},
 						{m.caption, r(s, 0.88), "caption 0.88 S"},
-						{m.body_lead, r(s, 1.65), "body leading 1.65 S"},
-						{m.head_above[2], r(s, 1.60), "h2 space above 1.6 S"},
-						{m.head_above[3], r(s, 1.40), "h3 space above 1.4 S"},
-						{m.head_above[4], r(s, 1.20), "h4 space above 1.2 S"},
+						{m.body_lead, r(s, 1.50), "body leading 1.50 S (--line-height-normal)"},
+						// PER-LEVEL heading leading, which §9.3 did not have at all --
+						// every heading used line_height(), the editor grid's flat 1.5.
+						// Derived from m.head, not from S, because Obsidian's
+						// --hN-line-height is a multiple of the HEADING's size.
+						{m.head_lead[1], f32(int(m.head[1] * 1.2 + 0.5)), "h1 leading 1.2"},
+						{m.head_lead[2], f32(int(m.head[2] * 1.2 + 0.5)), "h2 leading 1.2"},
+						{m.head_lead[3], f32(int(m.head[3] * 1.3 + 0.5)), "h3 leading 1.3"},
+						{m.head_lead[4], f32(int(m.head[4] * 1.4 + 0.5)), "h4 leading 1.4"},
+						{m.head_lead[5], f32(int(m.head[5] * 1.5 + 0.5)), "h5 leading 1.5"},
+						{m.head_lead[6], f32(int(m.head[6] * 1.5 + 0.5)), "h6 leading 1.5"},
+						// THE RHYTHM IS FLAT. Obsidian's `h1..h6 { margin-block: 1rem }`
+						// does not vary by level, and the graduated 1.6/1.4/1.2 and
+						// 0.6/0.5/0.4 ladders are gone with §9.3's scale. Every level
+						// is asserted, not just a sample: the whole point is that they
+						// are equal, and a sample cannot see one drifting.
+						{m.head_above[1], r(s, 1.00), "h1 space above 1.0 S"},
+						{m.head_above[2], r(s, 1.00), "h2 space above 1.0 S"},
+						{m.head_above[3], r(s, 1.00), "h3 space above 1.0 S"},
+						{m.head_above[4], r(s, 1.00), "h4 space above 1.0 S"},
 						{m.head_above[5], r(s, 1.00), "h5 space above 1.0 S"},
 						{m.head_above[6], r(s, 1.00), "h6 space above 1.0 S"},
-						{m.head_below[1], r(s, 0.60), "h1 space below 0.6 S"},
-						{m.head_below[2], r(s, 0.50), "h2 space below 0.5 S"},
-						{m.head_below[3], r(s, 0.40), "h3 space below 0.4 S"},
-						{m.head_below[4], r(s, 0.30), "h4 space below 0.3 S"},
-						{m.head_below[5], r(s, 0.30), "h5 space below 0.3 S"},
-						{m.head_below[6], r(s, 0.30), "h6 space below 0.3 S"},
-						{m.para_below, r(s, 0.80), "paragraph space below 0.8 S"},
-						{m.list_gap, r(s, 0.25), "list gap 0.25 S"},
-						{m.quote_above, r(s, 0.80), "blockquote space above 0.8 S"},
-						{m.quote_below, r(s, 0.80), "blockquote space below 0.8 S"},
+						{m.head_below[1], r(s, 1.00), "h1 space below 1.0 S"},
+						{m.head_below[2], r(s, 1.00), "h2 space below 1.0 S"},
+						{m.head_below[3], r(s, 1.00), "h3 space below 1.0 S"},
+						{m.head_below[4], r(s, 1.00), "h4 space below 1.0 S"},
+						{m.head_below[5], r(s, 1.00), "h5 space below 1.0 S"},
+						{m.head_below[6], r(s, 1.00), "h6 space below 1.0 S"},
+						{m.head_pair, r(s, 2.50), "heading-after-content 2.50 S (--heading-spacing)"},
+						{m.para_below, r(s, 1.00), "paragraph space below 1.0 S (--p-spacing)"},
+						{m.list_gap, r(s, 0.15), "list gap 0.15 S (--list-spacing, both edges)"},
+						{m.quote_above, r(s, 1.00), "blockquote space above 1.0 S"},
+						{m.quote_below, r(s, 1.00), "blockquote space below 1.0 S"},
 						{m.fence_above, r(s, 1.00), "fenced code space above 1.0 S"},
 						{m.fence_below, r(s, 1.00), "fenced code space below 1.0 S"},
 					}
@@ -14434,10 +14488,23 @@ when NEWTPAD_TESTS {
 							if first == "" {first = fmt.tprintf("%s: got %.3f want %.3f", row.what, row.got, row.want)}
 						}
 					}
-					mchk(&bad, wrong == 0, fmt.tprintf("scale %.1f S=%.0f: every row of 9.3's table is round(k*S) (%d wrong; %s)", scale, s, wrong, first))
-					// 9.3's own "space above / below" column, which is the part of
-					// the table most easily dropped: h1 alone has no space above.
-					mchk(&bad, m.head_above[1] == 0, fmt.tprintf("scale %.1f S=%.0f: h1 has no space above (9.3's `0 /`)", scale, s))
+					mchk(&bad, wrong == 0, fmt.tprintf("scale %.1f S=%.0f: every row of C7's Obsidian table is round(k*S) (%d wrong; %s)", scale, s, wrong, first))
+					// THE RHYTHM IS FLAT, asserted as a PROPERTY rather than as six
+					// more equalities -- the rows above already pin each value, and
+					// this says the thing those values are FOR. §9.3's graduated
+					// ladder passed every individual row and would fail this.
+					//
+					// h1 used to be the exception here ("h1 alone has no space
+					// above", §9.3's `0 /`). That exception moved: it was really
+					// about the document's FIRST BLOCK, whatever kind it is
+					// (Obsidian's `> :first-child { margin-top: 0 }`), and it is now
+					// the walk's rule -- asserted in the pair-rule case below, where
+					// there is a walk to observe it in.
+					flat := true
+					for lvl in 1 ..= 6 {
+						if m.head_above[lvl] != m.head_above[1] || m.head_below[lvl] != m.head_below[1] {flat = false}
+					}
+					mchk(&bad, flat, fmt.tprintf("scale %.1f S=%.0f: every heading level has the SAME space above and below", scale, s))
 
 					// THE hazard. Every size must survive u16 truncation unchanged,
 					// or it shares an atlas entry with the integer below it.
@@ -14453,7 +14520,7 @@ when NEWTPAD_TESTS {
 					// being testable here and the sweep needs a size that exercises
 					// it, not a weaker assertion.
 					if s == 16 {
-						mchk(&bad, m.code == 15 && int(0.92 * s) == 14, fmt.tprintf("S=16: 0.92*S rounds to %.0f, where TRUNCATING it would key %d instead", m.code, int(0.92 * s)))
+						mchk(&bad, m.code == 13 && int(0.80 * s) == 12, fmt.tprintf("S=16: 0.80*S rounds to %.0f, where TRUNCATING it would key %d instead", m.code, int(0.80 * s)))
 					}
 				}
 			}
@@ -15426,9 +15493,21 @@ when NEWTPAD_TESTS {
 						// end on a non-straddling one asserts nothing. A first draft
 						// swept 2..21 spans and the last three paragraphs came out
 						// identical under both families.
+						// C7 SHRANK INLINE CODE from 0.92 S to 0.80 S, and 19 spans
+						// stopped being enough: at the smaller size the two families'
+						// accumulated advance difference no longer crossed a wrap
+						// boundary, both ceilings came out 21952/52.0, and the
+						// assertion below could not fail. The count is raised rather
+						// than the assertion relaxed -- the fixture's whole job is to
+						// be a document whose layout MOVES under a family change, and
+						// one that does not move asserts nothing about the cache key.
+						//
+						// More spans, not a narrower measure: the measure is about to
+						// become a user setting (W3), and a fixture pinned to a
+						// particular column width would be the next thing to go quiet.
 						for i in 0 ..< 60 {
 							fmt.sbprintf(&fb, "line %02d of prose with ", i)
-							for k in 0 ..< 19 {fmt.sbprintf(&fb, "`code_%02d_span` and ", k)}
+							for k in 0 ..< 31 {fmt.sbprintf(&fb, "`code_%02d_span` and ", k)}
 							strings.write_string(&fb, "a tail.\n\n")
 						}
 						fsrc := strings.to_string(fb)
@@ -15546,26 +15625,34 @@ when NEWTPAD_TESTS {
 			fence_h := m.fence_pad * 2 + one_line(&h, "code", m.code, measure - m.fence_pad, line_height(m.code), .Doc)
 
 			Row :: struct {
-				what:   string,
-				src:    string, // the block under test, WITHOUT its trailing newline
-				height: f32,
-				above:  f32,
-				below:  f32,
-				para:   bool, // is this block a bare prose line, which now JOINS?
+				what:    string,
+				src:     string, // the block under test, WITHOUT its trailing newline
+				height:  f32,
+				above:   f32,
+				below:   f32,
+				para:    bool, // is this block a bare prose line, which now JOINS?
+				// Is this a HEADING, so that C7's pair rule applies to it? A heading
+				// following CONTENT takes --heading-spacing (2.5 S) rather than the
+				// 1.0 S it carries on its own; following another heading it does not.
+				// The `above` field stays the block's OWN value and the pair is
+				// resolved in the loop, so the two cases share one row.
+				heading: bool,
 			}
 			rows := []Row {
-				{"paragraph", "block text", body_h, 0, m.para_below, true},
+				{"paragraph", "block text", body_h, 0, m.para_below, true, false},
 				// A list item and a quote lay out at the body face and do not wrap
 				// at this measure, so their block height is a paragraph's.
-				{"list item", "- block text", body_h, 0, m.list_gap, false},
-				{"blockquote", "> block text", body_h, m.quote_above, m.quote_below, false},
+				{"list item", "- block text", body_h, 0, m.list_gap, false, false},
+				{"blockquote", "> block text", body_h, m.quote_above, m.quote_below, false, false},
 				// h1 and h2 carry their rule INSIDE their own height (9.2 item 1).
-				{"h1", "# block text", one_line(&h, "block text", m.head[1], measure, line_height(m.head[1]), bold) + hairline(), m.head_above[1], m.head_below[1], false},
-				{"h2", "## block text", one_line(&h, "block text", m.head[2], measure, line_height(m.head[2]), bold) + hairline(), m.head_above[2], m.head_below[2], false},
-				{"h3", "### block text", one_line(&h, "block text", m.head[3], measure, line_height(m.head[3]), bold), m.head_above[3], m.head_below[3], false},
-				{"h4", "#### block text", one_line(&h, "block text", m.head[4], measure, line_height(m.head[4]), bold), m.head_above[4], m.head_below[4], false},
-				{"fenced code", "```\ncode\n```", fence_h, m.fence_above, m.fence_below, false},
-				{"thematic break", "***", hairline(), m.rule_gap, m.rule_gap, false},
+				// Leading is m.head_lead[n], not line_height(): C7 gave headings a
+				// per-level leading and the layout stopped using the editor grid's.
+				{"h1", "# block text", one_line(&h, "block text", m.head[1], measure, m.head_lead[1], bold) + hairline(), m.head_above[1], m.head_below[1], false, true},
+				{"h2", "## block text", one_line(&h, "block text", m.head[2], measure, m.head_lead[2], bold) + hairline(), m.head_above[2], m.head_below[2], false, true},
+				{"h3", "### block text", one_line(&h, "block text", m.head[3], measure, m.head_lead[3], bold), m.head_above[3], m.head_below[3], false, true},
+				{"h4", "#### block text", one_line(&h, "block text", m.head[4], measure, m.head_lead[4], bold), m.head_above[4], m.head_below[4], false, true},
+				{"fenced code", "```\ncode\n```", fence_h, m.fence_above, m.fence_below, false, false},
+				{"thematic break", "***", hairline(), m.rule_gap, m.rule_gap, false, false},
 			}
 			leads := []struct {
 				what:  string,
@@ -15581,7 +15668,20 @@ when NEWTPAD_TESTS {
 				// the `want` formula below would be the right question for them
 				// again.
 				absorbs: bool,
-			}{{"a paragraph", "lead text", m.para_below, true}, {"a list item", "- lead text", m.list_gap, true}}
+				// Is this lead CONTENT for C7's heading pair rule? Obsidian's
+				// selector is `:is(p,pre,table,ul,ol) + :is(h1..h6)`, so a paragraph
+				// and a list item are, and a HEADING deliberately is not. The heading
+				// lead is here to be the negative case: without it every lead in this
+				// table would fire the pair rule and an implementation that applied
+				// 2.5 S to every heading unconditionally would pass.
+				content: bool,
+			} {
+				{"a paragraph", "lead text", m.para_below, true, true},
+				{"a list item", "- lead text", m.list_gap, true, true},
+				// A heading absorbs nothing -- the prose line under it is its own
+				// block -- so `absorbs` is false and every row is measured.
+				{"a heading", "## lead text", m.head_below[2], false, false},
+			}
 
 			for ld in leads {
 				base_src := strings.concatenate({ld.src, "\n", PROBE, "\n"}, context.temp_allocator)
@@ -15599,7 +15699,14 @@ when NEWTPAD_TESTS {
 					// lead's own below is already inside y_base, so it comes back
 					// out. K.below is the collapsed gap under it (a paragraph has
 					// no space above, so the max is K.below itself).
-					want := max(ld.below, r.above) - ld.below + r.height + r.below
+					// C7's PAIR RULE: a heading after content takes --heading-spacing
+					// (2.5 S) in place of the 1.0 S it carries alone. Resolved here
+					// rather than baked into the row, so the same row asserts BOTH
+					// directions -- 2.5 S under the two content leads, 1.0 S under the
+					// heading lead.
+					above := r.above
+					if r.heading && ld.content {above = max(above, m.head_pair)}
+					want := max(ld.below, above) - ld.below + r.height + r.below
 					got := y - y_base
 					if ld.absorbs && r.para {
 						// A prose line under a lead that absorbs one is the SAME block
@@ -15617,22 +15724,82 @@ when NEWTPAD_TESTS {
 					}
 					gchk(
 						&bad, abs(got - want) <= 1,
-						fmt.tprintf("gap: [%s] a %s costs h=%.0f + above=%.0f + below=%.0f (got %.1f, want %.1f)", ld.what, r.what, r.height, r.above, r.below, got, want),
+						fmt.tprintf("gap: [%s] a %s costs h=%.0f + above=%.0f + below=%.0f (got %.1f, want %.1f)", ld.what, r.what, r.height, above, r.below, got, want),
 					)
 				}
 			}
+			// THE FIRST BLOCK HAS NO SPACE ABOVE IT, whatever kind it is --
+			// Obsidian's `.markdown-rendered > :first-child { margin-top: 0 }`. This
+			// generalises what m.head_above[1] used to hardcode as 0 for h1 alone,
+			// and it lives in the walk's collapse rather than in any block's layout,
+			// so it needs a document to be observed in.
+			//
+			// The THEMATIC BREAK is the probe kind, chosen because its space-above is
+			// the largest in the table (m.rule_gap, a fixed 24px rather than a
+			// fraction of S) and because it is the only kind whose above and below
+			// are equal -- so the two readings below differ by exactly one rule_gap
+			// and by nothing else. A heading would work too, but its above is now
+			// entangled with the pair rule above, and a test should not depend on two
+			// rules to demonstrate one.
+			//
+			// y_bare measures the constant inset markdown_links applies before any
+			// block; subtracting it is what makes this an assertion about the GAP
+			// rather than about the pane's padding.
+			y_bare := probe_y(&h, PROBE + "\n", px_, x0, x1, ytop, ybot)
+			y_rule_first := probe_y(&h, "***\n" + PROBE + "\n", px_, x0, x1, ytop, ybot)
+			gchk(&bad, y_bare >= 0 && y_rule_first >= 0, "first-block: both probes are placed")
+			if y_bare >= 0 && y_rule_first >= 0 {
+				// With the rule: the break's own 24px above is dropped, so the probe
+				// sits one rule height plus one rule_gap (its BELOW) down.
+				// Without it: 24px more. Deleting `if lay.start <= 0 {gap = 0}` from
+				// md_walk moves this by exactly m.rule_gap and nothing else.
+				want_first := hairline() + m.rule_gap
+				got_first := y_rule_first - y_bare
+				gchk(
+					&bad, abs(got_first - want_first) <= 1,
+					fmt.tprintf("first-block: an opening thematic break has NO space above it (got %.1f, want %.1f; its above would be %.0f)", got_first, want_first, m.rule_gap),
+				)
+			}
+			// ...and the rule is about being FIRST, not about being a thematic break:
+			// the same break lower down keeps its space-above in full. Without this
+			// half, `gap = 0` applied to EVERY block would pass the check above.
+			y_lead := probe_y(&h, "lead text\n" + PROBE + "\n", px_, x0, x1, ytop, ybot)
+			y_lead_rule := probe_y(&h, "lead text\n***\n" + PROBE + "\n", px_, x0, x1, ytop, ybot)
+			if y_lead >= 0 && y_lead_rule >= 0 {
+				want_after := max(m.para_below, m.rule_gap) - m.para_below + hairline() + m.rule_gap
+				got_after := y_lead_rule - y_lead
+				gchk(
+					&bad, abs(got_after - want_after) <= 1,
+					fmt.tprintf("first-block: ...but a break LOWER DOWN keeps its space above (got %.1f, want %.1f)", got_after, want_after),
+				)
+			}
+
 			// Non-degeneracy: if every kind happened to carry the same space, the
 			// table above would pass against an implementation that applied one
 			// number everywhere -- which is very nearly the sabotage.
-			distinct_below := 0
-			for r, i in rows {
-				seen := false
-				for j in 0 ..< i {
-					if abs(rows[j].below - r.below) < 0.5 {seen = true}
-				}
-				if !seen {distinct_below += 1}
+			//
+			// THE COUNT USED TO BE THE ASSERTION (`distinct_below >= 4`) and C7 broke
+			// it honestly: Obsidian's rhythm gives a paragraph, a heading, a quote and
+			// a fence the SAME 1.0 S below, so the count fell to three and the old
+			// bound could only be met by lowering it. Lowering a threshold until a
+			// test passes is the "assertion with slack" trap, so the assertion is
+			// restated as the STRUCTURE it was always reaching for:
+			//
+			//   * most kinds share one space-below -- that IS C7's flat rhythm, and an
+			//     implementation with a graduated ladder fails it;
+			//   * and at least two kinds deliberately do NOT -- the list gap (0.15 S,
+			//     much tighter, because items are one list) and the thematic break
+			//     (24 px, a fixed decoration rather than type) -- which is what an
+			//     implementation applying one number everywhere fails.
+			//
+			// Both halves are needed. Either alone passes against a real defect.
+			common := m.para_below
+			shared, deviant := 0, 0
+			for r in rows {
+				if abs(r.below - common) < 0.5 {shared += 1} else {deviant += 1}
 			}
-			gchk(&bad, distinct_below >= 4, fmt.tprintf("gap: the fixture spans several DIFFERENT space-below values (%d distinct)", distinct_below))
+			gchk(&bad, shared >= 4, fmt.tprintf("gap: C7's rhythm is FLAT -- most kinds share one space-below (%d of %d at %.0fpx)", shared, len(rows), common))
+			gchk(&bad, deviant >= 2, fmt.tprintf("gap: ...but not uniform -- the list gap and the rule keep their own (%d deviate)", deviant))
 			return
 		}
 
@@ -38914,7 +39081,30 @@ when NEWTPAD_TESTS {
 				}
 				defer headless_gpu_destroy(&h)
 
-				src := "# Heading\n\nA paragraph with enough words in it to occupy a line.\n\n- A list item\n\nAnother paragraph.\n"
+				// DENSE ON PURPOSE. The probes below sit at fixed pixel offsets, so the
+				// fixture has to put real glyphs at those offsets -- and C7 changed
+				// every block height and gap underneath them. The first version was
+				// one heading, one short paragraph, a list item and a paragraph
+				// (~150px of content at S=16); after C7 the h1 is 31px rather than 45,
+				// so the +40 probe fell into the gap BELOW the heading and the +120
+				// probe into another gap, both resolved to the same position, and the
+				// selection between them came back empty.
+				//
+				// Several full paragraphs instead, each long enough to wrap, so every
+				// offset from +8 to +160 lands on prose regardless of what the rhythm
+				// does next. The `a != b` assertion added below is what names this
+				// failure directly if it ever recurs -- an empty copy on its own does
+				// not say WHY it was empty.
+				src :=
+					"# Heading\n\n" +
+					"A paragraph with enough words in it to occupy several lines of the measure, so that a probe " +
+					"landing anywhere inside it finds a glyph rather than the space between two blocks.\n\n" +
+					"A second paragraph, equally long, for the same reason: the probes below walk down the pane at " +
+					"fixed offsets and each one has to land on something the hit-test can resolve.\n\n" +
+					"- A list item, also long enough to wrap at the measure rather than ending mid-line\n" +
+					"- A second list item, so the list itself occupies more than a single row of the pane\n\n" +
+					"A third paragraph, closing the fixture, long enough that the deepest probe still lands on prose " +
+					"and not past the end of the document.\n"
 				content := make([]u8, len(src))
 				copy(content, transmute([]u8)src)
 				doc := doc_from_content(content, "hit.md", .UTF8)
@@ -38967,6 +39157,18 @@ when NEWTPAD_TESTS {
 				a, aok := md_preview_pos_at(&h.gfx, &h.text, &doc, px, W, H, 0.5, bx0 + sx(4), bytop + 40)
 				b, bok := md_preview_pos_at(&h.gfx, &h.text, &doc, px, W, H, 0.5, bx1 - sx(40), min(bytop + 120, bybot - 1))
 				mh_chk(&bad, aok && bok, "two ends of a drag both resolve")
+				// ...to DIFFERENT positions. md_sel_range refuses a zero-width
+				// selection ("a bare click selects nothing"), so two probes that
+				// resolve to the same Md_Pos copy "" and the assertion below fails
+				// with no indication of why. That is exactly what happened when C7
+				// moved the blocks under these fixed offsets: both probes landed in
+				// inter-block gaps and clamped to the same position. Asserted
+				// separately so the next such move is diagnosed rather than puzzled
+				// over.
+				mh_chk(
+					&bad, !(aok && bok) || !md_pos_eq(a, b),
+					fmt.tprintf("...and to DIFFERENT positions (a=%d/%d/%d b=%d/%d/%d)", a.block, a.span, a.off, b.block, b.span, b.off),
+				)
 				if aok && bok {
 					doc.md_sel_a, doc.md_sel_b = a, b
 					doc.md_sel_on = true

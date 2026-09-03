@@ -1727,6 +1727,19 @@ Md_Metrics :: struct {
 	s:            f32, // the base document size S, as handed in
 	// Sizes, round(k * S). head[0] is unused so head[level] indexes directly.
 	head:         [7]f32,
+	// Per-level heading leading, from Obsidian's --h1-line-height … --h6-line-height
+	// (1.2 / 1.2 / 1.3 / 1.4 / 1.5 / 1.5). Indexed like `head`, head_lead[0] unused.
+	//
+	// NOT line_height(). That is LINE_SPACING -- the editor GRID's 1.5 (doc.odin:43),
+	// shared by every row of the document surface -- and a heading is not on that
+	// grid. Using it gave every heading one leading, which is most of why our
+	// headings read as loose beside Obsidian's: a 1.618 S h1 wants 1.2, not 1.5.
+	//
+	// Rounded through the same int() the grid's is, for the reason doc.odin:224
+	// states: an unrounded fractional leading drifts half a pixel per line. A
+	// heading is rarely tall enough for that to show as text, but the block HEIGHT
+	// feeds the scroll anchor, so a fractional one drifts the anchor instead.
+	head_lead:    [7]f32,
 	body:         f32, // 1.00 S
 	code:         f32, // 0.92 S -- inline and fenced
 	table:        f32, // 0.95 S
@@ -1750,6 +1763,13 @@ Md_Metrics :: struct {
 	// an h2's 1.6 S above are not meant to sum to 2.4 S.
 	head_above:   [7]f32,
 	head_below:   [7]f32,
+	// 2.5 S -- Obsidian's --heading-spacing, the space above a heading that FOLLOWS
+	// CONTENT. A pair rule, not a block's own property, so it is applied by the
+	// walk's collapse and never by md_layout_build: a cached entry cannot see its
+	// predecessor, and baking a neighbour into one is how a cache serves the wrong
+	// geometry after an edit above it. A heading after another heading, and the
+	// document's first block, do not get it.
+	head_pair:    f32,
 	para_below:   f32, // 0.8 S
 	list_gap:     f32, // 0.25 S between items
 	quote_above:  f32, // 0.8 S
@@ -1829,17 +1849,46 @@ md_scale :: #force_inline proc(s, k: f32) -> f32 {return max(1, f32(int(s * k + 
 // `t` is needed only for the `ch` measure, which is a property of the body face.
 md_metrics :: proc(t: ^plat.Text, s: f32) -> (m: Md_Metrics) {
 	m.s = s
-	m.head = {0, md_scale(s, 1.85), md_scale(s, 1.50), md_scale(s, 1.25), md_scale(s, 1.10), md_scale(s, 1.00), md_scale(s, 1.00)}
+	// THE SCALE IS OBSIDIAN'S, and that is decision C7 rather than a tweak: the
+	// preview is measured against Obsidian and Obsidian wins where it and §9
+	// conflict (docs/ui-spec-gaps/README.md). Read out of its own app.css --
+	// --h1-size: 1.618em and so down -- not eyeballed from a screenshot. Ours was
+	// far more contrasty: 1.85 at the top and 1.00 by h5, against a near-geometric
+	// ladder where each step is about 1.10x the next.
+	m.head = {0, md_scale(s, 1.618), md_scale(s, 1.462), md_scale(s, 1.318), md_scale(s, 1.188), md_scale(s, 1.076), md_scale(s, 1.000)}
+	m.head_lead = {0,
+		f32(int(m.head[1] * 1.2 + 0.5)),
+		f32(int(m.head[2] * 1.2 + 0.5)),
+		f32(int(m.head[3] * 1.3 + 0.5)),
+		f32(int(m.head[4] * 1.4 + 0.5)),
+		f32(int(m.head[5] * 1.5 + 0.5)),
+		f32(int(m.head[6] * 1.5 + 0.5)),
+	}
 	m.body = md_scale(s, 1.00)
-	m.code = md_scale(s, 0.92)
-	m.table = md_scale(s, 0.95)
+	m.code = md_scale(s, 0.80) // --code-size -> --font-smallest: 0.8em. Was 0.92.
+	m.table = md_scale(s, 1.00) // --table-text-size IS --font-text-size. Was 0.95.
 	m.caption = md_scale(s, 0.88)
-	m.body_lead = md_scale(s, 1.65)
-	m.head_above = {0, 0, md_scale(s, 1.60), md_scale(s, 1.40), md_scale(s, 1.20), md_scale(s, 1.00), md_scale(s, 1.00)}
-	m.head_below = {0, md_scale(s, 0.60), md_scale(s, 0.50), md_scale(s, 0.40), md_scale(s, 0.30), md_scale(s, 0.30), md_scale(s, 0.30)}
-	m.para_below = md_scale(s, 0.80)
-	m.list_gap = md_scale(s, 0.25)
-	m.quote_above, m.quote_below = md_scale(s, 0.80), md_scale(s, 0.80)
+	m.body_lead = md_scale(s, 1.50) // --line-height-normal. Was 1.65, 10% looser.
+	// OBSIDIAN'S RHYTHM DOES NOT VARY BY LEVEL, and ours did. Its two rules are
+	//   h1..h6 { margin-block-start: 1rem; margin-block-end: 1rem }
+	//   :is(p,pre,table,ul,ol) + :is(h1..h6) { margin-top: 2.5rem }
+	// so what a heading carries ON ITS OWN is 1.0 S either side, and the 2.5 S is a
+	// property of the PAIR (content, then heading). The pair half is applied in
+	// md_walk's collapse, where the previous block is known -- a cached layout must
+	// not bake in a neighbour it cannot see.
+	//
+	// h1's space-above used to be 0 here, commented "it is the document's opening
+	// element". That intent is right and is now expressed properly: Obsidian's
+	// `.markdown-rendered > :first-child { margin-top: 0 }` zeroes the FIRST BLOCK
+	// whatever its kind, which md_walk applies. A document opening with a paragraph
+	// got no such treatment before, and an h1 in the MIDDLE of a document -- where
+	// it wants the full gap -- was given none.
+	m.head_above = {0, md_scale(s, 1.00), md_scale(s, 1.00), md_scale(s, 1.00), md_scale(s, 1.00), md_scale(s, 1.00), md_scale(s, 1.00)}
+	m.head_below = {0, md_scale(s, 1.00), md_scale(s, 1.00), md_scale(s, 1.00), md_scale(s, 1.00), md_scale(s, 1.00), md_scale(s, 1.00)}
+	m.head_pair = md_scale(s, 2.50) // --heading-spacing: calc(--p-spacing * 2.5)
+	m.para_below = md_scale(s, 1.00) // --p-spacing: 1rem. Was 0.80.
+	m.list_gap = md_scale(s, 0.15) // --list-spacing 0.075em, applied top AND bottom.
+	m.quote_above, m.quote_below = md_scale(s, 1.00), md_scale(s, 1.00)
 	m.fence_above, m.fence_below = md_scale(s, 1.00), md_scale(s, 1.00)
 	m.rule_gap = sx(24)
 	m.fence_pad = sx(12)
@@ -2540,6 +2589,33 @@ Md_Kind :: enum u8 {
 	List,
 	Table,
 	Front_Matter,
+}
+
+// Is this kind CONTENT, for the purpose of the heading pair rule?
+//
+// Obsidian's selector is `:is(p,pre,table,ul,ol) + :is(h1..h6)`, and this is that
+// set: a paragraph, a fence, a table, a list, a quote, a rule. `pre` is our three
+// Fence_* kinds, since a fence is one CSS element and three blocks to us.
+//
+// What is NOT content, and each for its own reason:
+//   .Blank        -- has no height and the source did not mean it as a block; a
+//                    blank between a paragraph and a heading must not break the
+//                    pair, which is why the walk latches this kind SKIPPING blanks.
+//   .Heading      -- deliberately outside Obsidian's set. Stacked headings are a
+//                    title and its subtitle; 2.5 S between them reads as two
+//                    sections rather than one.
+//   .Front_Matter -- not prose the reader is reading past, and it opens the file,
+//                    where the first-block rule applies anyway.
+//
+// A procedure rather than a bit_set literal at the call site because the set IS
+// the rule, and a rule spelled at its one call site is a rule the next call site
+// copies.
+md_kind_is_content :: #force_inline proc(k: Md_Kind) -> bool {
+	#partial switch k {
+	case .Para, .Fence_Open, .Fence_Body, .Fence_Close, .Table, .List, .Quote, .Rule:
+		return true
+	}
+	return false
 }
 
 // One styled span of a block's inline content, parallel to the plat.Shape_Span
@@ -3530,7 +3606,10 @@ md_layout_build :: proc(
 		e.indent = m.fence_pad
 	case .Heading:
 		px = m.head[clamp(e.cls.level, 1, 6)]
-		lead = line_height(px)
+		// Per-level, from m.head_lead -- NOT line_height(), which is the editor
+		// grid's LINE_SPACING and gave all six headings the same 1.5. See the
+		// head_lead comment in Md_Metrics.
+		lead = m.head_lead[clamp(e.cls.level, 1, 6)]
 		base_col = g_theme[.Md_Heading]
 		e.above = m.head_above[clamp(e.cls.level, 1, 6)]
 		e.below = m.head_below[clamp(e.cls.level, 1, 6)]
@@ -4250,6 +4329,19 @@ md_walk :: proc(
 	// walk keeps besides prev_below, and both exist for the same reason -- a gap is
 	// a property of a pair, not of a block.
 	after_list := false
+	// The last CONTENT kind the walk passed, for the heading pair rule above.
+	// Blanks do not overwrite it, so `paragraph / blank line / heading` still reads
+	// as the pair Obsidian's `+` combinator matches -- a blank line is how markdown
+	// separates blocks, not a block the reader sees.
+	//
+	// Seeded to .Blank, exactly as prev_below is seeded to 0 and for the same
+	// reason: a walk enters the document at the scroll anchor, so the first block
+	// it sees has a predecessor it did not look at. MD_RUNUP_LINES is what makes
+	// that safe -- md_anchor_walk starts the walk above the anchor so this is
+	// latched from real blocks by the time the anchor is reached. A walk with no
+	// run-up gets the same answer the collapsed gap gets, which is to say the
+	// document's own, only at byte 0.
+	last_kind := Md_Kind.Blank
 	empties := 0
 	reached = p > doc.pt.length || p >= stop_at
 	for p <= doc.pt.length && p < stop_at && n < len(out) && empties < MD_MAX_EMPTY_BLOCKS {
@@ -4259,6 +4351,39 @@ md_walk :: proc(
 		if nb > 0 && buf[nb - 1] == '\r' {nb -= 1}
 		lay := md_layout_ensure(gfx, text, doc, m, p, end, string(buf[:nb]), in_fence, fence_lex, fence_state, measure)
 		gap := max(prev_below, lay.above)
+		// OBSIDIAN'S PAIR RULE: `:is(p,pre,table,ul,ol) + :is(h1..h6)` gets
+		// --heading-spacing (2.5 S) rather than the 1.0 S a heading carries alone.
+		//
+		// HERE and not in md_layout_build for the same reason after_list below is
+		// here: a gap is a property of a PAIR, and md_layout_build sees one block.
+		// A cached entry that baked in its predecessor would serve the wrong space
+		// the moment the block above it changed kind.
+		//
+		// last_kind, not the raw previous block, so a blank line between a paragraph
+		// and a heading does not break the pair -- the blank has no height and the
+		// source did not mean it as content. That is the same skip after_list makes,
+		// and for the same reason.
+		//
+		// A heading after a HEADING is deliberately not in Obsidian's `:is(...)`
+		// set and so keeps 1.0 S: stacked headings are a title and its subtitle,
+		// and 2.5 S between them reads as two sections rather than one.
+		if lay.cls.kind == .Heading && md_kind_is_content(last_kind) {
+			gap = max(gap, m.head_pair)
+		}
+		// `.markdown-rendered > :first-child { margin-top: 0 }` -- the document's
+		// FIRST block has no space above it, whatever kind it is. The top inset is
+		// the pane's padding's job, not a block's.
+		//
+		// This generalises what m.head_above[1] used to hardcode as 0 for h1 alone,
+		// commented "it is the document's opening element". It was right about the
+		// intent and wrong about the mechanism: a document opening with a paragraph
+		// or a fence got no such treatment, and an h1 in the MIDDLE of a document,
+		// where it wants the full gap, was given none.
+		//
+		// lay.start rather than a loop counter: `p` may enter this walk anywhere
+		// (the walk starts at the scroll anchor, not at byte 0), so "is this the
+		// first block" is a fact about the DOCUMENT and only byte 0 answers it.
+		if lay.start <= 0 {gap = 0}
 		// THE GAP AFTER A LIST RUN IS A PARAGRAPH'S, NOT AN ITEM'S. §9.3 gives a
 		// list item "0.25 S between items" -- between ITEMS -- and the layout
 		// applied it as the `below` of every item including the last, so the prose
@@ -4294,14 +4419,18 @@ md_walk :: proc(
 		// immediately, so nothing fires.
 		//
 		// PROSE AND BLANKS ONLY, not every block that can follow a list. Every
-		// other kind carries its own space-above from §9.3 -- an h2's 1.6 S, a
-		// fence's 1.0 S, a quote's 0.8 S -- and those are already at least a
-		// paragraph's worth, so raising them would change nothing. The one
-		// exception is an h1, whose §9.3 space-above is 0 ON PURPOSE (it is the
-		// document's opening element), and overriding that would be this fix
-		// second-guessing the spec on a case nobody reported. A paragraph's
-		// space-above is 0 for the same stated reason and is exactly the case that
-		// WAS reported, which is why the gap has to come from the list's side.
+		// other kind carries its own space-above -- 1.0 S for a heading, a fence or
+		// a quote, and 24px for a rule -- and those are already at least a
+		// paragraph's worth, so raising them would change nothing.
+		//
+		// The old text here named "an h2's 1.6 S, a quote's 0.8 S" and made an
+		// exception of h1, "whose space-above is 0 ON PURPOSE (it is the document's
+		// opening element)". C7 replaced the graduated per-level rhythm with
+		// Obsidian's flat one, so those three numbers are gone; the h1 exception is
+		// gone with them, generalised into the first-block rule above, which is what
+		// it was always trying to say. A paragraph's space-above is still 0, which
+		// is still exactly the reported case, which is still why the gap has to come
+		// from the list's side.
 		if after_list && lay.cls.kind != .List {
 			if lay.cls.kind == .Para || lay.cls.kind == .Blank {
 				gap = max(gap, m.para_below)
@@ -4309,6 +4438,10 @@ md_walk :: proc(
 			after_list = false
 		}
 		if lay.cls.kind == .List {after_list = true}
+		// Latched AFTER this block's own gap is decided, and skipping .Blank -- see
+		// the declaration. A heading updates it too, so heading-after-heading is
+		// correctly not a content pair.
+		if lay.cls.kind != .Blank {last_kind = lay.cls.kind}
 		out[n] = {start = p, end = lay.end, next = lay.next, slot_top = total, gap = gap, h = lay.h, lay = lay}
 		n += 1
 		total += gap + lay.h
