@@ -10107,6 +10107,31 @@ when NEWTPAD_TESTS {
 				}
 				px := f32(16)
 
+				// 2b. WITH NO PREFERENCE SET, THE PREVIEW RESOLVES SEGOE UI -- the
+				//     SANS, not a serif. Decision C7: the preview is measured against
+				//     Obsidian, whose --font-default resolves to Segoe UI on Windows,
+				//     and §9.3's serif is overruled. Before C7 this order began with
+				//     Georgia and the reorder is the whole of the change, so without
+				//     this assertion the task had no test at all -- every other font
+				//     check here passes identically under either order, because they
+				//     ask whether the face is PROPORTIONAL and both are.
+				//
+				//     Asserted through text_load_body_face's own return value rather
+				//     than by reading BODY_FAMILIES[0].name, which would be the array
+				//     agreeing with itself. This is the resolution the app performs.
+				//
+				//     `body_pref` is cleared first: a settings file naming a face is a
+				//     legitimate override and is NOT what this asserts.
+				{
+					pref := t.body_pref
+					t.body_pref = ""
+					fam, fam_ok := plat.text_load_body_face(&t)
+					fmt.printfln("    body face with no preference: %q (ok=%v)", fam, fam_ok)
+					fnt_chk(bad, fam_ok && fam == "Segoe UI", fmt.tprintf("the preview's default body face is Segoe UI, not a serif (got %q)", fam))
+					t.body_pref = pref
+					plat.text_load_body_face(&t) // put the chain back for the checks below
+				}
+
 				// 3. The styled body chains loaded the BODY family, not the mono
 				//    one. find_family tests FONT_SETS[set].base rather than
 				//    `set == .Body`; with the naive test every styled chain would
@@ -15728,6 +15753,28 @@ when NEWTPAD_TESTS {
 					)
 				}
 			}
+			// THE REQUESTED BODY LEADING IS ACTUALLY WHAT COMES OUT, and until now
+			// nothing checked it. Md_Metrics.body_lead's own comment says it is a
+			// FLOOR rather than the leading you get -- the shaper clamps up for a
+			// face whose ascent + descent exceeds it -- and tells the reader to read
+			// Shaped.line_h back. This is that read.
+			//
+			// It matters more after C7 than it did before. Body leading came down
+			// from 1.65 S to 1.50 S at the same moment the body face changed from
+			// Georgia (asc+desc 1.136 em) to Segoe UI, so BOTH sides of the clamp
+			// moved in the same commit. If Segoe UI's box exceeds 1.50 S the whole
+			// rhythm silently becomes something other than what §3 specifies, and
+			// every heading's tighter head_lead is clamped too.
+			//
+			// body_h is a ONE-LINE run, so it is exactly the line height the shaper
+			// produced. Asserted as equality, not `<=`: a bound here is the "assertion
+			// with slack" the register warns about, and the interesting failure is
+			// the shaper quietly giving us MORE than we asked for.
+			gchk(
+				&bad, abs(body_h - m.body_lead) <= 1,
+				fmt.tprintf("the body face actually achieves the requested leading (got %.1f, asked %.1f at S=%.0f)", body_h, m.body_lead, m.s),
+			)
+
 			// THE FIRST BLOCK HAS NO SPACE ABOVE IT, whatever kind it is --
 			// Obsidian's `.markdown-rendered > :first-child { margin-top: 0 }`. This
 			// generalises what m.head_above[1] used to hardcode as 0 for h1 alone,

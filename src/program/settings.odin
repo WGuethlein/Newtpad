@@ -309,7 +309,7 @@ settings_default :: proc() -> Settings {
 		caret_blink = true, // spec §8's 500ms blink; the setting exists to turn it OFF
 		current_line = false, // spec §8: "off by default"
 		gutter = false, // spec §8: "off by default"
-		preview_font = "", // no preference: the curated serif order decides
+		preview_font = "", // no preference: BODY_FAMILIES' order decides (Segoe UI, then the serifs)
 		theme_name = "Dark",
 	}
 }
