@@ -2114,6 +2114,15 @@ md_fence_lexer :: proc(fence_line: string) -> Lexer_Proc {
 		tag = "c" // close enough for braces, strings and // comments
 	case "shell", "console", "bash", "zsh":
 		tag = "sh"
+	// POWERSHELL, and it is the one that mattered most in practice: EXT_LEXERS has
+	// carried a real PowerShell lexer at .ps1 (lex_shell_ps1_adapt, stateful, `#>`
+	// resync) the whole time, and with no alias here every ```powershell fence
+	// resolved nothing -- so it got neither the mono face nor the colours that were
+	// already implemented and already tested. Most of Wyatt's deploy notes are
+	// PowerShell, which is why his screenshots of our preview looked worst exactly
+	// where ours should have looked best.
+	case "powershell", "pwsh", "posh":
+		tag = "ps1"
 	case "yml":
 		tag = "yaml"
 	case "csharp", "c#":
@@ -3637,6 +3646,24 @@ md_layout_build :: proc(
 	case .Fence_Body:
 		px, lead = m.code, line_height(m.code)
 		base_col = g_theme[.Md_Code]
+		// THE MONO FACE, and its absence was a real bug rather than an omission.
+		// `fallback_set` defaults to .Body at the top of this proc and only .Table
+		// overrode it, so a fence body fell back to the PROPORTIONAL body face. The
+		// mono, syntax-coloured path below is gated on `fence_lex != nil`, so the
+		// split was:
+		//
+		//   a fence whose language HAS a lexer -> mono, coloured, correct;
+		//   a fence whose language does not    -> proportional, one flat colour.
+		//
+		// Inline code was unaffected (correctly mono), which is why the two
+		// disagreed inside the same paragraph. Code set in a proportional face is
+		// the single loudest way a rendered document says "this was not done
+		// carefully", and after C7 moved the body face to a sans it would have been
+		// proportional SANS instead -- no better, and harder to notice.
+		//
+		// It is the FALLBACK, so it changes only the blocks that were reaching the
+		// wrong face: a resolved lexer still sets .Doc per token below.
+		fallback_set = .Doc
 		// 9.3's 12px fenced-code padding, as the block's INDENT rather than as a
 		// number the draw adds on its own. The glyph origin has exactly one
 		// producer (md_block_origin) and the link rects are built from it, so an
@@ -3792,6 +3819,35 @@ md_layout_build :: proc(
 			cut = hi
 		}
 		if cut < len(e.src) {emit(&sb, &draft, e.src[cut:], base_col, px)}
+	} else if e.cls.kind == .Fence_Body {
+		// A FENCE BODY WITH NO LEXER: one raw span, on the mono face, with no
+		// inline parsing at all.
+		//
+		// Without this it fell through to the general branch below, which does two
+		// wrong things to code. It runs md_inline over it, so `**x**` inside a code
+		// block rendered as emphasis and its asterisks disappeared -- markdown does
+		// not apply inside a fence, and the whole point of one is that the bytes are
+		// shown as written. And it takes its face from md_run_set, which answers
+		// .Body for a run with no .Code style, so the text came out in the
+		// PROPORTIONAL body face. Inline code was unaffected (md_run_set answers
+		// .Doc for .Code), which is why the two disagreed inside one document.
+		//
+		// So the split was: a fence whose language HAS a lexer -> mono and coloured,
+		// because the branch above emits .Doc per token; a fence whose language does
+		// not -> proportional, and quietly re-parsed as prose.
+		//
+		// NOTE FOR THE SWEEP'S DIAGNOSIS, which named `fallback_set`: that variable
+		// is real and it did default to .Body, but it is read at exactly one place
+		// (the empty-block height fallback), so setting it does NOT fix this. It is
+		// set correctly in the .Fence_Body case now and this is the change that
+		// makes code look like code. Reading the symptom off the source found the
+		// right block and the wrong line.
+		//
+		// e.src, not e.cls.content, matching the lexer branch above: both want the
+		// raw line exactly as written, including its leading whitespace.
+		off := strings.builder_len(sb)
+		strings.write_string(&sb, e.src)
+		append(&draft, Md_Draft_Span{off = off, len = len(e.src), color = base_col, px = px, set = .Doc})
 	} else {
 		content := e.cls.content
 		// UI spec §9.3: h6 is CAPS. It is the one level with no size of its own --
@@ -3983,6 +4039,49 @@ md_layout_build_for_test :: proc(gfx: ^plat.Gfx, t: ^plat.Text, doc: ^Document, 
 	buf: [RENDER_LINE_CAP]u8
 	line, lend, _ := md_line_at(doc, p, buf[:])
 	return md_layout_build(gfx, t, doc, m, p, lend, line, false, nil, {}, measure)
+}
+
+// The same, but with the fence state THREADED FROM BYTE 0 the way md_walk
+// threads it, so a block inside a fence classifies as `.Fence_Body` and carries
+// the opening fence's lexer.
+//
+// A separate procedure rather than a change to the one above, which hands
+// `in_fence = false` unconditionally: every existing caller builds a block that
+// is not in a fence, and quietly making them all thread would change what those
+// tests are testing. This one exists because a test that wanted a fence body got
+// a `.Para` and asserted happily about it.
+//
+// THREADED, not md_fence_seed'd, and the difference is the whole point. The seed
+// is for entering a document partway down: it recovers `in_fence` from the lexer
+// state, then asks lex_index_fence_open for the opening line so it can recover
+// the LEXER too -- and that index is built by a background pass which a
+// freshly-made test document does not have, so the seed answers
+// `(true, nil)`. A test built on it therefore exercises the no-lexer path
+// whatever language the fence names, and a "control" case meant to prove the
+// lexer path still works passes for the wrong reason. md_walk itself never has
+// this problem: it takes `out_lex` from the `.Fence_Open` block it just built.
+md_layout_build_fenced_for_test :: proc(gfx: ^plat.Gfx, t: ^plat.Text, doc: ^Document, m: ^Md_Metrics, p: int, measure: f32) -> Md_Layout {
+	buf: [RENDER_LINE_CAP]u8
+	in_fence, fence_lex := false, Lexer_Proc(nil)
+	fence_state := base.Lex_State{}
+	q := 0
+	for q < p && q <= doc.pt.length {
+		line, lend, _ := md_line_at(doc, q, buf[:])
+		lay := md_layout_build(gfx, t, doc, m, q, lend, line, in_fence, fence_lex, fence_state, measure)
+		// EVERY field is read before the free. md_layout_free ends with `e^ = {}`,
+		// so `lay.next` afterwards is 0 and this loop never advances -- which is a
+		// hang, not a wrong answer, and cost one 7-minute timeout to notice.
+		next := lay.next
+		in_fence, fence_lex, fence_state = lay.out_fence, lay.out_lex, lay.out_state
+		md_layout_free(&lay)
+		// A block that does not advance would hang the loop just as surely; blocks
+		// tile the document, so this is belt and braces over a bound that already
+		// holds.
+		if next <= q {break}
+		q = next
+	}
+	line, lend, _ := md_line_at(doc, p, buf[:])
+	return md_layout_build(gfx, t, doc, m, p, lend, line, in_fence, fence_lex, fence_state, measure)
 }
 
 // The cached layout for the block at `p`, building it if no slot holds one.

@@ -17441,6 +17441,152 @@ when NEWTPAD_TESTS {
 				mf_chk(&bad, seed_in == truth[2], "indent fixture: seed agrees with the walk from byte 0")
 			}
 
+			// --- C7: the fence's FACE and its language aliases -------------------
+			//
+			// Two defects the 2026-08-04 sweep diagnosed and nothing had closed.
+			{
+				// 1. ```powershell resolves a lexer. EXT_LEXERS has carried a real
+				//    PowerShell lexer at .ps1 the whole time and md_fence_lexer had no
+				//    alias for it, so the language most of Wyatt's notes are written in
+				//    got neither the mono face nor the colours that already existed.
+				//
+				//    `sh` is the control: it proves the alias table is reached at all,
+				//    so a failure on powershell means the alias is missing rather than
+				//    that lexer resolution is broken generally.
+				mf_chk(&bad, md_fence_lexer("```sh") != nil, "control: ```sh resolves a lexer, so the alias table is reachable")
+				for tag in ([]string{"powershell", "pwsh", "posh", "PowerShell", "POWERSHELL"}) {
+					line := strings.concatenate({"```", tag}, context.temp_allocator)
+					mf_chk(&bad, md_fence_lexer(line) != nil, fmt.tprintf("```%s resolves the .ps1 lexer", tag))
+				}
+				// ...and a genuinely unknown language still resolves nothing, or the
+				// check above would pass against a md_fence_lexer that returned some
+				// lexer for everything.
+				mf_chk(&bad, md_fence_lexer("```notalanguage") == nil, "...while an unknown language still resolves no lexer")
+
+				// 2. A fence body whose language resolves NO lexer is still set in the
+				//    MONO face. `fallback_set` defaulted to .Body, and the mono path is
+				//    gated on `fence_lex != nil`, so exactly those blocks fell back to
+				//    the proportional body face -- code in a proportional face, beside
+				//    inline code that was correctly mono.
+				//
+				//    Asserted on the shape span's SET, which is what the shaper was
+				//    actually handed, rather than on a colour: the bug is about the
+				//    face and a colour check would pass with the face still wrong.
+				// THE THEME HAS TO BE REAL for any colour claim below to mean
+				// anything. mdfencetest never set it -- every other visual mode does
+				// -- so g_theme was the zero value and every syntax role resolved to
+				// the same {0,0,0,0}. The tokenisation control below counted eight
+				// spans in "one colour" and failed, which looked like broken
+				// highlighting and was an unpainted palette.
+				g_theme, UI_SCALE = theme_dark(), 1
+				h: Headless_Gpu
+				if !headless_gpu_init(&h, 900, 700, "mdfencetest") {
+					mf_chk(&bad, false, "an offscreen device came up, so a fence body could be shaped")
+				} else {
+					defer headless_gpu_destroy(&h)
+					m := md_metrics(&h.text, 16)
+					fence_set :: proc(h: ^Headless_Gpu, m: ^Md_Metrics, lang: string) -> (plat.Font_Set, bool) {
+						src := strings.concatenate({"```", lang, "\ncode_text\n```\n"}, context.temp_allocator)
+						content := make([]u8, len(src))
+						copy(content, src)
+						doc := doc_from_content(content, "f.md", .UTF8)
+						defer doc_close(&doc)
+						// Line 1 is the fence BODY; line 0 is the opening fence.
+						body := min(base.pt_line_end_cap(&doc.pt, 0, RENDER_LINE_CAP) + 1, doc.pt.length)
+						// SEEDED from the document: md_layout_build_for_test hands
+						// in_fence = false unconditionally, so this line classified as
+						// a .Para -- a paragraph, in the body face, which the first
+						// draft of this check then reported as the bug it was looking
+						// for. The control (a fence WITH a lexer, long known correct)
+						// failing too is what gave it away.
+						lay := md_layout_build_fenced_for_test(&h.gfx, &h.text, &doc, m, body, 600)
+						defer md_layout_free(&lay)
+						if lay.cls.kind != .Fence_Body || len(lay.shape) == 0 {return .Body, false}
+						return lay.shape[0].set, true
+					}
+					unk, uok := fence_set(&h, &m, "notalanguage")
+					mf_chk(&bad, uok && unk == .Doc, fmt.tprintf("a fence with NO lexer is still mono (.Doc), not the proportional body face (got %v)", unk))
+					bare, bok := fence_set(&h, &m, "")
+					mf_chk(&bad, bok && bare == .Doc, fmt.tprintf("...and so is a fence naming no language at all (got %v)", bare))
+					// The control, and it has to prove the LEXER path specifically,
+					// not just that the result is mono. Both paths emit .Doc now, so
+					// "is it .Doc" cannot tell them apart -- the first version of this
+					// check asked exactly that and passed while the lexer path was not
+					// being reached at all (md_layout_build_fenced_for_test used to
+					// seed via md_fence_seed, which cannot recover a lexer without the
+					// background line index a fresh test document has never built).
+					//
+					// A tokenised fence emits one span per token, so SEVERAL spans in
+					// more than one colour is the signature the fall-through cannot
+					// produce: it emits exactly one span in one colour.
+					lexed :: proc(h: ^Headless_Gpu, m: ^Md_Metrics, lang, body: string) -> (spans, colors: int) {
+						src := strings.concatenate({"```", lang, "\n", body, "\n```\n"}, context.temp_allocator)
+						content := make([]u8, len(src))
+						copy(content, src)
+						doc := doc_from_content(content, "f3.md", .UTF8)
+						defer doc_close(&doc)
+						off := min(base.pt_line_end_cap(&doc.pt, 0, RENDER_LINE_CAP) + 1, doc.pt.length)
+						lay := md_layout_build_fenced_for_test(&h.gfx, &h.text, &doc, m, off, 600)
+						defer md_layout_free(&lay)
+						seen: [dynamic][4]f32
+						defer delete(seen)
+						for sp in lay.spans {
+							dup := false
+							for c in seen {if c == sp.color {dup = true}}
+							if !dup {append(&seen, sp.color)}
+						}
+						return len(lay.spans), len(seen)
+					}
+					ns, nc := lexed(&h, &m, "json", "{ \"key\": 42 }")
+					mf_chk(&bad, ns > 1 && nc > 1, fmt.tprintf("control: a fence WITH a lexer is TOKENISED (%d spans, %d colours)", ns, nc))
+					// ...and the one without is not, which is what makes the counts
+					// above a signature rather than a number.
+					us, uc := lexed(&h, &m, "notalanguage", "{ \"key\": 42 }")
+					mf_chk(&bad, us == 1 && uc == 1, fmt.tprintf("...and one without a lexer is a single flat span (%d spans, %d colours)", us, uc))
+
+					// 3. MARKDOWN IS NOT PARSED INSIDE A FENCE. The same fall-through
+					//    that gave a lexer-less fence the proportional face also ran
+					//    md_inline over it, so `**x**` rendered as emphasis and its
+					//    asterisks vanished -- from a block whose entire purpose is
+					//    showing bytes as written.
+					//
+					//    Asserted on the SPAN TEXT rather than on the span count: a
+					//    correct implementation may split the line for its own reasons
+					//    (bare-link splitting, the lexer's tokens), and what must hold
+					//    is that the asterisks survive into what gets drawn.
+					fence_text :: proc(h: ^Headless_Gpu, m: ^Md_Metrics, lang, body: string) -> string {
+						src := strings.concatenate({"```", lang, "\n", body, "\n```\n"}, context.temp_allocator)
+						content := make([]u8, len(src))
+						copy(content, src)
+						doc := doc_from_content(content, "f2.md", .UTF8)
+						defer doc_close(&doc)
+						off := min(base.pt_line_end_cap(&doc.pt, 0, RENDER_LINE_CAP) + 1, doc.pt.length)
+						lay := md_layout_build_fenced_for_test(&h.gfx, &h.text, &doc, m, off, 600)
+						defer md_layout_free(&lay)
+						sb := strings.builder_make(context.temp_allocator)
+						for sp in lay.shape {strings.write_string(&sb, sp.text)}
+						return strings.clone(strings.to_string(sb), context.temp_allocator)
+					}
+					got_raw := fence_text(&h, &m, "notalanguage", "keep **these** and _these_ marks")
+					mf_chk(
+						&bad, got_raw == "keep **these** and _these_ marks",
+						fmt.tprintf("a fence's bytes are shown as written, not parsed as markdown (%q)", got_raw),
+					)
+				}
+			}
+			// NO LANGUAGE LABEL IS DRAWN, and that is a decision rather than an
+			// omission. The 2026-08-04 sweep filed "no language label on the fence"
+			// as the third fence defect, on §9's authority. C7 makes Obsidian the
+			// authority where the two conflict, and Obsidian's READING view has no
+			// label: `.code-block-flair` exists only under
+			// `.markdown-source-view.mod-cm6`, its editor. What its reading view puts
+			// on a fence is a copy button, revealed on hover
+			// (`pre:not(:hover) > button.copy-code-button { display: none }`), which
+			// is a different feature and is not this batch's.
+			//
+			// Written here rather than in a doc because the next reader of the sweep
+			// will otherwise file it again.
+
 			// Exits non-zero, the guard palettetest carries. Demonstrated rather than
 			// assumed: sabotaging md_fence_seed made this mode print "8 failures" and
 			// still exit 0 (2026-08-01).
