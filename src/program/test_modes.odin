@@ -15710,8 +15710,8 @@ when NEWTPAD_TESTS {
 				// h1 and h2 carry their rule INSIDE their own height (9.2 item 1).
 				// Leading is m.head_lead[n], not line_height(): C7 gave headings a
 				// per-level leading and the layout stopped using the editor grid's.
-				{"h1", "# block text", one_line(&h, "block text", m.head[1], measure, m.head_lead[1], bold) + hairline(), m.head_above[1], m.head_below[1], false, true},
-				{"h2", "## block text", one_line(&h, "block text", m.head[2], measure, m.head_lead[2], bold) + hairline(), m.head_above[2], m.head_below[2], false, true},
+				{"h1", "# block text", one_line(&h, "block text", m.head[1], measure, m.head_lead[1], bold), m.head_above[1], m.head_below[1], false, true},
+				{"h2", "## block text", one_line(&h, "block text", m.head[2], measure, m.head_lead[2], bold), m.head_above[2], m.head_below[2], false, true},
 				{"h3", "### block text", one_line(&h, "block text", m.head[3], measure, m.head_lead[3], bold), m.head_above[3], m.head_below[3], false, true},
 				{"h4", "#### block text", one_line(&h, "block text", m.head[4], measure, m.head_lead[4], bold), m.head_above[4], m.head_below[4], false, true},
 				{"fenced code", "```\ncode\n```", fence_h, m.fence_above, m.fence_below, false, false},
@@ -15791,6 +15791,35 @@ when NEWTPAD_TESTS {
 					)
 				}
 			}
+			// NO HEADING CARRIES A RULE UNDER IT (C7; Wyatt, 2026-09-03). Obsidian
+			// draws no heading border, and 9.2 item 1 asked for one on h1 and h2.
+			//
+			// Asserted EXACTLY, and separately from the gap table above, for the same
+			// reason the thematic break needed its own check: a rule is one hairline
+			// and that table compares with a +/-1px tolerance, so it cannot tell a
+			// heading with a rule from one without. Both h1 rows in that table used to
+			// carry `+ hairline()` and kept passing after the rule was removed.
+			{
+				for lvl in 1 ..= 2 {
+					hashes := strings.repeat("#", lvl, context.temp_allocator)
+					hsrc := strings.concatenate({hashes, " block text\n"}, context.temp_allocator)
+					hcontent := make([]u8, len(hsrc))
+					copy(hcontent, hsrc)
+					hdoc := doc_from_content(hcontent, "h2.md", .UTF8)
+					defer doc_close(&hdoc)
+					hlay := md_layout_build_for_test(&h.gfx, &h.text, &hdoc, &m, 0, measure)
+					defer md_layout_free(&hlay)
+					want_h := one_line(&h, "block text", m.head[lvl], measure, m.head_lead[lvl], bold)
+					gchk(
+						&bad, hlay.h == want_h,
+						fmt.tprintf("h%d carries NO rule under it: its height is exactly its text (%.1f vs %.1f; a rule would add %.1f)", lvl, hlay.h, want_h, hairline()),
+					)
+				}
+				// md_head_rules itself is deliberately not asserted here: it is
+				// @(private = "file") and should stay that way. The height above is
+				// the behaviour, and the predicate is an implementation detail of it.
+			}
+
 			// THE FIXED-PIXEL DECORATIONS, BY VALUE. Nothing asserted these: the
 			// scale table above covers only the S-derived rows, and the UI_SCALE case
 			// asserts they MOVE without ever saying what they are. Sabotaging

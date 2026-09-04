@@ -1940,9 +1940,24 @@ md_metrics :: proc(t: ^plat.Text, s: f32) -> (m: Md_Metrics) {
 	return
 }
 
-// h1 and h2 carry a rule under them (9.2 item 1, 9.3's "+ md_rule").
+// NO HEADING CARRIES A RULE UNDER IT. C7 (docs/ui-spec-gaps/README.md) measures
+// the preview against Obsidian, and Obsidian's reading view draws no heading
+// border at all -- `.code-block-flair` aside, there is no border-bottom on any
+// h1..h6 rule in its app.css. 9.2 item 1 and 9.3's "+ md_rule" asked for one on
+// h1 and h2; Obsidian wins where they conflict, and Wyatt chose it directly
+// (2026-09-03) with the two put side by side.
+//
+// The PROCEDURE stays, returning false, rather than the two call sites losing
+// their branch. It is the single producer of "does this heading have a rule",
+// read by the height (md_layout_build) and by the draw (md_block_draw), and
+// those two must never be able to disagree -- which is exactly what deleting it
+// and hand-editing both sites invites. It also keeps the decision in one place
+// to reverse if the rule ever comes back.
+//
+// The 2.5 S above a heading that follows content (m.head_pair) is what separates
+// sections now, which is what Obsidian uses and is why the rule is not missed.
 @(private = "file")
-md_head_rules :: #force_inline proc(level: int) -> bool {return level == 1 || level == 2}
+md_head_rules :: #force_inline proc(level: int) -> bool {return false}
 
 @(private = "file")
 is_space :: proc(b: u8) -> bool {return b == ' ' || b == '\t'}
