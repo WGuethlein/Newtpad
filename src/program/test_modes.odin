@@ -12064,6 +12064,52 @@ when NEWTPAD_TESTS {
 				bar_chk(&bad, wide_ok && !narrow_ok, fmt.tprintf("present at 1920 and dropped at 318 (%v / %v) -- else the drop case is untested", wide_ok, narrow_ok))
 			}
 
+			// THE PREVIEW'S CONTEXT MENU (C7 / W6). Wyatt could not right-click the
+			// preview, and the reason was that nothing had been built to receive it.
+			{
+				pm_chk :: proc(bad: ^int, ok: bool, msg: string) {
+					fmt.printfln("  %-72s %s", msg, "OK" if ok else "FAIL")
+					if !ok {bad^ += 1}
+				}
+				// Every row names a real command and carries an `enabled` predicate.
+				// A row with none is a row that offers a command which silently
+				// no-ops, which the Menu_Item comment calls "lying about what it
+				// does".
+				rows, gaps := 0, 0
+				for it in preview_menu_items {
+					if it.cmd == .None {continue} // a separator
+					rows += 1
+					if it.enabled == nil {gaps += 1}
+				}
+				pm_chk(&bad, rows >= 3, fmt.tprintf("the preview menu has rows (%d)", rows))
+				pm_chk(&bad, gaps == 0, fmt.tprintf("...and every one of them says when it is available (%d without)", gaps))
+
+				// COPY IS ENABLED BY A PREVIEW SELECTION, and this is the assertion
+				// the menu was most likely to get wrong. `has_sel` asks doc_has_sel,
+				// which is the EDITOR's selection; a preview highlight leaves it
+				// false, so a menu built on it would grey out Copy in exactly the
+				// situation the menu exists for. The two selections are mutually
+				// exclusive by construction, so this is not a case that can be
+				// covered by the editor's own state.
+				d := app_active(&a)
+				if d != nil {
+					copy_row := preview_menu_items[0]
+					pm_chk(&bad, copy_row.cmd == .Copy, "the first row is Copy")
+					d.md_sel_on = false
+					off := copy_row.enabled != nil && copy_row.enabled(&a)
+					d.md_sel_on = true
+					// A range, not a bare flag: md_sel_range refuses a zero-width
+					// selection, and `on` alone is what a bare click leaves behind.
+					d.md_sel_a, d.md_sel_b = Md_Pos{block = 0, span = 0, off = 0}, Md_Pos{block = 0, span = 0, off = 4}
+					on := copy_row.enabled != nil && copy_row.enabled(&a)
+					d.md_sel_on = false
+					pm_chk(&bad, on, "Copy is enabled while a PREVIEW selection is live")
+					pm_chk(&bad, !off, "...and disabled with no selection of either kind, so the row is not simply always on")
+				} else {
+					pm_chk(&bad, false, "menutest has an active document to hang a selection on")
+				}
+			}
+
 			// Non-zero exit, for the reason keytest grew one: a mode that only ever
 			// prints its verdict is a mode whose verdict a sweep can miss.
 			mode_done("menutest", bad)
@@ -39749,6 +39795,109 @@ when NEWTPAD_TESTS {
 			}
 			fmt.println("mdhittest:")
 			return mode_done("mdhittest", mh_run())
+		}
+
+		// THE FRAME LOOP'S PRESS DECISION, driven directly.
+		//
+		// Three preview bugs in a row have hidden in main.odin's press routing --
+		// the one path this environment cannot execute -- and each time the answer
+		// was another headless test of a procedure the loop CALLS rather than of the
+		// loop's own decision. mdseltest drives md_preview_sel_text_for_test, which
+		// never touches the pixel->position mapping; mdhittest drives that mapping,
+		// which is not the routing. Both pass. The routing was never reachable at
+		// all until press_route was lifted out (HANDOFF §6cz did the same for the
+		// keyboard, and keyboard bugs stopped hiding).
+		//
+		// So this is a TRUTH TABLE, not a scenario: every gate crossed with every
+		// other, asserted against the meaning each combination should have.
+		if os.args[1] == "pressroutetest" {
+			pr_run :: proc() -> int {
+				bad := 0
+				pr_chk :: proc(bad: ^int, ok: bool, msg: string) {
+					fmt.printfln("  %-74s %s", msg, "OK" if ok else "FAIL")
+					if !ok {bad^ += 1}
+				}
+				CT :: f32(80) // a stand-in CHROME_TOP
+				ED :: f32(600) // the Split divider
+				none := Drag_Latches{}
+				// A plain single left press over the preview half, nothing latched.
+				press :: proc(md_mode: Md_Mode, mx, my: f32, table := false, is_text := true, pressed := true, down := true, ctrl := false, clicks := 1, sel_drag := false, d := Drag_Latches{}) -> Press_Route {
+					return press_route(is_text, table, md_mode, my, CT, mx, ED, pressed, down, ctrl, clicks, sel_drag, d)
+				}
+
+				fmt.println("-- the surface is live at all --")
+				// THE ONE THAT MATTERS. Wyatt, 2026-08-06: "i can't drag,
+				// right-click, etc, copy, anything on the preview". If a plain press
+				// over a preview does not route to Sel_Start, the surface is dead to
+				// everything -- the swallow below consumes the press either way, so
+				// nothing else gets a chance at it.
+				r := press(.Preview, 300, 200)
+				pr_chk(&bad, r.ro && r.action == .Sel_Start, fmt.tprintf("Preview: a plain press starts a selection (ro=%v action=%v)", r.ro, r.action))
+				r = press(.Split, ED + 40, 200)
+				pr_chk(&bad, r.ro && r.action == .Sel_Start, fmt.tprintf("Split: a press RIGHT of the divider starts a selection (ro=%v action=%v)", r.ro, r.action))
+
+				fmt.println("-- and refuses what is not its press --")
+				r = press(.Split, ED - 40, 200)
+				pr_chk(&bad, !r.ro && r.action == .None, fmt.tprintf("Split: a press LEFT of the divider is the editor's (ro=%v action=%v)", r.ro, r.action))
+				r = press(.Off, 300, 200)
+				pr_chk(&bad, !r.ro && r.action == .None, "Off: a press in a plain text document is not the preview's")
+				r = press(.Preview, 300, CT - 10)
+				pr_chk(&bad, !r.ro && r.action == .None, "above CHROME_TOP: the tab strip's, not the preview's")
+				r = press(.Preview, 300, 200, is_text = false)
+				pr_chk(&bad, !r.ro && r.action == .None, "a settings page is not .Text, so nothing routes here")
+
+				fmt.println("-- the modifier and cluster gates --")
+				r = press(.Preview, 300, 200, ctrl = true)
+				pr_chk(&bad, r.ro && r.action == .None, "Ctrl is the link modifier, so it takes no selection")
+				r = press(.Preview, 300, 200, clicks = 2)
+				pr_chk(&bad, r.ro && r.action == .None, "the second press of a cluster belongs to click-to-sync-scroll")
+				r = press(.Preview, 300, 200, clicks = 3)
+				pr_chk(&bad, r.ro && r.action == .None, "...and so does a triple's third")
+
+				fmt.println("-- the drag continues across frames --")
+				// The press is over by now (pressed=false) but the button is still
+				// down and a drag is live. This is the case §6bu's bug killed one
+				// surface over: the swallow zeroes mouse_down every frame, so the
+				// extend has to be decided here or the drag dies the frame after it
+				// starts.
+				r = press(.Preview, 400, 300, pressed = false, sel_drag = true)
+				pr_chk(&bad, r.action == .Sel_Extend, fmt.tprintf("a live drag extends on a frame with no fresh press (%v)", r.action))
+				r = press(.Preview, 400, 300, pressed = false, down = false, sel_drag = true)
+				pr_chk(&bad, r.action == .None, "...but not once the button is released")
+				r = press(.Preview, 400, 300, pressed = false, sel_drag = false)
+				pr_chk(&bad, r.action == .None, "...and not without a drag in progress")
+
+				fmt.println("-- every drag latch stands the surface down --")
+				// Each latch owns the pointer across frames, so the read-only swallow
+				// must not consume its events. ro=false is what keeps the drag alive;
+				// the §6bu bug was one missing member of this struct.
+				latches := []struct {
+					what: string,
+					d:    Drag_Latches,
+				} {
+					{"the editor scrollbar", {vscroll = true}},
+					{"the h-scrollbar", {hscroll = true}},
+					{"the preview scrollbar", {preview = true}},
+					{"the split divider", {divider = true}},
+					{"a column resize", {col_resize = true}},
+					{"a dropdown's scrollbar", {menu_scroll = true}},
+				}
+				for l in latches {
+					rl := press(.Preview, 300, 200, d = l.d)
+					pr_chk(&bad, !rl.ro && rl.action == .None, fmt.tprintf("while %s is dragging, the preview stands down", l.what))
+				}
+				// ...and with NOTHING latched it does not, or the six rows above pass
+				// against a routine that always stands down.
+				r = press(.Preview, 300, 200, d = none)
+				pr_chk(&bad, r.ro && r.action == .Sel_Start, "...and with nothing latched it does not")
+
+				fmt.println("-- the grid is read-only too, but has no preview --")
+				r = press(.Off, 300, 200, table = true)
+				pr_chk(&bad, r.ro && r.action == .None, "a table grid swallows its press and starts no selection")
+				return bad
+			}
+			fmt.println("pressroutetest:")
+			return mode_done("pressroutetest", pr_run())
 		}
 
 		if os.args[1] == "mdjointest" {

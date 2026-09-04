@@ -974,8 +974,31 @@ main :: proc() {
 				}
 			}
 		}
-		// The right press is read at exactly one point per frame -- the header branch
-		// above -- and cleared here whether or not it was read. mouse_pressed can rely
+		// THE PREVIEW'S CONTEXT MENU, and it has to be HERE -- above the clear below,
+		// beside the table header's -- because that clear takes the right press
+		// whether or not anything read it. Wyatt, live use 2026-08-06: *"i can't
+		// drag, right-click, etc, copy, anything on the preview"*. The right-click
+		// third of that was never built rather than broken: the header branch above
+		// was the only reader of mouse_right_pressed in the whole frame, and the
+		// preview's press handling sits fifty lines BELOW the clear.
+		//
+		// Gated on the PANE, through md_pane_box, so a right click in the editor half
+		// of a Split still belongs to the editor. The overlay check is the same one
+		// the header branch uses and for the same reason: a menu, the palette or the
+		// history panel is painted over the content, so hit-testing this point
+		// against the preview would read a coordinate in the wrong space.
+		if window.mouse_right_pressed && doc.kind == .Text && doc.md_mode != .Off && !app_content_overlay_active(&app) {
+			if px0, px1, pytop, pybot, pok := md_pane_box(doc, f32(window.width), f32(window.height), app.settings.split_frac); pok {
+				mx, my := f32(window.mouse_x), f32(window.mouse_y)
+				if mx >= px0 && mx < px1 && my >= pytop && my < pybot {
+					menu_open_ctx(&app, preview_menu_items, mx, my, -1)
+				}
+			}
+		}
+
+		// The right press is read at exactly TWO points per frame -- the table
+		// header's branch and the preview's, both above -- and cleared here whether
+		// or not either read it. mouse_pressed can rely
 		// on its consumers to clear it because the caret path below claims every press
 		// that reaches it; a right press has no such terminal consumer, so one that
 		// landed on the canvas, or in a document that is not a grid at all, would still
@@ -1045,7 +1068,16 @@ main :: proc() {
 			// (Wyatt, v0.53.0). The filter dropdown only ever opens over the grid, so
 			// this path was not an edge case for it, it was the only path.
 			drags := Drag_Latches{scrollbar_drag, hscrollbar_drag, md_preview_drag, divider_drag, table_resize_col >= 0, app.menu.scroll_drag}
-			ro := ro_surface_swallows(doc.table, doc.md_mode, f32(window.mouse_x) >= ed_right, drags)
+			// THE DECISION IS press_route's, and nothing below re-derives any part
+			// of it. See its comment for why it was lifted out of this loop.
+			route := press_route(
+				doc.kind == .Text, doc.table, doc.md_mode,
+				f32(window.mouse_y), CHROME_TOP,
+				f32(window.mouse_x), ed_right,
+				window.mouse_pressed, window.mouse_down, plat.key_ctrl_down(),
+				window.mouse_count, doc.md_sel_drag, drags,
+			)
+			ro := route.ro
 			// 9.1's one surviving pixel -> content mapping, wired to the gesture it
 			// exists for: "click-to-sync-scroll, which only needs the nearest
 			// BLOCK". SPLIT only -- it is the mode with both panes on screen, so it
@@ -1084,20 +1116,20 @@ main :: proc() {
 					drags.vscroll, drags.hscroll, drags.preview, drags.divider, drags.col_resize, drags.menu_scroll,
 				)
 			}
-			if ro && f32(window.mouse_x) >= (ed_right if doc.md_mode == .Split else 0) {
-				if window.mouse_pressed && !plat.key_ctrl_down() && window.mouse_count < 2 {
-					if pos, pok := md_preview_pos_at(&gfx, &text, doc, px, f32(window.width), f32(window.height), app.settings.split_frac, f32(window.mouse_x), f32(window.mouse_y)); pok {
-						doc.md_sel_a, doc.md_sel_b = pos, pos
-						doc.md_sel_on, doc.md_sel_drag = true, true
-						// One live selection in the window (Wyatt, 2026-08-02): taking
-						// one here drops the editor's, so Ctrl+C is never ambiguous
-						// about which of two highlights it means.
-						doc.anchor = doc.cursor
-					}
-				} else if doc.md_sel_drag && window.mouse_down {
-					if pos, pok := md_preview_pos_at(&gfx, &text, doc, px, f32(window.width), f32(window.height), app.settings.split_frac, f32(window.mouse_x), f32(window.mouse_y)); pok {
-						doc.md_sel_b = pos
-					}
+			switch route.action {
+			case .None:
+			case .Sel_Start:
+				if pos, pok := md_preview_pos_at(&gfx, &text, doc, px, f32(window.width), f32(window.height), app.settings.split_frac, f32(window.mouse_x), f32(window.mouse_y)); pok {
+					doc.md_sel_a, doc.md_sel_b = pos, pos
+					doc.md_sel_on, doc.md_sel_drag = true, true
+					// One live selection in the window (Wyatt, 2026-08-02): taking
+					// one here drops the editor's, so Ctrl+C is never ambiguous
+					// about which of two highlights it means.
+					doc.anchor = doc.cursor
+				}
+			case .Sel_Extend:
+				if pos, pok := md_preview_pos_at(&gfx, &text, doc, px, f32(window.width), f32(window.height), app.settings.split_frac, f32(window.mouse_x), f32(window.mouse_y)); pok {
+					doc.md_sel_b = pos
 				}
 			}
 			if !window.mouse_down {doc.md_sel_drag = false}
@@ -1848,6 +1880,85 @@ Drag_Latches :: struct {
 ro_surface_swallows :: proc(table: bool, md_mode: Md_Mode, in_preview_half: bool, d: Drag_Latches) -> bool {
 	if d.vscroll || d.hscroll || d.preview || d.divider || d.col_resize || d.menu_scroll {return false}
 	return table || md_mode == .Preview || (md_mode == .Split && in_preview_half)
+}
+
+// What one mouse press over the content area MEANS, before anything acts on it.
+//
+// The preview's own half of the frame loop's press handling, lifted out on
+// 2026-09-03 for the reason HANDOFF §6cz lifted `key_route` out: three preview
+// bugs in a row have hidden in the frame loop, which is the one path this
+// environment cannot execute, and each time the response was another headless
+// test of a procedure the loop calls rather than of the loop's own decision.
+// Instrumenting the fourth (NEWTPAD_PREVIEW_DIAG) does nothing about the fifth.
+//
+// So the DECISION is a pure function of its inputs and `pressroutetest` drives
+// every combination of them. What stays in the loop is the ACTION -- resolving a
+// pixel to an Md_Pos and writing the selection -- because that needs a device and
+// a document, and because md_preview_pos_at is already covered by mdhittest.
+//
+// It takes no ^Document and no ^plat.Window on purpose: every gate is a scalar or
+// a flag, so the whole truth table is reachable without building either.
+Press_Action :: enum u8 {
+	None, // nothing to do; the swallow below may still consume the press
+	Sel_Start, // begin a preview selection at (mx, my)
+	Sel_Extend, // drag it to (mx, my)
+}
+
+Press_Route :: struct {
+	// Does the read-only surface consume this event? Reported rather than acted
+	// on, because the swallow zeroes persistent platform state (see
+	// ro_surface_swallows) and the loop must do that at exactly one point.
+	ro:     bool,
+	action: Press_Action,
+}
+
+press_route :: proc(
+	is_text: bool,
+	table: bool,
+	md_mode: Md_Mode,
+	my, chrome_top: f32,
+	mx, ed_right: f32,
+	pressed, down, ctrl: bool,
+	clicks: int,
+	sel_drag: bool,
+	d: Drag_Latches,
+) -> (
+	r: Press_Route,
+) {
+	// The outer gate: settings and font pages are not `.Text` and have their own
+	// handling far above; the chrome (tabs, menu bar) owns everything above
+	// CHROME_TOP.
+	if !is_text || my < chrome_top {return}
+	r.ro = ro_surface_swallows(table, md_mode, mx >= ed_right, d)
+	// In Split the preview is only the columns right of the divider; in full
+	// Preview it is every column. The grid is read-only across the whole window
+	// and has no preview at all, so its presses route to .None and are simply
+	// swallowed.
+	x_gate := ed_right if md_mode == .Split else 0
+	if !r.ro || mx < x_gate {return}
+	// A TABLE GRID HAS NO PREVIEW, so its press starts no selection -- it is
+	// read-only and simply swallowed.
+	//
+	// The loop used to reach md_preview_pos_at here for a grid press, because `ro`
+	// is true for a table and the x gate is 0 outside Split. That was a NO-OP
+	// rather than a bug: md_pane_box returns ok=false for .Off (its first switch
+	// arm), so the mapping refused every one of those presses. Stating it here
+	// instead of relying on a refusal three calls away is what makes this routine
+	// the decision -- and the truth table below asserts it, which is how the case
+	// was found at all.
+	//
+	// Provably behaviour-preserving, which is the bar for a change made during an
+	// extraction: the removed call could only ever return false.
+	if md_mode == .Off {return}
+	// A SINGLE press only. The second press of a cluster is Split's
+	// click-to-sync-scroll gesture (md_split_click_gate), so double-click-selects-
+	// a-word would be one input meaning two things.
+	if pressed && !ctrl && clicks < 2 {
+		r.action = .Sel_Start
+	} else if sel_drag && down {
+		r.action = .Sel_Extend
+	}
+	return
 }
 
 // Whether a press at (mx, my) is Split's click-to-sync-scroll gesture, and the

@@ -134,6 +134,20 @@ has_sel :: proc(app: ^App) -> bool {
 	return d != nil && doc_has_sel(d)
 }
 
+// Either kind of selection: the editor's, or the PREVIEW's.
+//
+// The two are mutually exclusive by construction -- taking one clears the other,
+// so Ctrl+C is never ambiguous about which highlight it means (Wyatt,
+// 2026-08-02) -- and .Copy already handles both (commands.odin's .Copy arm tries
+// the preview first). `has_sel` alone does not: it asks doc_has_sel, which is the
+// editor's, so a preview menu using it would grey out Copy over a live preview
+// highlight -- the exact case the menu exists for.
+@(private = "file")
+has_sel_any :: proc(app: ^App) -> bool {
+	d := app_active(app)
+	return d != nil && (doc_has_sel(d) || d.md_sel_on)
+}
+
 @(private = "file")
 can_undo :: proc(app: ^App) -> bool {
 	d := app_active(app)
@@ -669,6 +683,27 @@ menus := []Menu {
 // in place) for "Then by", table_sort_drop for "Remove", table_sort_clear for
 // "Clear". Nothing here writes doc.table_sort itself -- every row calls one of
 // those four, which is the only thing allowed to.
+// The markdown preview's context menu (right click anywhere in the pane).
+//
+// Wyatt, live use 2026-08-06: *"i can't drag, right-click, etc, copy, anything
+// on the preview"*. The right-click half of that was not broken, it was never
+// built -- main.odin reads `mouse_right_pressed` and then clears it whether or
+// not anything wanted it, and the only reader was the table header's.
+//
+// Three rows, and deliberately only three. §9.4 says "read-only does not mean
+// inert"; it does not mean a full editor menu, and every row here is something a
+// reader of a rendered document actually does. Copy is the one that matters --
+// the whole complaint is that a selection could be made and not taken anywhere.
+preview_menu_items := []Menu_Item {
+	{cmd = .Copy, enabled = has_sel_any},
+	{cmd = .Select_All, enabled = has_doc},
+	sep,
+	// The way back to the source, from the surface you are looking at. Ctrl+M
+	// already does it and the menu bar already carries it; a reader who has
+	// right-clicked the preview is exactly the person who wants it.
+	{cmd = .Toggle_Preview, enabled = can_md_view},
+}
+
 table_header_menu_items := []Menu_Item {
 	{cmd = .Table_Sort_Asc, enabled = in_table_view},
 	{cmd = .Table_Sort_Desc, enabled = in_table_view},
