@@ -5912,12 +5912,43 @@ md_anchor_from_top :: proc(c: ^Md_Scroll_Ctx, top: int) -> Md_Anchor {
 }
 
 // The other direction of 9.4's sync: the source line the editor should put at
-// its top when the preview is at `a`. A block start is a line start, so this is
-// the block's own byte -- the mapping is by BLOCK, which is the point: mapping
-// by line drifts the moment a heading or a fence changes height.
+// its top when the preview is at `a`.
+//
+// THE MAPPING IS STILL BY BLOCK, AND NOW IT INTERPOLATES INSIDE ONE. Wyatt, live
+// use 2026-09-03: *"the scroll is weird, it's blocky… it should be smooth"*. This
+// returned the block's own first line and threw `a.px` away, so scrolling the
+// preview left the editor STILL until the anchor crossed into the next block and
+// then jumped it a whole paragraph or fence at once. The preview moved smoothly
+// and the pane beside it lurched, which is what "blocky" describes.
+//
+// §9.4's rule survives intact, because it is a rule about IDENTITY: *"scroll sync
+// by block, not by line. Line-based sync drifts the moment a heading or a code
+// fence changes height."* The anchor is still a block -- nothing here counts
+// lines from the top of the document, so nothing can drift -- and the pixels are
+// resolved only WITHIN that block, where the two views describe the same bytes.
+// Recorded as C9 in the gap register: the effect is overruled, the reason is kept.
+//
+// The interpolation is md_anchor_from_frac's, run backwards. That procedure sits
+// directly above and maps a byte to a sub-block pixel by the same proportion; two
+// inverse mappings that disagreed about what "half way through this block" means
+// would put the round trip somewhere other than where it started.
+//
+// A LINE START, not the interpolated byte itself: doc.top is the byte of a
+// visible ROW, so an arbitrary interior byte is not a legal value for it. With
+// wrap on (Split forces it) a logical line start is still a valid visual row
+// start -- the first one of that line -- so this is coarser than per-visual-row
+// and never invalid, which is the right way round for a value the editor's whole
+// coordinate system reads.
 md_anchor_top_byte :: proc(c: ^Md_Scroll_Ctx, a: Md_Anchor) -> int {
 	if c.doc == nil {return 0}
-	return base.pt_line_start(&c.doc.pt, clamp(a.block, 0, c.doc.pt.length))
+	blk := clamp(a.block, 0, c.doc.pt.length)
+	if a.px <= 0 {return base.pt_line_start(&c.doc.pt, blk)}
+	start, next, slot := md_block_at_byte(c, blk)
+	// A zero-height or empty block has no interior to be part way through.
+	if slot <= 0 || next <= start {return base.pt_line_start(&c.doc.pt, blk)}
+	frac := clamp(a.px / slot, 0, 1)
+	target := start + int(frac * f32(next - start))
+	return base.pt_line_start(&c.doc.pt, clamp(target, start, max(start, next - 1)))
 }
 
 // 9.1's one surviving pixel -> content mapping: "click-to-sync-scroll, which

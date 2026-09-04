@@ -31448,6 +31448,63 @@ when NEWTPAD_TESTS {
 				fail = true
 			}
 
+			// --- C9: the sync interpolates INSIDE a block --------------------------
+			//
+			// Wyatt, 2026-09-03: "the scroll is weird, it's blocky… it should be
+			// smooth". md_anchor_top_byte threw the anchor's sub-block pixels away and
+			// returned the block's own first line, so scrolling the preview left the
+			// editor still until the anchor crossed into the next block, then jumped
+			// it a whole paragraph at once.
+			//
+			// THE ASSERTION THAT CANNOT PASS WITH BLOCK QUANTISATION PRESENT: for an
+			// anchor part way down a TALL block, the editor's top line must not be
+			// that block's first line. Comparing content, or comparing against a
+			// hand-computed expected byte, would both be satisfiable by the old
+			// behaviour on a short-enough fixture; "it moved at all, without leaving
+			// the block" is the property itself.
+			{
+				h: Headless_Gpu
+				if !headless_gpu_init(&h, 900, 700, "splittest") {
+					chk("an offscreen device came up, so an anchor could be resolved", false, &fail)
+				} else {
+					defer headless_gpu_destroy(&h)
+					saved_theme, saved_scale := g_theme, UI_SCALE
+					g_theme, UI_SCALE = theme_dark(), 1
+					defer {g_theme, UI_SCALE = saved_theme, saved_scale}
+					// ONE paragraph of many hard-wrapped lines. It joins into a single
+					// tall block, so every line after the first is interior to it --
+					// which is exactly the region the old mapping could not address.
+					sb := strings.builder_make(context.temp_allocator)
+					for i in 0 ..< 60 {fmt.sbprintf(&sb, "line %02d of one long hard wrapped paragraph\n", i)}
+					src := strings.to_string(sb)
+					content := make([]u8, len(src))
+					copy(content, src)
+					sdoc := doc_from_content(content, "sync.md", .UTF8)
+					defer doc_close(&sdoc)
+					defer md_layout_reset(&sdoc)
+					sdoc.md_mode = .Preview
+					if c, cok := md_scroll_ctx(&h.gfx, &h.text, &sdoc, 16, 900, 700, 0.5); cok {
+						first := md_anchor_from_top(&c, 0)
+						_, bnext, bslot := md_block_at_byte(&c, first.block)
+						chk(fmt.tprintf("sync: the fixture's first block is tall and long (%.0fpx, %d bytes)", bslot, bnext - first.block), bslot > 200 && bnext - first.block > 400, &fail)
+						top0 := md_anchor_top_byte(&c, {first.block, 0})
+						mid := md_anchor_top_byte(&c, {first.block, bslot * 0.5})
+						end := md_anchor_top_byte(&c, {first.block, bslot * 0.95})
+						chk(fmt.tprintf("sync: at the block's top the editor is at its first line (%d)", top0), top0 == base.pt_line_start(&sdoc.pt, first.block), &fail)
+						chk(fmt.tprintf("sync: HALF WAY DOWN it is NOT -- the editor moved inside the block (%d vs %d)", mid, top0), mid > top0, &fail)
+						chk(fmt.tprintf("sync: ...and further down it moves further still (%d > %d)", end, mid), end > mid, &fail)
+						// ...while never leaving the block, which is what keeps §9.4's
+						// drift argument intact: the identity is still the block.
+						chk(fmt.tprintf("sync: ...but never past the block's own end (%d < %d)", end, bnext), end < bnext, &fail)
+						// And it is a LINE start, not an arbitrary interior byte --
+						// doc.top's whole coordinate system assumes one.
+						chk(fmt.tprintf("sync: every mapped byte is a line start (%d)", mid), base.pt_line_start(&sdoc.pt, mid) == mid, &fail)
+					} else {
+						chk("sync: a scroll context came up", false, &fail)
+					}
+				}
+			}
+
 			return mode_done_flag("splittest", fail)
 		}
 
