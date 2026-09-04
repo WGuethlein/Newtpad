@@ -85,6 +85,10 @@ Settings :: struct {
 	// (table_detect_headerless). A user whose exports are all headerless answers
 	// once instead of once per file.
 	table_header_mode: Table_Header_Mode,
+	// Where the markdown preview puts its readable column (C7 / W3). Full is the
+	// default and means no column at all -- see Md_Column, and §1.1 of the design
+	// doc for why that is the state matching Obsidian as Wyatt actually runs it.
+	md_column:         Md_Column,
 	// When on, toggling a view updates the defaults above; off turns them into a
 	// pin instead of a running average of what you last did.
 	remember_views:  bool,
@@ -305,6 +309,7 @@ settings_default :: proc() -> Settings {
 		md_default = .Off,
 		table_default = false,
 		table_header_mode = .Auto, // judge each file on its own bytes until told otherwise
+		md_column = .Full, // no readable-width cap; the text fills the pane
 		remember_views = true, // remembering is on by default; the toggle pins it
 		caret_blink = true, // spec §8's 500ms blink; the setting exists to turn it OFF
 		current_line = false, // spec §8: "off by default"
@@ -419,6 +424,14 @@ settings_load :: proc() -> Settings {
 			if n, pok := strconv.parse_int(parts[1]); pok && n >= 0 && n <= int(max(Table_Header_Mode)) {
 				s.table_header_mode = Table_Header_Mode(n)
 			}
+		case "md_column":
+			// Range-checked exactly as table_header_mode above is, and for the same
+			// reason: a value from a hand-edited or newer settings file degrades to
+			// Full rather than becoming an invalid enum that md_content_span's switch
+			// would have to defend against.
+			if n, pok := strconv.parse_int(parts[1]); pok && n >= 0 && n <= int(max(Md_Column)) {
+				s.md_column = Md_Column(n)
+			}
 		case "caret_blink":
 			s.caret_blink = parts[1] == "1"
 		case "current_line":
@@ -466,7 +479,7 @@ settings_serialize :: proc(s: Settings, allocator := context.temp_allocator) -> 
 	if s.split_frac == 0 {s.split_frac = SPLIT_DEFAULT}
 	s.split_frac = clamp(s.split_frac, SPLIT_MIN, SPLIT_MAX)
 	body := fmt.tprintf(
-		"newtpad-settings 1\nrestore_session %d\nshow_menu_bar %d\nwrap_default %d\nfont_size %d\nzoom_pct %d\ntab_width %d\nreflow_col %d\nfont_family %s\nfont_style %d\nui_font_family %s\nlink_style %d\nsplit_frac %.4f\nmd_default %d\ntable_default %d\ntable_header_mode %d\nremember_views %d\ncaret_blink %d\ncurrent_line %d\ngutter %d\npreview_font %s\ntheme_name %s\n",
+		"newtpad-settings 1\nrestore_session %d\nshow_menu_bar %d\nwrap_default %d\nfont_size %d\nzoom_pct %d\ntab_width %d\nreflow_col %d\nfont_family %s\nfont_style %d\nui_font_family %s\nlink_style %d\nsplit_frac %.4f\nmd_default %d\ntable_default %d\ntable_header_mode %d\nmd_column %d\nremember_views %d\ncaret_blink %d\ncurrent_line %d\ngutter %d\npreview_font %s\ntheme_name %s\n",
 		1 if s.restore_session else 0,
 		1 if s.show_menu_bar else 0,
 		1 if s.wrap_default else 0,
@@ -482,6 +495,7 @@ settings_serialize :: proc(s: Settings, allocator := context.temp_allocator) -> 
 		int(s.md_default),
 		1 if s.table_default else 0,
 		int(s.table_header_mode),
+		int(s.md_column),
 		1 if s.remember_views else 0,
 		1 if s.caret_blink else 0,
 		1 if s.current_line else 0,

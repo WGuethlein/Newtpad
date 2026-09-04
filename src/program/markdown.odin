@@ -22,6 +22,7 @@ import "core:strings"
 import "core:unicode/utf8"
 import base "src:base"
 import plat "src:platform"
+import "src:ui"
 
 // Self-test for the pure parsing (block classifiers + inline runs); the rendering
 // itself needs a live eye. Returns the failure count. Driven by `newtpad mdtest`.
@@ -4334,6 +4335,55 @@ md_pane_owns :: proc(doc: ^Document, winw, winh, split_frac, mx: f32) -> bool {
 // SHOULD share an entry. .Left and .Centre at a wide pane produce the same width
 // and different origins -- also the same layout, since an origin cannot change
 // where text wraps, and the origin is not baked into one.
+// THE COLUMN CONTROL'S GEOMETRY -- one producer, read by the draw, the hover and
+// the click (CLAUDE.md's one-layout rule).
+//
+// Four square cells in the pane's top-right corner. Obsidian puts its own
+// in-content controls there, and it is the corner that does not move when the
+// pane's left edge does -- which is exactly what happens in Split as the divider
+// is dragged, and why ui.segmented_layout places from its RIGHT edge.
+//
+// It is drawn only while the pointer is over the pane (see md_column_control_shown)
+// and hit-tested unconditionally. A control that becomes clickable only after a
+// hover has registered loses the first click of every interaction; one that is
+// always painted is chrome over the content, which principle 2 spends the screen
+// on the document instead. Obsidian makes the same trade with its copy button
+// (`pre:not(:hover) > button.copy-code-button { display: none }`).
+MD_COL_CELL_96 :: f32(20)
+MD_COL_GAP_96 :: f32(2)
+MD_COL_INSET_96 :: f32(6) // from the pane's top-right corner
+
+// The four glyphs, in Md_Column order, so `tag` indexes this directly and the
+// mapping from a cell to a state is a cast rather than a switch.
+//
+// BLOCK ELEMENTS, not letters or arrows, because the thing being chosen is WHERE
+// A COLUMN SITS IN A PANE and these draw exactly that: a full-width block, a
+// block against the left edge, a narrow one in the middle, one against the right.
+// The glyph is a picture of the result rather than a label for it, which is what
+// lets four 20px cells say something without a word between them.
+//
+// All four are Block Elements (U+2588, U+258C, U+25AE, U+2590), present in
+// Consolas and Cascadia Mono -- the two faces the chrome ever uses. `≡` for all
+// three alignments was the first draft and made Left, Centre and Right
+// indistinguishable, which is a control that cannot be used without trying it.
+md_column_glyphs := [4]string{"█", "▌", "▮", "▐"}
+
+md_column_control :: proc(m: ^Md_Metrics, text: ^plat.Text, x0, x1, ytop: f32, out: []ui.Button) -> ui.Segmented {
+	um := ui.Metrics {
+		h        = sx(MD_COL_CELL_96),
+		pad      = 0,
+		gap      = 0,
+		label_cw = plat.text_char_width(text, UI_SMALL_PX),
+		chord_cw = plat.text_char_width(text, UI_SMALL_PX),
+		baseline = sx(MD_COL_CELL_96) - sx(6),
+		snap     = true,
+	}
+	// Flush to the same right margin the content uses, so the control lines up
+	// with the text under it rather than with the scrollbar.
+	right := x1 - m.pad
+	return ui.segmented_layout(right, ytop + sx(MD_COL_INSET_96), sx(MD_COL_CELL_96), sx(MD_COL_GAP_96), md_column_glyphs[:], um, out)
+}
+
 md_content_span :: proc(m: ^Md_Metrics, x0, x1: f32) -> (cx, pane: f32) {
 	// THE CONTENT BOX NEVER LEAVES [x0, x1], and that bound is not cosmetic:
 	// md_preview_pos_at refuses any press with `mx < x0` (its own first line), so
@@ -5001,6 +5051,47 @@ markdown_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text,
 	bottom, s = md_pass(gfx, qp, text, doc, px, x0, x1, ytop, ybot, at, nil)
 	if shown != nil {shown^ = s}
 	return
+}
+
+// Is the column control visible? Only while the pointer is inside the pane.
+//
+// The PANE, not the strip. Revealing on the strip alone would mean the control
+// appears only once the pointer is already on top of it, which nobody would ever
+// discover; revealing on the pane is how Obsidian's copy button behaves (its
+// selector is `pre:hover`, the block, not the button).
+md_column_control_shown :: proc(doc: ^Document, winw, winh, split_frac, mx, my: f32) -> bool {
+	if doc == nil || doc.md_mode == .Off {return false}
+	x0, x1, ytop, ybot, ok := md_pane_box(doc, winw, winh, split_frac)
+	if !ok {return false}
+	return mx >= x0 && mx < x1 && my >= ytop && my < ybot
+}
+
+// Draw it. Appearance only -- every coordinate comes from md_column_control, the
+// same call the click reads, so what is painted and what is clickable cannot
+// disagree (CLAUDE.md's one-layout rule).
+md_column_control_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text, doc: ^Document, px, winw, winh, split_frac, mx, my: f32) {
+	if !md_column_control_shown(doc, winw, winh, split_frac, mx, my) {return}
+	x0, x1, ytop, _, ok := md_pane_box(doc, winw, winh, split_frac)
+	if !ok {return}
+	m := md_metrics(text, px)
+	cells: [4]ui.Button
+	seg := md_column_control(&m, text, x0, x1, ytop, cells[:])
+	// A ground under the whole strip, so the glyphs read against the document
+	// rather than on top of whatever line happens to be behind them.
+	r := m.code_radius
+	plat.quads_draw(gfx, qp, []plat.Quad{{pos = {seg.x - sx(3), seg.y - sx(3)}, size = {seg.w + sx(6), seg.h + sx(6)}, color = g_theme[.Bg_Raised], radius = {r, r, r, r}}})
+	for i in 0 ..< seg.n {
+		c := cells[i]
+		on := int(m.column) == i
+		if on {
+			plat.quads_draw(gfx, qp, []plat.Quad{{pos = {c.x, c.y}, size = {c.w, c.h}, color = g_theme[.Accent], radius = {r, r, r, r}}})
+		}
+		// The CURRENT cell reads against its accent fill; the rest are dim until
+		// the pointer is on them, which is the same three-state treatment every
+		// other control in the product uses.
+		col := g_theme[.Bg_Base] if on else (g_theme[.Text_Primary] if ui.button_hit(c, mx, my) else g_theme[.Text_Dim])
+		plat.text_draw(gfx, text, c.label, c.tx, c.ty, UI_SMALL_PX, col)
+	}
 }
 
 // The links the preview would draw, in absolute client coordinates. The same

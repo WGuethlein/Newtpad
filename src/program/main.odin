@@ -213,6 +213,11 @@ main :: proc() {
 	app: App
 	menu_init(&app.menu) // before any frame: the zero value means "File is open"
 	app.settings = settings_load()
+	// The preview's column state is a global for the reason UI_SCALE is -- md_metrics
+	// is the one place a pass samples the world -- so the saved value has to reach it
+	// before any frame builds metrics. Seeded here and written at the one click site;
+	// there is no third assignment, which is what keeps a global honest.
+	g_md_column = app.settings.md_column
 	perf_mark("start: settings_load")
 	// The user keymap overlay, before any frame can resolve a key. A missing or
 	// unreadable keys.txt leaves the defaults in force (keymap.odin).
@@ -1068,6 +1073,34 @@ main :: proc() {
 			// (Wyatt, v0.53.0). The filter dropdown only ever opens over the grid, so
 			// this path was not an edge case for it, it was the only path.
 			drags := Drag_Latches{scrollbar_drag, hscrollbar_drag, md_preview_drag, divider_drag, table_resize_col >= 0, app.menu.scroll_drag}
+			// THE COLUMN CONTROL takes its click first, before the read-only swallow
+			// below eats it. It is hit-tested unconditionally -- md_column_control is
+			// the same producer the draw reads, and the draw's own hover gate is
+			// about VISIBILITY only, so the first click on a control that has just
+			// appeared under the pointer still lands.
+			//
+			// The setting is written and saved here rather than through a command,
+			// because there is no keyboard route to it: it is a four-state control
+			// with no accelerator, and routing it through the command table would
+			// mean four Command_Ids that nothing else can reach.
+			if window.mouse_pressed && !plat.key_ctrl_down() && doc.kind == .Text && doc.md_mode != .Off {
+				if cx0, cx1, cytop, _, cok := md_pane_box(doc, f32(window.width), f32(window.height), app.settings.split_frac); cok {
+					cm := md_metrics(&text, px)
+					ccells: [4]ui.Button
+					cseg := md_column_control(&cm, &text, cx0, cx1, cytop, ccells[:])
+					if i := ui.segmented_cell_at(ccells[:], cseg.n, f32(window.mouse_x), f32(window.mouse_y)); i >= 0 {
+						app.settings.md_column = Md_Column(i)
+						g_md_column = app.settings.md_column
+						settings_save(app.settings)
+						// The layout cache is keyed on the WIDTH the column produces
+						// (md_content_span), so it invalidates itself; nothing to
+						// reset here. See md_content_span's own comment.
+						window.mouse_pressed = false
+						window.mouse_down = false
+					}
+				}
+			}
+
 			// THE DECISION IS press_route's, and nothing below re-derives any part
 			// of it. See its comment for why it was lifted out of this loop.
 			route := press_route(
@@ -2272,6 +2305,9 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 		// two different rectangles.
 		if mx0, mx1, mytop, mybot, mok := md_pane_box(doc, f32(window.width), f32(window.height), rc.app.settings.split_frac); mok {
 			bottom = markdown_draw(gfx, quad_pipe, text, doc, px, mx0, mx1, mytop, mybot, doc.md_top, &shown)
+			// After the content, so it sits over it. Its geometry is
+			// md_column_control's, the same call the click reads.
+			md_column_control_draw(gfx, quad_pipe, text, doc, px, f32(window.width), f32(window.height), rc.app.settings.split_frac, f32(window.mouse_x), f32(window.mouse_y))
 			if plat.key_ctrl_down() || rc.app.settings.link_style != .Hover {
 				md_draw_links(gfx, quad_pipe, md_preview_links(gfx, text, doc, px, f32(window.width), f32(window.height), rc.app.settings.split_frac))
 			}
@@ -2531,6 +2567,7 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 		if mx0, mx1, mytop, mybot, mok := md_pane_box(doc, w, h, rc.app.settings.split_frac); mok {
 			pv_shown: int
 			markdown_draw(gfx, quad_pipe, text, doc, px, mx0, mx1, mytop, mybot, doc.md_top, &pv_shown)
+			md_column_control_draw(gfx, quad_pipe, text, doc, px, f32(window.width), f32(window.height), rc.app.settings.split_frac, f32(window.mouse_x), f32(window.mouse_y))
 			if plat.key_ctrl_down() || rc.app.settings.link_style != .Hover {
 				md_draw_links(gfx, quad_pipe, md_preview_links(gfx, text, doc, px, w, h, rc.app.settings.split_frac))
 			}

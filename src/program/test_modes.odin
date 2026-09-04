@@ -10885,6 +10885,11 @@ when NEWTPAD_TESTS {
 				// confused for one another in the save format's argument order.
 				ui_font_family  = "Cascadia Code",
 				split_frac      = 0.25, // non-zero, non-default, exact in binary float (survives %.4f round-trip)
+				// Same rule again, and it applies to every enum whose default IS its
+				// zero value: .Full is both, so leaving this unset would compare equal
+				// on both sides whether or not the field is written or read at all.
+				// .Centre is neither.
+				md_column       = .Centre,
 				theme_name      = "Light", // non-blank, non-default -- see the blank-normalises check below for ""
 			}
 			settings_save(w)
