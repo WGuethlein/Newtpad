@@ -1723,6 +1723,36 @@ Md_Run :: struct {
 //
 // So: nothing in the preview may multiply S by a ratio at a draw site. It reads
 // a field of this struct, which was rounded when the struct was built.
+// Where the preview's readable column sits in its pane, and whether there is one.
+//
+// FULL IS THE DEFAULT because it is what Obsidian does as Wyatt runs it: his
+// vault's app.json sets `readableLineLength: false`, so the reading view he put
+// beside ours has no 700px column and no centring -- text fills the pane with
+// only the file margins. A default of .Centre would have made our preview
+// narrower than the thing it is supposed to look like, on first launch, for the
+// one person who reported the problem.
+//
+// FULL AND LEFT SHARE AN ORIGIN AND DIFFER IN WIDTH. Full stretches the column to
+// the pane; Left caps it at `measure` and pins it to the left. They are not the
+// same state, and any test that distinguishes them has to compare the WIDTH --
+// comparing origins alone cannot tell them apart.
+//
+// Named Md_Column, not Md_Align: Md_Align is taken, by a table cell's text
+// alignment, and one of the two would have had to be read in context forever.
+Md_Column :: enum u8 {
+	Full, // no readable-width cap: the column IS the pane
+	Left,
+	Centre,
+	Right,
+}
+
+// The preview's column state, sampled by md_metrics the way UI_SCALE and the
+// theme are. A global for the same reason those are: md_metrics is the single
+// point at which a pass samples the world, and threading a setting through every
+// caller of every layout entry point to reach it would be a parameter on a dozen
+// signatures that only one line reads.
+g_md_column: Md_Column = .Full
+
 Md_Metrics :: struct {
 	s:            f32, // the base document size S, as handed in
 	// Sizes, round(k * S). head[0] is unused so head[level] indexes directly.
@@ -1797,7 +1827,10 @@ Md_Metrics :: struct {
 	quote_bar_w:  f32, // 2px -- --blockquote-border-thickness. Was max(sx(2), 2)
 	// spelled at the draw, which is the same number with no name.
 	task_box:     f32, // 14px checkbox (9.2 item 9)
-	pad_left:     f32, // 40px left padding (9.3 measure line)
+	// 20px on EVERY side -- Obsidian's --file-margins (--size-4-5). §9.3's measure
+	// line gave 40px on the left and nothing anywhere else, so the preview's text
+	// sat hard against the top of the pane and against the scrollbar.
+	pad:          f32,
 	// LIST INDENTATION IS S-DERIVED, NOT DPI-DERIVED, and that is a fix rather
 	// than a port. §9.2 item 5 said "24px per list level" and sx(24) scales with
 	// the MONITOR, so a reader who raised the preview font size got the same 24px
@@ -1812,10 +1845,31 @@ Md_Metrics :: struct {
 	// sitting a whole indent step right of the marker, which is what put a
 	// bullet's text almost a tab away from it.
 	list_hang:    f32,
-	// 72ch, where a `ch` is the body face's advance for '0' at body size -- CSS's
-	// own definition, and the only one that makes "72ch" mean a column of 72
-	// characters in a proportional face.
+	// THE READABLE COLUMN WIDTH, when one is asked for: 43.75 S.
+	//
+	// Obsidian's --file-line-width is 700px at its own 16px base, and 700/16 is
+	// 43.75 -- so this is that number expressed as a RATIO rather than as a pixel
+	// constant, which is what keeps it right when the reader changes the preview
+	// font size. A hardcoded 700px would be a narrower column in characters at
+	// every size but 16.
+	//
+	// It replaces §9.3's "72ch". Two reasons, and the second is the real one: 72ch
+	// is 72 advances of `0` in a PROPORTIONAL face, which is not 72 characters of
+	// anything anyone reads; and C7 measures this preview against Obsidian, whose
+	// own answer is this one.
+	//
+	// Whether it BINDS is `column` below. Under .Full it is not consulted at all.
 	measure:      f32,
+	// Where the readable column sits in the pane, and whether there is one.
+	//
+	// .Full is the default and means NO column: the text runs the whole pane, which
+	// is what Wyatt's Obsidian does (his app.json has readableLineLength false) and
+	// so is the thing the preview is being compared against. The other three apply
+	// `measure` and place it.
+	//
+	// It reaches here through a global, the same way ui_scale and the theme do,
+	// because md_metrics is the one place that samples the world for a pass.
+	column:       Md_Column,
 	// Not type at all: the state OUTSIDE this struct that a block's layout also
 	// depends on, sampled ONCE per pass here because this struct is already the
 	// thing md_pass builds once and hands to every block. All three are cache-key
@@ -1926,7 +1980,8 @@ md_metrics :: proc(t: ^plat.Text, s: f32) -> (m: Md_Metrics) {
 	m.quote_inset = sx(24)
 	m.quote_bar_w = sx(2)
 	m.task_box = sx(14)
-	m.pad_left = sx(40)
+	m.pad = sx(20) // --file-margins: var(--size-4-5), all four sides
+	m.column = g_md_column
 	// A `ch` is the body face's advance for '0' -- CSS's own definition, and the
 	// same one m.measure below uses. Read once: text_advance is a cache lookup,
 	// but two call sites for one quantity is the thing the one-producer rule is
@@ -1935,7 +1990,7 @@ md_metrics :: proc(t: ^plat.Text, s: f32) -> (m: Md_Metrics) {
 	m.list_indent = 3 * ch // `ul > li { margin-inline-start: 3ch }`
 	m.list_step = md_scale(s, 2.25) // --indent-unit 0.5625em * --indent-size 4
 	m.list_hang = md_scale(s, 0.80) // .list-bullet's -0.8em
-	m.measure = 72 * ch
+	m.measure = md_scale(s, 43.75) // --file-line-width: 700px at a 16px base
 	m.ui_scale, m.theme, m.faces = UI_SCALE, md_theme_gen(), plat.text_face_gen(t)
 	return
 }
@@ -3503,16 +3558,24 @@ md_layout_build :: proc(
 
 	trimmed := strings.trim_left(e.src, " \t")
 	e.cls = md_classify(e.src, trimmed, in_fence)
-	// §9.3's "measure 72ch max" is a PROSE rule, applied here because this is the
-	// first point that knows what kind of block it is. Tables and fenced code get
-	// the whole pane: neither is continuous prose, and a table punished for extra
-	// columns is what sent this here (see md_content_span).
+	// EVERY KIND WRAPS AT THE PANE IT WAS GIVEN, and that pane is already the
+	// reader's chosen column (md_content_span). There is no per-kind cap here any
+	// more.
+	//
+	// There used to be: §9.3's "measure 72ch max" is a PROSE rule, so this switch
+	// exempted tables and fenced code, because squeezing a four-column table into
+	// 72ch makes every cell wrap MORE, which is the opposite of what a measure is
+	// for (Wyatt, live use 2026-08-05). C7 dissolves the problem rather than
+	// solving it again: under .Full there is no column, so a table gets the whole
+	// pane exactly as that fix intended, and under .Left/.Centre/.Right the reader
+	// asked for a column and everything in it belongs inside it -- which is what a
+	// browser does with a max-width container and what Obsidian does with
+	// `.is-readable-line-width`.
+	//
+	// Keeping the exemption would now be actively wrong: a table would break out of
+	// a column the reader deliberately narrowed, and paint over the scrollbar,
+	// since there is no scissor rect here.
 	measure := pane
-	#partial switch e.cls.kind {
-		case .Table, .Fence_Body, .Fence_Open, .Fence_Close, .Rule:
-		case:
-			measure = max(1, min(pane, m.measure))
-	}
 	e.wrap_w = measure
 
 	// Front matter is a BLOCK, not a pre-loop special case. Its height comes
@@ -4237,30 +4300,71 @@ md_pane_owns :: proc(doc: ^Document, winw, winh, split_frac, mx: f32) -> bool {
 	return mx >= x0 - TEXT_MARGIN_X && mx < x1 + SCROLLBAR_W
 }
 
-// The content origin and the measure inside a pane spanning [x0, x1].
+// THE SINGLE PRODUCER of the preview's content origin and content width, inside a
+// pane spanning [x0, x1]. The draw, the hit-test, the link rects, the scroll
+// context and the selection all read this and nothing re-derives either number.
 //
-// 9.3: "measure 72ch max, left-aligned, 40px left padding". The padding is
-// measured from the PANE's own left edge, which is x0 - TEXT_MARGIN_X (both
-// call sites hand this the margin already added), so the preview gets its 40px
-// without either of them having to know that.
-// Returns the PANE's usable width, not §9.3's 72ch measure.
+// The padding is measured from the PANE's own left edge, which is
+// `x0 - TEXT_MARGIN_X` (both call sites hand this the margin already added), so
+// the preview gets its inset without either of them having to know that.
 //
-// The 72ch cap moved into md_layout_build, where the block's KIND is known,
-// because it is a PROSE rule and does not transfer to everything. Wyatt, live use
-// 2026-08-05, with a four-column table as the evidence: squeezing more columns
-// into a fixed 72ch makes each one narrower, so every cell wraps more -- his
-// screenshot broke `docs/01-specification.md` across two lines mid-filename. A
-// measure exists so the eye can find the next line of continuous prose; a table
-// cell is a short independent phrase and the eye never travels the row. Capping
-// it produced more eye travel, not less, which is the opposite of the rule's
-// purpose.
+// C7 changed both halves of what this returns.
 //
-// This also has to be the LAYOUT CACHE KEY, which is the other reason the cap
-// cannot live here: keyed on the capped value, a table's layout would not
-// invalidate when the pane grew from 100ch to 140ch, because the key never moved.
+// THE WIDTH IS NOW THE COLUMN, NOT THE PANE, and the per-kind 72ch cap that used
+// to live in md_layout_build is gone with it. That cap existed because §9.3's
+// measure was a PROSE rule that could not be applied to tables -- Wyatt, live use
+// 2026-08-05: squeezing a four-column table into 72ch makes every cell wrap more,
+// which is the opposite of what a measure is for. Under .Full there is no cap at
+// all, so a table gets the whole pane exactly as that fix intended; under the
+// other three the reader has ASKED for a column, and a table inside it belongs
+// inside it, which is what a browser does with a max-width container and what
+// Obsidian does with `.is-readable-line-width`.
+//
+// That also disposes of the cache-key hazard the old comment here warned about --
+// "keyed on the capped value, a table's layout would not invalidate when the pane
+// grew from 100ch to 140ch". It could not, because the width the layout USED
+// (capped) was not the width the key HELD (the pane). They are the same number
+// now. Under .Full the column tracks the pane, so growing it moves the key;
+// under a bound column the layout genuinely should not change, because the
+// reader's chosen column did not.
+//
+// So no new cache-key term is needed, and that is worth stating because it looks
+// like one would be: .Full and .Left at a pane narrower than `measure` produce
+// the same origin AND the same width, which means they are the same layout and
+// SHOULD share an entry. .Left and .Centre at a wide pane produce the same width
+// and different origins -- also the same layout, since an origin cannot change
+// where text wraps, and the origin is not baked into one.
 md_content_span :: proc(m: ^Md_Metrics, x0, x1: f32) -> (cx, pane: f32) {
-	cx = max(x0, x0 - TEXT_MARGIN_X + m.pad_left)
-	return cx, max(1, x1 - cx)
+	// THE CONTENT BOX NEVER LEAVES [x0, x1], and that bound is not cosmetic:
+	// md_preview_pos_at refuses any press with `mx < x0` (its own first line), so
+	// content drawn left of x0 is drawn and NOT clickable. §9.3's 40px left padding
+	// hid this -- 40 > TEXT_MARGIN_X's 24, so the origin was always right of x0
+	// anyway. Obsidian's margin is 20px, which is less, and taking it from the
+	// pane's true edge put the first 4px of every line outside the hit region.
+	// The four-state seam check in mdhittest is what caught it.
+	//
+	// So the left margin is `max(x0, pane_edge + pad)` -- 24px here rather than
+	// Obsidian's 20 -- while the right is a true `pad`. Four pixels of asymmetry,
+	// against a hit-test gate that would otherwise have to move for every consumer
+	// of the pane box. If the two ever need to be exactly equal, the gate is the
+	// thing to change, and md_pane_hit (which already widens to `x0 -
+	// TEXT_MARGIN_X`) is the shape to change it to.
+	pane_l := x0 - TEXT_MARGIN_X // the pane's own left edge, inside x0
+	inner_l := max(x0, pane_l + m.pad)
+	inner_r := max(inner_l + 1, x1 - m.pad)
+	avail := inner_r - inner_l
+	column := avail if m.column == .Full else max(1, min(avail, m.measure))
+	slack := max(0, avail - column)
+	off := f32(0)
+	switch m.column {
+	case .Full, .Left:
+	case .Centre:
+		off = slack * 0.5
+	case .Right:
+		off = slack
+	}
+	cx = inner_l + off
+	return cx, column
 }
 
 // UI spec 9.1 item 4: "a scroll offset in PIXELS, not lines".

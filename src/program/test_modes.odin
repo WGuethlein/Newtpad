@@ -12460,8 +12460,8 @@ when NEWTPAD_TESTS {
 					// ...and the 40px padding to its LEFT really is bare canvas, or
 					// "the card starts at cx" would also be satisfied by a card that
 					// starts further left and happens to cover cx.
-					pb, pg, pr, _ := sample(buf, W, int(x0) + 3, int(ytop) + 3)
-					dchk(&bad, !near(g_theme[.Md_Code_Bg], pb, pg, pr, 3), "front matter: the 40px left padding is not part of the card")
+					pb, pg, pr, _ := sample(buf, W, max(0, int(cx) - 4), int(ytop) + 3)
+					dchk(&bad, !near(g_theme[.Md_Code_Bg], pb, pg, pr, 3), "front matter: the left margin is not part of the card")
 
 					// The RULE line ("***") right after the block is a SOLID,
 					// unantialiased-interior quad -- unlike prose, its colour is
@@ -14045,10 +14045,15 @@ when NEWTPAD_TESTS {
 			// same face and size. A probe, not a second producer: if the layout stopped
 			// going through the shaper this would stop agreeing with it.
 			trow := plat.shape_run(&h.gfx, &h.text, "x", m.table, 1e6, md_table_lead(&m), .Doc, context.temp_allocator).line_h
-			// The span IS the pane now (§9.3's cap is per-kind, in md_layout_build), and
-			// the pane must still exceed the prose cap or the table cases below would not
-			// be exercising a table that gets MORE room than a paragraph would.
-			tchk(&bad, abs(measure - (x1 - cx)) < 1.5, fmt.tprintf("pane: md_content_span returns the pane (measure %.0f, pane %.0f)", measure, x1 - cx))
+			// Under .Full -- the default -- there is no readable-width cap, so the
+			// column is the whole pane less one margin at EACH side. That right margin
+			// is the part worth asserting: §9.3 gave the preview a left padding and
+			// nothing else, so its text ran into the scrollbar, and Obsidian's
+			// --file-margins is symmetric.
+			//
+			// The pane must still exceed m.measure or the table cases below would not be
+			// exercising a table that gets more room than a bound column would give it.
+			tchk(&bad, abs(measure - ((x1 - cx) - m.pad)) < 1.5, fmt.tprintf("pane: under .Full the column is the pane less its RIGHT margin too (column %.0f, to the pane edge %.0f, margin %.0f)", measure, x1 - cx, m.pad))
 			tchk(&bad, x1 - cx > m.measure + 100, fmt.tprintf("pane: ...and the pane exceeds the 72ch prose cap, so a table gains by it (%.0f vs %.0f)", x1 - cx, m.measure))
 			tchk(&bad, char_w > 0 && trow > 0, fmt.tprintf("pane: the table face resolves (char_w %.2f, row %.1f)", char_w, trow))
 
@@ -14569,7 +14574,7 @@ when NEWTPAD_TESTS {
 			UI_SCALE = 2
 			m2 := md_metrics(t, 16)
 			mchk(&bad, m1.body == m2.body && m1.head[1] == m2.head[1], "type sizes are multiples of S, not of UI_SCALE")
-			mchk(&bad, m2.fence_pad > m1.fence_pad && m2.pad_left > m1.pad_left && m2.quote_inset > m1.quote_inset, "the fixed-pixel decorations DO scale with the UI")
+			mchk(&bad, m2.fence_pad > m1.fence_pad && m2.pad > m1.pad && m2.quote_inset > m1.quote_inset, "the fixed-pixel decorations DO scale with the UI")
 			// LIST INDENTATION CHANGED SIDES, and that is the fix rather than a
 			// regression. §9.2 item 5 said "24px per list level", so it was sx(24)
 			// and moved with the MONITOR only: a reader who raised the preview font
@@ -15124,8 +15129,12 @@ when NEWTPAD_TESTS {
 			}
 			defer headless_gpu_destroy(&h)
 			saved_theme, saved_scale := g_theme, UI_SCALE
+			// The column state is global for the same reason UI_SCALE is, so it gets
+			// the same save/restore: this proc drives all four states and must not
+			// leave the last one behind for whatever runs next in the mode.
+			saved_column := g_md_column
 			g_theme, UI_SCALE = theme_dark(), 1
-			defer {g_theme, UI_SCALE = saved_theme, saved_scale}
+			defer {g_theme, UI_SCALE = saved_theme, saved_scale;g_md_column = saved_column}
 
 			px_ := f32(20)
 			x0, x1 := f32(40), f32(1340)
@@ -15136,38 +15145,124 @@ when NEWTPAD_TESTS {
 				return doc_from_content(content, name, .UTF8)
 			}
 
-			// --- (1) 9.3's "measure: 72ch max" (M2) ------------------------------
+			// --- (1) C7's readable column, all four states (M2) ------------------
+			//
+			// §9.3's "measure 72ch max, left-aligned" is gone. It is now a reader
+			// CHOICE with four states, defaulting to .Full -- no column at all --
+			// because that is what Wyatt's Obsidian does (his app.json sets
+			// readableLineLength false) and so is the thing our preview is measured
+			// against. .Left/.Centre/.Right apply m.measure (43.75 S, Obsidian's
+			// 700px-at-16px expressed as a ratio) and place it.
+			//
+			// md_content_span is the single producer of BOTH numbers, so every
+			// assertion here is on its output rather than on arithmetic repeated
+			// beside it.
+			g_md_column = .Full
 			m := md_metrics(&h.text, px_)
 			cx, meas := md_content_span(&m, x0, x1)
+			// The precondition. Every claim below distinguishes "column" from "pane",
+			// so the pane has to be comfortably wider than the column or they are the
+			// same number and nothing here can fail.
 			kchk(
 				&bad, x1 - cx > m.measure * 1.25,
-				fmt.tprintf("measure: the fixture pane is genuinely wider than 72ch (%.0fpx of room against a %.0fpx measure)", x1 - cx, m.measure),
+				fmt.tprintf("column: the fixture pane is genuinely wider than the column (%.0fpx of room against %.0fpx)", x1 - cx, m.measure),
 			)
-			// md_content_span returns the PANE. §9.3's 72ch is a PROSE rule and now
-			// lives in md_layout_build, where the kind is known -- a table gets the
-			// whole pane, because capping one made its columns narrower and its cells
-			// wrap MORE, which is the opposite of what a measure is for.
+			// .Full: no cap at all -- the column is everything between the margins,
+			// which is why it is much wider than m.measure on this pane.
+			//
+			// Asserted against m.measure and against the OTHER states' outputs below,
+			// not against a margin formula repeated here. md_content_span is the
+			// single producer of this arithmetic (and it is not symmetric: the left
+			// margin is clamped to x0 because md_preview_pos_at refuses presses left
+			// of it), so a copy of the formula in the test is a second producer that
+			// has to be edited in lockstep -- which is exactly what happened when the
+			// clamp went in.
 			kchk(
-				&bad, abs(meas - (x1 - cx)) < 1.5,
-				fmt.tprintf("measure: ...so md_content_span returns the pane, not the 72ch cap (%.0f, pane %.0f)", meas, x1 - cx),
+				&bad, meas > m.measure * 1.25,
+				fmt.tprintf("column .Full: no cap -- the column is far wider than the readable width (%.0f against %.0f)", meas, m.measure),
 			)
-			// ...and the cap is 72 of the BODY face's '0', CSS's own definition of
-			// `ch` -- not 72 of the editor's monospace cell, which is what a preview
-			// that forgot it went proportional would use.
-			adv := plat.text_advance(nil, &h.text, '0', m.body, .Body)
-			kchk(&bad, abs(m.measure - 72 * adv) < 0.01, fmt.tprintf("measure: 72ch is 72 body-face '0' advances (%.2f vs %.2f)", m.measure, 72 * adv))
-			// The other side: in a NARROW pane the pane binds, or "the cap binds"
-			// above would also be satisfied by a measure that ignores the pane.
-			ncx, nmeas := md_content_span(&m, x0, x0 + 300)
-			kchk(
-				&bad, nmeas == x0 + 300 - ncx && nmeas < m.measure,
-				fmt.tprintf("measure: in a narrow pane the PANE binds instead (%.0f, cap %.0f)", nmeas, m.measure),
-			)
+			// ...and the other three DO cap, at exactly m.measure.
+			for st in ([]Md_Column{.Left, .Centre, .Right}) {
+				g_md_column = st
+				ms := md_metrics(&h.text, px_)
+				_, w := md_content_span(&ms, x0, x1)
+				kchk(&bad, abs(w - ms.measure) < 1.5, fmt.tprintf("column %v: caps at the readable width (%.0f, want %.0f)", st, w, ms.measure))
+			}
+			// WHERE the column sits, and this is the half an origin-only assertion
+			// would miss: .Full and .Left share an origin and differ in WIDTH, while
+			// .Left/.Centre/.Right share a width and differ in ORIGIN. Both terms are
+			// checked, for all four, or two of the states are indistinguishable.
+			{
+				g_md_column = .Full
+				mfu := md_metrics(&h.text, px_)
+				cfu, wfu := md_content_span(&mfu, x0, x1)
+				g_md_column = .Left
+				ml := md_metrics(&h.text, px_)
+				cl, wl := md_content_span(&ml, x0, x1)
+				g_md_column = .Centre
+				mc := md_metrics(&h.text, px_)
+				cc, wc := md_content_span(&mc, x0, x1)
+				g_md_column = .Right
+				mr := md_metrics(&h.text, px_)
+				cr, wr := md_content_span(&mr, x0, x1)
+				kchk(&bad, abs(cfu - cl) < 1.5 && wfu > wl + 1, fmt.tprintf("column: .Full and .Left share an ORIGIN and differ in WIDTH (%.0f/%.0f vs %.0f/%.0f)", cfu, wfu, cl, wl))
+				kchk(&bad, abs(wl - wc) < 1.5 && abs(wc - wr) < 1.5, "column: .Left/.Centre/.Right share a width")
+				kchk(&bad, cl < cc && cc < cr, fmt.tprintf("column: ...and step rightwards in origin (%.0f < %.0f < %.0f)", cl, cc, cr))
+				// Centre really is CENTRED, not merely somewhere in between: its
+				// origin is exactly midway between .Left's and .Right's. Stated in
+				// terms of the producer's own three answers rather than against a
+				// margin formula copied here -- the margins are not symmetric (the
+				// left one is clamped to x0, see md_content_span) and a copy of that
+				// arithmetic in the test is a second producer to keep in step.
+				kchk(
+					&bad, abs(cc - (cl + cr) * 0.5) < 1.5,
+					fmt.tprintf("column .Centre: sits exactly midway between .Left and .Right (%.0f vs %.0f)", cc, (cl + cr) * 0.5),
+				)
+				// .Right ends where .Full ends: both are flush with the right margin,
+				// and .Full's right edge is the only one derived without any slack.
+				kchk(
+					&bad, abs((cr + wr) - (cfu + wfu)) < 1.5,
+					fmt.tprintf("column .Right: ends flush with the right margin, as .Full does (%.0f vs %.0f)", cr + wr, cfu + wfu),
+				)
+			}
+			// In a pane NARROWER than the column, all four collapse to the same
+			// geometry -- the pane binds and there is no slack to place anything in.
+			// Without this, a cap that ignored the pane would satisfy everything
+			// above; and it is the usual case in Split, where the preview half is
+			// narrow.
+			{
+				narrow_cx, narrow_w := f32(0), f32(0)
+				same := true
+				for st, i in ([]Md_Column{.Full, .Left, .Centre, .Right}) {
+					g_md_column = st
+					ms := md_metrics(&h.text, px_)
+					c2, w2 := md_content_span(&ms, x0, x0 + 300)
+					if i == 0 {narrow_cx, narrow_w = c2, w2} else if abs(c2 - narrow_cx) > 0.5 || abs(w2 - narrow_w) > 0.5 {same = false}
+					if w2 >= ms.measure {same = false} // the pane really is the binding one
+				}
+				kchk(&bad, same, fmt.tprintf("column: in a pane narrower than the column all four states agree (origin %.0f, width %.0f)", narrow_cx, narrow_w))
+			}
+			g_md_column = .Full
 
-			// The cap as the draw actually applies it, not as arithmetic: a
-			// paragraph far too long for one line must wrap AT the measure, leaving
-			// the rest of this very wide pane empty. Without the cap the same
-			// paragraph runs to the pane edge, which is ~560px further right.
+			// The column as the DRAW actually applies it, not as arithmetic: a
+			// paragraph far too long for one line must wrap AT the column, leaving
+			// the rest of this very wide pane empty, and must START at the centred
+			// origin rather than at the pane's left margin.
+			//
+			// Under .Centre deliberately. .Full has no column to stop at, and .Left
+			// would be satisfied by a draw that ignored the origin entirely -- only a
+			// centred column puts BOTH edges of the text somewhere the pane's own
+			// edges are not.
+			//
+			// The metrics and origin for this case are LOCAL. The outer `m` and `cx`
+			// belong to the sections below (the theme case samples pixels at an
+			// origin derived from them), and reassigning them here left those
+			// sections looking for a centred column while the draw they inspect ran
+			// under .Full -- five assertions failed for a reason that had nothing to
+			// do with what they test.
+			g_md_column = .Centre
+			mcen := md_metrics(&h.text, px_)
+			cxcen, _ := md_content_span(&mcen, x0, x1)
 			{
 				long := strings.repeat("wrap ", 200, context.temp_allocator)
 				doc := mk(strings.concatenate({long, "\n"}, context.temp_allocator), "measure.md")
@@ -15191,23 +15286,63 @@ when NEWTPAD_TESTS {
 							miny, maxy = min(miny, yy), max(maxy, yy)
 						}
 					}
-					// Bounded against 72 body-face advances computed HERE, not
-					// against md_content_span's own answer: with the cap deleted
-					// `meas` becomes the pane and a bound derived from it moves out
-					// to the pane edge with the ink, passing.
-					cap72 := 72 * adv
+					// Bounded against m.measure computed HERE from the metrics, not
+					// against md_content_span's answer for whatever state is
+					// current: under .Full that answer IS the pane, so a bound
+					// derived from it moves out to the pane edge with the ink and
+					// passes against anything.
 					kchk(
-						&bad, maxx >= 0 && f32(maxx) <= cx + cap72 + 2,
-						fmt.tprintf("measure: the drawn paragraph stops at the 72ch measure (rightmost ink x=%d, 72ch ends at %.0f, pane at %.0f)", maxx, cx + cap72, x1),
+						&bad, maxx >= 0 && f32(maxx) <= cxcen + mcen.measure + 2,
+						fmt.tprintf("column .Centre: the drawn paragraph stops at the column (rightmost ink x=%d, column ends at %.0f, pane at %.0f)", maxx, cxcen + mcen.measure, x1),
 					)
-					// ...and it really did fill the measure and wrap, or the bound
+					// ...and it really did fill the column and wrap, or the bound
 					// above is satisfied by any short line.
-					kchk(&bad, f32(maxx) > cx + cap72 * 0.8, fmt.tprintf("measure: ...having actually filled it (rightmost ink x=%d of %.0f)", maxx, cx + cap72))
+					kchk(&bad, f32(maxx) > cxcen + mcen.measure * 0.8, fmt.tprintf("column .Centre: ...having actually filled it (rightmost ink x=%d of %.0f)", maxx, cxcen + mcen.measure))
 					kchk(
-						&bad, f32(maxy - miny) > line_height(m.body) * 1.5,
-						fmt.tprintf("measure: ...over several wrapped lines (ink spans %dpx, one line is %.0f)", maxy - miny, line_height(m.body)),
+						&bad, f32(maxy - miny) > line_height(mcen.body) * 1.5,
+						fmt.tprintf("column .Centre: ...over several wrapped lines (ink spans %dpx, one line is %.0f)", maxy - miny, line_height(mcen.body)),
 					)
-					_ = minx
+					// The ink starts at the column, not at the pane's left margin --
+					// which is the only thing here that can see CENTRING as opposed
+					// to a narrower left-aligned column.
+					kchk(
+						&bad, minx < W && f32(minx) >= cxcen - 2,
+						fmt.tprintf("column .Centre: ...beginning at the centred origin, not the pane's edge (leftmost ink x=%d, origin %.0f)", minx, cxcen),
+					)
+				}
+			}
+			// THE SAME PARAGRAPH UNDER .Full REACHES THE PANE, which is what makes
+			// the bound above an assertion about the column rather than about the
+			// fixture being short. Under §9.3's old always-on 72ch cap this case
+			// could not have existed.
+			{
+				g_md_column = .Full
+				mfull := md_metrics(&h.text, px_)
+				cxf, wf := md_content_span(&mfull, x0, x1)
+				long := strings.repeat("wrap ", 200, context.temp_allocator)
+				doc := mk(strings.concatenate({long, "\n"}, context.temp_allocator), "full.md")
+				defer doc_close(&doc)
+				bg := g_theme[.Bg_Base]
+				plat.gfx_begin_frame(&h.gfx, bg[0], bg[1], bg[2])
+				markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, x0, x1, ytop, ybot, Md_Anchor{})
+				pix, ok := plat.gfx_readback_bgra(&h.gfx, context.temp_allocator)
+				kchk(&bad, ok, "column .Full: readback")
+				if ok {
+					maxx := -1
+					for yy in int(ytop) ..< int(ybot) {
+						for xx in int(x0) ..< min(W, int(x1)) {
+							i := (yy * W + xx) * 4
+							d :=
+								abs(int(pix[i]) - int(bg[2] * 255)) +
+								abs(int(pix[i + 1]) - int(bg[1] * 255)) +
+								abs(int(pix[i + 2]) - int(bg[0] * 255))
+							if d > 24 {maxx = max(maxx, xx)}
+						}
+					}
+					kchk(
+						&bad, f32(maxx) > cxf + mfull.measure * 1.1,
+						fmt.tprintf("column .Full: the same paragraph runs PAST the readable width (rightmost ink x=%d, column would end at %.0f, pane ends at %.0f)", maxx, cxf + mfull.measure, cxf + wf),
+					)
 				}
 			}
 
@@ -15556,18 +15691,26 @@ when NEWTPAD_TESTS {
 						// end on a non-straddling one asserts nothing. A first draft
 						// swept 2..21 spans and the last three paragraphs came out
 						// identical under both families.
-						// C7 SHRANK INLINE CODE from 0.92 S to 0.80 S, and 19 spans
-						// stopped being enough: at the smaller size the two families'
-						// accumulated advance difference no longer crossed a wrap
-						// boundary, both ceilings came out 21952/52.0, and the
-						// assertion below could not fail. The count is raised rather
-						// than the assertion relaxed -- the fixture's whole job is to
-						// be a document whose layout MOVES under a family change, and
-						// one that does not move asserts nothing about the cache key.
+						// THE COLUMN IS PINNED for this fixture, and that is the fix
+						// for a check that went quiet twice in one batch.
 						//
-						// More spans, not a narrower measure: the measure is about to
-						// become a user setting (W3), and a fixture pinned to a
-						// particular column width would be the next thing to go quiet.
+						// Its job is to be a document whose layout MOVES under a
+						// family change, so it needs the two families' accumulated
+						// advance difference to cross a WRAP boundary. Twice now the
+						// spacing work has stopped it doing that: first when inline
+						// code shrank from 0.92 S to 0.80 S (spans got narrower, so
+						// fewer wraps), then again when .Full removed the readable-width
+						// cap (the pane got much wider, so fewer wraps still). Both
+						// times both ceilings came out identical and the assertion
+						// below could not fail.
+						//
+						// Raising the span count fixed it once and would have to be
+						// raised again every time; binding the column fixes the
+						// CAUSE. .Left gives a fixed 43.75 S of width regardless of
+						// the pane, so the number of wraps is a property of the FACE,
+						// which is the only variable this case is about.
+						g_md_column = .Left
+						defer g_md_column = .Full
 						for i in 0 ..< 60 {
 							fmt.sbprintf(&fb, "line %02d of prose with ", i)
 							for k in 0 ..< 31 {fmt.sbprintf(&fb, "`code_%02d_span` and ", k)}
@@ -16720,13 +16863,11 @@ when NEWTPAD_TESTS {
 				pchk(&bad, box_ok, "indent: the fixture has a preview pane")
 				m := md_metrics(&h.text, px_)
 				cx, meas := md_content_span(&m, x0, x1)
-				// The cap must BIND, or every bound below is the pane's and the
-				// property is untestable on this fixture.
-				// md_content_span returns the PANE now; §9.3's 72ch moved into
-				// md_layout_build, where the block kind is known. Both halves are pinned:
-				// the span is the pane, AND the pane is wide enough for the prose cap to
-				// bind on the blocks below, or their limits would be untestable here.
-				pchk(&bad, abs(meas - (x1 - cx)) < 1.5, fmt.tprintf("indent: md_content_span returns the pane (%.0f of %.0fpx)", meas, x1 - cx))
+				// Under .Full -- the default this mode runs at -- md_content_span's width
+				// is the whole pane less one margin at each side. There is no readable-width
+				// cap to bind, which is what the blocks below want: their indents are
+				// measured against the full column.
+				pchk(&bad, abs(meas - ((x1 - cx) - m.pad)) < 1.5, fmt.tprintf("indent: the column is the pane less its right margin (%.0f of %.0fpx, margin %.0f)", meas, x1 - cx, m.pad))
 				pchk(&bad, x1 - cx > m.measure + sx(100), fmt.tprintf("indent: ...and the pane is wide enough that the prose cap still binds (%.0f vs %.0f)", x1 - cx, m.measure))
 
 				markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, x0, x1, ytop, ybot, Md_Anchor{})
@@ -39499,6 +39640,76 @@ when NEWTPAD_TESTS {
 					// the press is swallowed either way, one that also eats the click.
 					mh_chk(&bad, hits > 0, fmt.tprintf("%v: a press inside the pane resolves a position (%d hit / %d missed)", mode, hits, misses))
 					mh_chk(&bad, misses == 0, fmt.tprintf("%v: EVERY probe down the pane resolves (first miss at +%.0fpx)", mode, first_miss))
+				}
+
+				// THE SEAM, ACROSS ALL FOUR COLUMN STATES (C7 / W3). What is DRAWN
+				// against what is CLICKABLE, at the one place C7 moved: the content
+				// origin. md_content_span is the single producer of it, and the draw,
+				// the link rects and the pixel->position mapping all consume it -- so
+				// this asserts they consume the same answer rather than three
+				// arithmetics that happen to agree under the default.
+				//
+				// A link rect's x IS the block's glyph origin (md_block_origin reads
+				// md_content_span's cx), so markdown_links is the cheapest honest
+				// probe of where the draw put things.
+				//
+				// BOTH terms, for the reason Md_Column's own comment gives: .Full and
+				// .Left share an origin and differ in width, .Left/.Centre/.Right
+				// share a width and differ in origin. An assertion on the origin
+				// alone cannot tell .Full from .Left; one on the width alone cannot
+				// tell .Left from .Right.
+				{
+					saved_col := g_md_column
+					defer g_md_column = saved_col
+					lsrc := "[see](http://seam.example) and a good deal of following prose so the block is not a stub\n"
+					lcontent := make([]u8, len(lsrc))
+					copy(lcontent, transmute([]u8)lsrc)
+					ldoc := doc_from_content(lcontent, "seam.md", .UTF8)
+					defer doc_close(&ldoc)
+					ldoc.md_mode = .Preview
+					lx0, lx1, lytop, lybot, _ := md_pane_box(&ldoc, W, H, 0.5)
+					seen_x, seen_w := [4]f32{}, [4]f32{}
+					for st, i in ([]Md_Column{.Full, .Left, .Centre, .Right}) {
+						g_md_column = st
+						sm := md_metrics(&h.text, px)
+						scx, swidth := md_content_span(&sm, lx0, lx1)
+						seen_x[i], seen_w[i] = scx, swidth
+						hits := markdown_links(&h.gfx, &h.text, &ldoc, px, lx0, lx1, lytop, lybot, Md_Anchor{}, context.temp_allocator)
+						rx, ry, rh, rok := f32(0), f32(0), f32(0), false
+						for hh in hits {
+							if hh.url == "http://seam.example" {rx, ry, rh, rok = hh.rect.pos.x, hh.rect.pos.y, hh.rect.size.y, true}
+						}
+						mh_chk(&bad, rok, fmt.tprintf("%v: the link is placed at all", st))
+						// The link opens the block, so its rect starts AT the origin.
+						mh_chk(
+							&bad, rok && abs(rx - scx) <= 1,
+							fmt.tprintf("%v: what is CLICKABLE starts at md_content_span's origin (rect x %.0f vs origin %.0f)", st, rx, scx),
+						)
+						// ...and a press INSIDE that rect resolves a position, which
+						// is the other side of the seam: the pixel->position mapping
+						// agrees with the rect the draw produced.
+						//
+						// Probed at the rect's own centre, not at (origin, ytop + 8).
+						// That guessed y sits in the pane's top margin above the first
+						// line's glyphs, and the first version of this check failed
+						// for .Full and .Left on exactly that -- a fixture artefact
+						// that looked like a geometry bug. The rect is where the draw
+						// says the text is, so it is the only y worth probing.
+						if rok {
+							_, pok := md_preview_pos_at(&h.gfx, &h.text, &ldoc, px, W, H, 0.5, rx + 2, ry + rh * 0.5)
+							mh_chk(&bad, pok, fmt.tprintf("%v: ...and a press inside that rect resolves a position", st))
+						}
+					}
+					// The four states really are four, or every row above is the same
+					// row four times. This is the non-degeneracy the seam checks need.
+					mh_chk(
+						&bad, abs(seen_x[0] - seen_x[1]) <= 1 && seen_w[0] > seen_w[1] + 1,
+						fmt.tprintf("column: .Full and .Left share an origin, differ in width (%.0f/%.0f vs %.0f/%.0f)", seen_x[0], seen_w[0], seen_x[1], seen_w[1]),
+					)
+					mh_chk(
+						&bad, seen_x[1] < seen_x[2] && seen_x[2] < seen_x[3] && abs(seen_w[1] - seen_w[3]) <= 1,
+						fmt.tprintf("column: .Left/.Centre/.Right share a width, differ in origin (%.0f < %.0f < %.0f, widths %.0f/%.0f)", seen_x[1], seen_x[2], seen_x[3], seen_w[1], seen_w[3]),
+					)
 				}
 
 				// ...and a press outside the pane must NOT resolve, or the preview
