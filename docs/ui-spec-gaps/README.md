@@ -84,7 +84,7 @@ Two more overrules of the spec, from live use on 2026-08-05:
   table made its cells wrap *more*; under Full nothing is capped, and under a chosen column everything
   inside it belongs inside it, so the exemption has nothing left to protect. See `md_content_span`.
 
-## State as of v0.87.0
+## State as of v0.91.0
 
 **21 items shipped across v0.74.0–v0.85.0**, ~24 remain. Highlights:
 

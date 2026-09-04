@@ -1828,9 +1828,17 @@ Md_Metrics :: struct {
 	quote_bar_w:  f32, // 2px -- --blockquote-border-thickness. Was max(sx(2), 2)
 	// spelled at the draw, which is the same number with no name.
 	task_box:     f32, // 14px checkbox (9.2 item 9)
-	// 20px on EVERY side -- Obsidian's --file-margins (--size-4-5). §9.3's measure
-	// line gave 40px on the left and nothing anywhere else, so the preview's text
-	// sat hard against the top of the pane and against the scrollbar.
+	// 20px HORIZONTALLY, both sides -- Obsidian's --file-margins (--size-4-5).
+	// §9.3's measure line gave 40px on the left and nothing on the right, so the
+	// preview's text ran into the scrollbar.
+	//
+	// The vertical margins are NOT this and are not owed: `ytop` comes from
+	// doc_content_box, which already insets by TEXT_MARGIN_Y. This field's first
+	// comment claimed "every side" and gave the top margin as its motivation, which
+	// was wrong twice over -- three readers, all horizontal, and a top inset that
+	// already existed. Fixed after the whole-branch review; CLAUDE.md's standing
+	// complaint is that audits cite comments as though they describe the code, and
+	// this was a fresh instance of exactly that.
 	pad:          f32,
 	// LIST INDENTATION IS S-DERIVED, NOT DPI-DERIVED, and that is a fix rather
 	// than a port. §9.2 item 5 said "24px per list level" and sx(24) scales with
@@ -4362,7 +4370,8 @@ MD_COL_INSET_96 :: f32(6) // from the pane's top-right corner
 // The glyph is a picture of the result rather than a label for it, which is what
 // lets four 20px cells say something without a word between them.
 //
-// All four are Block Elements (U+2588, U+258C, U+25AE, U+2590), present in
+// Three are Block Elements (U+2588, U+258C, U+2590) and U+25AE is Geometric
+// Shapes; all four are present in
 // Consolas and Cascadia Mono -- the two faces the chrome ever uses. `≡` for all
 // three alignments was the first draft and made Left, Centre and Right
 // indistinguishable, which is a control that cannot be used without trying it.
@@ -4551,6 +4560,16 @@ md_sel_range :: proc(doc: ^Document) -> (lo, hi: Md_Pos, ok: bool) {
 	if md_pos_eq(a, b) {return {}, {}, false} // a bare click selects nothing
 	if md_pos_less(b, a) {a, b = b, a}
 	return a, b, true
+}
+
+// Does the preview hold a selection with any WIDTH? `doc.md_sel_on` alone does
+// not answer that: a bare click sets it with both ends equal, which md_sel_range
+// then refuses. Exposed because the context menu has to grey Copy out for exactly
+// that state, and asking md_sel_range for its `ok` is asking the one producer
+// rather than re-deriving the emptiness test beside it.
+md_sel_ok :: proc(doc: ^Document) -> bool {
+	_, _, ok := md_sel_range(doc)
+	return ok
 }
 
 md_sel_clear :: proc(doc: ^Document) {
@@ -4981,7 +5000,9 @@ md_pass :: proc(
 		} else {
 			zebra_tbl = -1 // a non-table block ends the run
 		}
-		if qp != nil {md_block_draw(gfx, qp, text, doc, &m, p.blk.lay, cx, x1, p.y, p.admit, p.blk.start, trow)}
+		// cx + measure, NOT x1: everything md_block_draw stretches rightwards must
+		// stop at the reader's column, not at the pane. See its own comment.
+		if qp != nil {md_block_draw(gfx, qp, text, doc, &m, p.blk.lay, cx, cx + measure, p.y, p.admit, p.blk.start, trow)}
 		if links != nil {md_block_links(doc, p.blk.lay, cx, p.y, p.admit, links)}
 		if sel_at != nil && !sel_at.ok {
 			// First block whose admitted band contains the point wins. `>= p.y` and
@@ -5089,7 +5110,11 @@ md_column_control_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^p
 		// The CURRENT cell reads against its accent fill; the rest are dim until
 		// the pointer is on them, which is the same three-state treatment every
 		// other control in the product uses.
-		col := g_theme[.Bg_Base] if on else (g_theme[.Text_Primary] if ui.button_hit(c, mx, my) else g_theme[.Text_Dim])
+		// Text_MUTED, not Text_Dim. themetest forbids Text_Dim in live text and this
+		// broke that guard -- the role is "DISABLED ONLY" and measures 2.9:1 in Dark,
+		// under the AA floor. An idle cell here is live information, not a disabled
+		// control, so it does not qualify for the one exemption that exists.
+		col := g_theme[.Bg_Base] if on else (g_theme[.Text_Primary] if ui.button_hit(c, mx, my) else g_theme[.Text_Muted])
 		plat.text_draw(gfx, text, c.label, c.tx, c.ty, UI_SMALL_PX, col)
 	}
 }
@@ -6019,10 +6044,19 @@ md_anchor_from_top :: proc(c: ^Md_Scroll_Ctx, top: int) -> Md_Anchor {
 // resolved only WITHIN that block, where the two views describe the same bytes.
 // Recorded as C9 in the gap register: the effect is overruled, the reason is kept.
 //
-// The interpolation is md_anchor_from_frac's, run backwards. That procedure sits
-// directly above and maps a byte to a sub-block pixel by the same proportion; two
-// inverse mappings that disagreed about what "half way through this block" means
-// would put the round trip somewhere other than where it started.
+// The interpolation matches **`md_scroll_to_fraction`** (:5989), which maps the
+// other way — a scalar position to `{block, px}` — by the same proportion of the
+// same `md_block_at_byte` slot. They are deliberately the same arithmetic so the
+// two cannot disagree about what "half way through this block" means.
+//
+// NOT an exact inverse, and the comment here used to claim one under a procedure
+// name (`md_anchor_from_frac`) that does not exist — the whole-branch review
+// caught both. `px` is lossy through the round trip, because this collapses to a
+// LINE start below. That is harmless in the only direction it runs: the sync
+// re-anchors the preview from the editor only when the EDITOR moved, and
+// md_anchor_from_top (the procedure that actually sits directly above) discards
+// `px` outright when it does. A future reader should not look here for an
+// invariant no code provides.
 //
 // A LINE START, not the interpolated byte itself: doc.top is the byte of a
 // visible ROW, so an arbitrary interior byte is not a legal value for it. With
@@ -6159,6 +6193,20 @@ md_block_links :: proc(doc: ^Document, lay: ^Md_Layout, cx, ytop: f32, ad: Md_Ad
 // glyphs and for every rectangle in lay.boxes. A band drawn to lay.h under a
 // partial admit is exactly the overhang the admit test exists to prevent.
 @(private = "file")
+// `x1` here is THE COLUMN'S RIGHT EDGE (cx + the width md_content_span returned),
+// not the pane's. The caller resolves it; everything in this procedure that
+// stretches to "the right" -- the fence bands, the rule, the front-matter card,
+// the table extent clamp and its column rules -- therefore stops where the
+// reader's column stops.
+//
+// It used to be the pane's own x1, which was harmless while the column was always
+// the pane. C7 made the column a choice, and under .Centre at a wide window the
+// difference is 222px: a fenced block's background, a thematic break and a
+// front-matter card all painted a fifth of the pane past the text they belong to,
+// and past the right margin as well. The whole-branch review caught it; the seam
+// assertion that should have caught it compared md_content_span's own output
+// against md_content_span's own output for another state, which is the producer
+// agreeing with itself.
 md_block_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text, doc: ^Document, m: ^Md_Metrics, lay: ^Md_Layout, cx, x1, ytop: f32, ad: Md_Admit, blk_start := -1, trow := -1) {
 	x := md_block_origin(lay, cx)
 	// The selection, UNDER everything this block draws (UI spec §9.4: "Selection

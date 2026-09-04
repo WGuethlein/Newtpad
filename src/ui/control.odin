@@ -255,15 +255,24 @@ segmented_layout :: proc(right, y, size, gap: f32, labels: []string, m: Metrics,
 		h = size,
 		n = n,
 	}
-	if m.snap {
-		s.x, s.y, s.w, s.h = rnd(s.x, true), rnd(s.y, true), rnd(s.w, true), rnd(s.h, true)
-	}
 	for i in 0 ..< n {
-		// From the UNSNAPPED x, then snapped per cell. Accumulating from a snapped
-		// origin would let each cell's rounding compound into the next, so the last
-		// cell of a four-cell strip could sit two pixels from where the strip's own
-		// right edge says it ends.
+		// From the UNSNAPPED x, then snapped per cell by button_square. Accumulating
+		// from a snapped origin would let each cell's rounding compound into the
+		// next, so the last cell of a four-cell strip could sit two pixels from
+		// where the strip's own right edge says it ends.
 		out[i] = button_square(x + f32(i) * (size + gap), y, size, labels[i], m, i)
+	}
+	// THE STRIP'S BOX IS DERIVED FROM ITS CELLS under snap, not rounded on its own.
+	// Rounding the two independently let `s.x + s.w` differ from the last cell's
+	// right edge -- the strip's background quad and the thing it sits behind
+	// disagreeing by a pixel, which is a one-producer routine producing two
+	// answers. Caught by the whole-branch review, which also noted the snapped path
+	// had no test: every case in control_test.odin used a Metrics with snap false
+	// while the product sets it true.
+	if m.snap && n > 0 {
+		s.x = out[0].x
+		s.w = (out[n - 1].x + out[n - 1].w) - s.x
+		s.y, s.h = rnd(s.y, true), rnd(s.h, true)
 	}
 	return
 }

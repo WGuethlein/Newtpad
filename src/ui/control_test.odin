@@ -297,3 +297,27 @@ segmented_truncates_to_the_shorter_of_labels_and_buffer :: proc(t: ^testing.T) {
 	// into a two-cell buffer -- the same contract pack keeps with a short `keep`.
 	testing.expect_value(t, s.n, 2)
 }
+
+@(test)
+segmented_snapped_strip_matches_its_own_cells :: proc(t: ^testing.T) {
+	// THE SNAPPED PATH, which had no test until the whole-branch review said so --
+	// every case above uses seg_m(), whose `snap` is false, while the product sets
+	// it true. The strip's box used to be rounded independently of its cells, so
+	// s.x + s.w could differ from the last cell's right edge by a pixel: the
+	// background quad and the buttons it sits behind disagreeing about where the
+	// control is, out of a routine whose whole job is to be the one producer.
+	m := seg_m()
+	m.snap = true
+	// Fractional inputs on purpose: whole numbers cannot tell a rounded value from
+	// an unrounded one, so an integral fixture would pass against either version.
+	for right in ([]f32{500.4, 500.5, 499.6, 777.3}) {
+		cells: [4]Button
+		s := segmented_layout(right, 100.7, 20.3, 4.2, []string{"a", "b", "c", "d"}, m, cells[:])
+		testing.expectf(t, s.x == cells[0].x, "right=%.1f: the strip starts at its first cell (%.1f vs %.1f)", right, s.x, cells[0].x)
+		last := cells[3].x + cells[3].w
+		testing.expectf(t, s.x + s.w == last, "right=%.1f: and ends at its last (%.1f vs %.1f)", right, s.x + s.w, last)
+		// ...and everything really is on whole pixels, or the equality above is
+		// satisfied by a version that snaps nothing at all.
+		testing.expectf(t, s.x == f32(int(s.x)) && s.w == f32(int(s.w)), "right=%.1f: the strip is pixel-aligned (%.2f, %.2f)", right, s.x, s.w)
+	}
+}

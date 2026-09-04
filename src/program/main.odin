@@ -1083,7 +1083,14 @@ main :: proc() {
 			// because there is no keyboard route to it: it is a four-state control
 			// with no accelerator, and routing it through the command table would
 			// mean four Command_Ids that nothing else can reach.
-			if window.mouse_pressed && !plat.key_ctrl_down() && doc.kind == .Text && doc.md_mode != .Off {
+			//
+			// app_content_overlay_active for the same reason the right-click branch
+			// above carries it: a menu, the palette or the history panel is painted
+			// OVER the content, so hit-testing this point against a control that
+			// lives under them would read a coordinate in the wrong space. In
+			// practice a dropdown's own consume_click covers it, but three call
+			// sites away is not where a guard belongs.
+			if window.mouse_pressed && !plat.key_ctrl_down() && doc.kind == .Text && doc.md_mode != .Off && !app_content_overlay_active(&app) {
 				if cx0, cx1, cytop, _, cok := md_pane_box(doc, f32(window.width), f32(window.height), app.settings.split_frac); cok {
 					cm := md_metrics(&text, px)
 					ccells: [4]ui.Button
@@ -2307,7 +2314,13 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 			bottom = markdown_draw(gfx, quad_pipe, text, doc, px, mx0, mx1, mytop, mybot, doc.md_top, &shown)
 			// After the content, so it sits over it. Its geometry is
 			// md_column_control's, the same call the click reads.
-			md_column_control_draw(gfx, quad_pipe, text, doc, px, f32(window.width), f32(window.height), rc.app.settings.split_frac, f32(window.mouse_x), f32(window.mouse_y))
+			// THE LIVE CURSOR, not window.mouse_x/y. WM_MOUSEMOVE updates those only
+			// while a button is held (window.odin:1009), so a hover driven by them
+			// appears on PRESS and never on hover -- the §6j mistake the grid branch
+			// below records in the same file. Every other hover in the product
+			// (the header, the menu, the palette, the tabs, the history) reads this.
+			chx, chy := plat.window_cursor_client(window)
+			md_column_control_draw(gfx, quad_pipe, text, doc, px, f32(window.width), f32(window.height), rc.app.settings.split_frac, f32(chx), f32(chy))
 			if plat.key_ctrl_down() || rc.app.settings.link_style != .Hover {
 				md_draw_links(gfx, quad_pipe, md_preview_links(gfx, text, doc, px, f32(window.width), f32(window.height), rc.app.settings.split_frac))
 			}
@@ -2567,7 +2580,13 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 		if mx0, mx1, mytop, mybot, mok := md_pane_box(doc, w, h, rc.app.settings.split_frac); mok {
 			pv_shown: int
 			markdown_draw(gfx, quad_pipe, text, doc, px, mx0, mx1, mytop, mybot, doc.md_top, &pv_shown)
-			md_column_control_draw(gfx, quad_pipe, text, doc, px, f32(window.width), f32(window.height), rc.app.settings.split_frac, f32(window.mouse_x), f32(window.mouse_y))
+			// THE LIVE CURSOR, not window.mouse_x/y. WM_MOUSEMOVE updates those only
+			// while a button is held (window.odin:1009), so a hover driven by them
+			// appears on PRESS and never on hover -- the §6j mistake the grid branch
+			// below records in the same file. Every other hover in the product
+			// (the header, the menu, the palette, the tabs, the history) reads this.
+			chx, chy := plat.window_cursor_client(window)
+			md_column_control_draw(gfx, quad_pipe, text, doc, px, f32(window.width), f32(window.height), rc.app.settings.split_frac, f32(chx), f32(chy))
 			if plat.key_ctrl_down() || rc.app.settings.link_style != .Hover {
 				md_draw_links(gfx, quad_pipe, md_preview_links(gfx, text, doc, px, w, h, rc.app.settings.split_frac))
 			}

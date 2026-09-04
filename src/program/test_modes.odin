@@ -12108,8 +12108,20 @@ when NEWTPAD_TESTS {
 					d.md_sel_a, d.md_sel_b = Md_Pos{block = 0, span = 0, off = 0}, Md_Pos{block = 0, span = 0, off = 4}
 					on := copy_row.enabled != nil && copy_row.enabled(&a)
 					d.md_sel_on = false
+					// A BARE CLICK sets md_sel_on with both ends equal, and
+					// md_sel_range refuses that ("a bare click selects nothing"). A
+					// predicate keyed on the FLAG therefore offered Copy after every
+					// click in the preview, and choosing it reached .Copy's failure
+					// branch and said "the selection is too large for the clipboard"
+					// -- the wrong sentence for an empty one. Found by the
+					// whole-branch review.
+					d.md_sel_on = true
+					d.md_sel_a, d.md_sel_b = Md_Pos{block = 0, span = 0, off = 3}, Md_Pos{block = 0, span = 0, off = 3}
+					bare := copy_row.enabled != nil && copy_row.enabled(&a)
+					d.md_sel_on = false
 					pm_chk(&bad, on, "Copy is enabled while a PREVIEW selection is live")
 					pm_chk(&bad, !off, "...and disabled with no selection of either kind, so the row is not simply always on")
+					pm_chk(&bad, !bare, "...and disabled for a BARE CLICK, which sets the flag but selects nothing")
 				} else {
 					pm_chk(&bad, false, "menutest has an active document to hang a selection on")
 				}
@@ -15362,6 +15374,73 @@ when NEWTPAD_TESTS {
 					)
 				}
 			}
+			// A FULL-WIDTH BAND STOPS AT THE COLUMN TOO, and this is the half of the
+			// seam that was missing.
+			//
+			// The checks above measure GLYPH ink, and glyphs stop at the wrap width by
+			// construction -- so they cannot see a background band, a thematic break
+			// or a front-matter card that stretches to the pane instead. And
+			// mdhittest's four-state check compares md_content_span's own return
+			// against md_content_span's own return for another state, which is the
+			// producer agreeing with itself. Between them they left five draws
+			// (markdown.odin's .Rule, .Fence_Open, .Fence_Close, .Fence_Body and the
+			// front-matter card) re-deriving their width from the PANE's right edge,
+			// painting 222px past the reader's column under .Centre. The whole-branch
+			// review found it; this is the assertion that would have.
+			//
+			// A FENCE is the probe because its band is the widest thing the preview
+			// paints and its colour is its own role. Md_Code_Bg is only eight units
+			// off Bg_Base (the register's own warning about quiet values), so the test
+			// is "close to the band AND measurably not the canvas" rather than a bare
+			// distance -- a loose threshold here would call the background the band
+			// and pass everywhere.
+			{
+				g_md_column = .Centre
+				mfen := md_metrics(&h.text, px_)
+				cxf2, wf2 := md_content_span(&mfen, x0, x1)
+				doc := mk("```\ncode\n```\n", "fenceband.md")
+				defer doc_close(&doc)
+				bg := g_theme[.Bg_Base]
+				band := g_theme[.Md_Code_Bg]
+				plat.gfx_begin_frame(&h.gfx, bg[0], bg[1], bg[2])
+				markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, x0, x1, ytop, ybot, Md_Anchor{})
+				pix, ok := plat.gfx_readback_bgra(&h.gfx, context.temp_allocator)
+				kchk(&bad, ok, "column .Centre: fence readback")
+				if ok {
+					near_band :: proc(pix: []u8, W, xx, yy: int, band, bg: [4]f32) -> bool {
+						i := (yy * W + xx) * 4
+						db :=
+							abs(int(pix[i]) - int(band[2] * 255)) +
+							abs(int(pix[i + 1]) - int(band[1] * 255)) +
+							abs(int(pix[i + 2]) - int(band[0] * 255))
+						dg :=
+							abs(int(pix[i]) - int(bg[2] * 255)) +
+							abs(int(pix[i + 1]) - int(bg[1] * 255)) +
+							abs(int(pix[i + 2]) - int(bg[0] * 255))
+						return db <= 6 && dg > 6
+					}
+					bmin, bmax := W, -1
+					for yy in int(ytop) ..< int(ybot) {
+						for xx in int(x0) ..< min(W, int(x1)) {
+							if near_band(pix, W, xx, yy, band, bg) {bmin, bmax = min(bmin, xx), max(bmax, xx)}
+						}
+					}
+					// The precondition: the band is on screen at all, and is wide
+					// enough that "stops at the column" is a real claim rather than
+					// something a one-pixel artefact satisfies.
+					kchk(&bad, bmax - bmin > 100, fmt.tprintf("column .Centre: the fence band is drawn and wide (%d..%d)", bmin, bmax))
+					kchk(
+						&bad, bmax >= 0 && f32(bmax) <= cxf2 + wf2 + 2,
+						fmt.tprintf("column .Centre: the fence BAND stops at the column, not the pane (right edge %d, column ends %.0f, pane at %.0f)", bmax, cxf2 + wf2, x1),
+					)
+					kchk(
+						&bad, bmin >= 0 && f32(bmin) >= cxf2 - 2,
+						fmt.tprintf("column .Centre: ...and starts at it (left edge %d, origin %.0f)", bmin, cxf2),
+					)
+				}
+				g_md_column = .Full
+			}
+
 			// THE SAME PARAGRAPH UNDER .Full REACHES THE PANE, which is what makes
 			// the bound above an assertion about the column rather than about the
 			// fixture being short. Under §9.3's old always-on 72ch cap this case
@@ -15456,7 +15535,7 @@ when NEWTPAD_TESTS {
 				// still serves the assertions below, is that the prose cap binds at
 				// both scales: a paragraph is capped either way, so the indent really
 				// is what moves.
-				kchk(&bad, meas1 > m1.measure && meas2 > m2.measure, fmt.tprintf("ui scale: the prose cap binds at BOTH scales (pane %.0f vs %.0f, %.0f vs %.0f)", meas1, m1.measure, meas2, m2.measure))
+				kchk(&bad, meas1 > m1.measure && meas2 > m2.measure, fmt.tprintf("ui scale: the column is UNCAPPED at both scales, so the inset is what moves (pane %.0f vs %.0f, %.0f vs %.0f)", meas1, m1.measure, meas2, m2.measure))
 				kchk(&bad, m2.quote_inset > m1.quote_inset, fmt.tprintf("ui scale: ...while the quote inset really does move (%.0f -> %.0f)", m1.quote_inset, m2.quote_inset))
 				xa, oka := first_x(h1, "http://ui.example")
 				xb, okb := first_x(h2, "http://ui.example")

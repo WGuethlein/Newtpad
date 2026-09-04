@@ -1576,7 +1576,22 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 		// The preview owns Ctrl+A whenever it is the pane being read. Only one
 		// selection is ever live (doc.md_sel_on), so this is a check rather than a
 		// contest between two highlights.
-		if doc != nil && doc.kind == .Text && doc.md_mode == .Preview {
+		//
+		// IN SPLIT it owns it only when the preview ALREADY holds the selection --
+		// the same precedence .Copy uses two arms below, and for the same reason:
+		// with both panes on screen, the live highlight is the only evidence of
+		// which one the reader is working in. Ctrl+A with the caret in the editor
+		// and nothing selected in the preview still means the editor.
+		//
+		// This is what makes the preview's context menu row (menu.odin's
+		// preview_menu_items) act on the preview in Split, in the flow that
+		// matters: select something, right-click it, Select All to widen. The
+		// residue, stated rather than hidden: a COLD right-click in a Split
+		// preview -- no selection anywhere -- still selects the editor's text.
+		// Fixing that properly needs a pane-focus concept the product does not
+		// have, and a near-duplicate Command_Id for one menu row is the kind of
+		// option principle 3 exists to refuse.
+		if doc != nil && doc.kind == .Text && (doc.md_mode == .Preview || (doc.md_mode == .Split && doc.md_sel_on)) {
 			md_preview_select_all(doc)
 			doc.anchor = doc.cursor // drop the editor's, per the one-selection rule
 		} else {

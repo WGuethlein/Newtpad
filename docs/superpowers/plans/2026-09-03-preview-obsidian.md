@@ -2,7 +2,7 @@
 
 **Spec:** [`../specs/2026-09-03-preview-obsidian-design.md`](../specs/2026-09-03-preview-obsidian-design.md)
 **Scope (Wyatt, 2026-09-03):** W1–W6, W7a, W8. **W7b (easing) is deferred** — see spec §4.1.
-**Branch:** cut `feat/preview-obsidian` from `fix/preview-inert` (which already carries `mdhittest`
+**Branch:** `feat/preview-obsidian`, continuing from `fix/preview-inert` (which already carries `mdhittest`
 and the press diagnostic).
 
 Every number below comes from spec §3, which came from Obsidian's own `app.css`. Every claim about our

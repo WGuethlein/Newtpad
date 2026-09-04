@@ -145,7 +145,15 @@ has_sel :: proc(app: ^App) -> bool {
 @(private = "file")
 has_sel_any :: proc(app: ^App) -> bool {
 	d := app_active(app)
-	return d != nil && (doc_has_sel(d) || d.md_sel_on)
+	if d == nil {return false}
+	if doc_has_sel(d) {return true}
+	// md_sel_ok, NOT the bare md_sel_on flag. A single click in the preview sets
+	// `on` with both ends at the same position, and md_sel_range refuses that ("a
+	// bare click selects nothing") -- so a menu keyed on the flag offered Copy
+	// after every click and then failed with "the selection is too large for the
+	// clipboard", which is the wrong sentence for an empty one. The flag says a
+	// selection EXISTS; this asks whether it has any width.
+	return md_sel_ok(d)
 }
 
 @(private = "file")
@@ -666,23 +674,6 @@ menus := []Menu {
 	},
 }
 
-// The table header's context menu: its contents only. Nothing here opens it --
-// the gesture that does must go through menu_open_ctx, which is the only writer
-// of ctx_col and therefore the only thing that can aim these rows at a column.
-// menu_open_ctx is the OTHER caller of the dropdown machinery `menus` above
-// feeds, and its own
-// comment explains why this has to be a package-level slice rather than
-// something built per-open: a menu survives into the frame after the one that
-// opened it, and main.odin's free_all(context.temp_allocator) runs once every
-// frame, so a temp-allocated table would dangle by the time the next draw or
-// hit-test read it.
-//
-// Six rows, three pairs, matching table.odin's Table_Sort operations one for
-// one: table_sort_set (replace with a single key) for the first two,
-// table_sort_add (compose a tie-breaker, or flip an existing key's direction
-// in place) for "Then by", table_sort_drop for "Remove", table_sort_clear for
-// "Clear". Nothing here writes doc.table_sort itself -- every row calls one of
-// those four, which is the only thing allowed to.
 // The markdown preview's context menu (right click anywhere in the pane).
 //
 // Wyatt, live use 2026-08-06: *"i can't drag, right-click, etc, copy, anything
@@ -704,6 +695,23 @@ preview_menu_items := []Menu_Item {
 	{cmd = .Toggle_Preview, enabled = can_md_view},
 }
 
+// The table header's context menu: its contents only. Nothing here opens it --
+// the gesture that does must go through menu_open_ctx, which is the only writer
+// of ctx_col and therefore the only thing that can aim these rows at a column.
+// menu_open_ctx is the OTHER caller of the dropdown machinery `menus` above
+// feeds, and its own
+// comment explains why this has to be a package-level slice rather than
+// something built per-open: a menu survives into the frame after the one that
+// opened it, and main.odin's free_all(context.temp_allocator) runs once every
+// frame, so a temp-allocated table would dangle by the time the next draw or
+// hit-test read it.
+//
+// Six rows, three pairs, matching table.odin's Table_Sort operations one for
+// one: table_sort_set (replace with a single key) for the first two,
+// table_sort_add (compose a tie-breaker, or flip an existing key's direction
+// in place) for "Then by", table_sort_drop for "Remove", table_sort_clear for
+// "Clear". Nothing here writes doc.table_sort itself -- every row calls one of
+// those four, which is the only thing allowed to.
 table_header_menu_items := []Menu_Item {
 	{cmd = .Table_Sort_Asc, enabled = in_table_view},
 	{cmd = .Table_Sort_Desc, enabled = in_table_view},
