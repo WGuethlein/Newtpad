@@ -42,6 +42,11 @@ diag_init :: proc() {
 	level := base.Log_Level.Info
 	when ODIN_DEBUG {level = .Debug}
 	base.log_init(level)
+	// See diag_preview_press. Read once, so the frame loop's check is a bool
+	// rather than an environment lookup per click.
+	if v, has := os.lookup_env("NEWTPAD_PREVIEW_DIAG", context.temp_allocator); has && v != "0" {
+		DIAG_PREVIEW = true
+	}
 
 	dir, ok := session_dir()
 	if ok {
@@ -149,6 +154,40 @@ diag_assert_fail :: proc(prefix, message: string, loc: runtime.Source_Code_Locat
 diag_cmd :: proc(cmd: Command_Id) {
 	base.log_debug("cmd %v", cmd)
 }
+
+// PRESS-ROUTING DIAGNOSTIC, off unless NEWTPAD_PREVIEW_DIAG is set.
+//
+// Wyatt, live use 2026-08-06: *"i can't drag, right-click, etc, copy, anything on
+// the preview"*. The preview's hit-test and its selection-to-text path both pass
+// headlessly (`mdhittest`, with a real offscreen device), so the defect is in the
+// frame loop's ROUTING of the press -- and the frame loop is the one thing this
+// environment cannot execute (HANDOFF section 7). Three bugs have now hidden
+// there for exactly that reason.
+//
+// So the app reports instead. One line per press over a markdown pane, naming
+// every gate between the press arriving and the selection starting, so the FIRST
+// `false` in the line is the bug. Behind an env var because it writes a line per
+// click and nobody wants that by default.
+diag_preview_press :: proc(
+	mx, my, chrome_top, ed_right, x_gate: f32,
+	mode: Md_Mode,
+	clicks: int,
+	ctrl, outer_gate, ro, x_ok, count_ok, resolved, sel_on: bool,
+	latch_scroll, latch_hscroll, latch_preview, latch_divider, latch_col, latch_menu: bool,
+) {
+	if !DIAG_PREVIEW {return}
+	base.log_info(
+		"press mode=%v at=(%.0f,%.0f) clicks=%d ctrl=%v | outer=%v chrome_top=%.0f | ro=%v latches[v=%v h=%v prev=%v div=%v col=%v menu=%v] | x_ok=%v (x>=%.0f ed_right=%.0f) count_ok=%v | resolved=%v -> sel_on=%v",
+		mode, mx, my, clicks, ctrl,
+		outer_gate, chrome_top,
+		ro, latch_scroll, latch_hscroll, latch_preview, latch_divider, latch_col, latch_menu,
+		x_ok, x_gate, ed_right, count_ok,
+		resolved, sel_on,
+	)
+}
+
+// Set once at startup from the environment.
+DIAG_PREVIEW := false
 
 diag_open :: proc(path: string, size: int, ok: bool) {
 	if ok {

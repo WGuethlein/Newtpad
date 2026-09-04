@@ -3534,7 +3534,17 @@ when NEWTPAD_TESTS {
 
 		sb := strings.builder_make()
 		defer strings.builder_destroy(&sb)
-		for para in 0 ..< 3 {
+		// SIX paragraphs, not three. The descent below is 60 steps of 40 px = 2400 px
+		// and it must still be climbing when it stops, or it clamps at the max anchor
+		// and spends its remaining steps inside one block -- which is exactly what
+		// `seen_blocks >= 3` exists to catch, and what three paragraphs started doing
+		// when C7 cut body leading from 1.65 S to 1.50 S. Three paragraphs came to
+		// ~1650 px, so the ceiling sat inside the SECOND block and the descent saw two.
+		//
+		// The fixture is sized with headroom rather than to just clear the bound: a
+		// fixture that only just fits is one the next spacing change breaks again,
+		// and the bound is not the thing under test.
+		for para in 0 ..< 6 {
 			for i in 0 ..< 40 {fmt.sbprintf(&sb, "paragraph %d line %02d of hard wrapped prose\n", para, i)}
 			strings.write_string(&sb, "\n")
 		}
@@ -10097,6 +10107,31 @@ when NEWTPAD_TESTS {
 				}
 				px := f32(16)
 
+				// 2b. WITH NO PREFERENCE SET, THE PREVIEW RESOLVES SEGOE UI -- the
+				//     SANS, not a serif. Decision C7: the preview is measured against
+				//     Obsidian, whose --font-default resolves to Segoe UI on Windows,
+				//     and §9.3's serif is overruled. Before C7 this order began with
+				//     Georgia and the reorder is the whole of the change, so without
+				//     this assertion the task had no test at all -- every other font
+				//     check here passes identically under either order, because they
+				//     ask whether the face is PROPORTIONAL and both are.
+				//
+				//     Asserted through text_load_body_face's own return value rather
+				//     than by reading BODY_FAMILIES[0].name, which would be the array
+				//     agreeing with itself. This is the resolution the app performs.
+				//
+				//     `body_pref` is cleared first: a settings file naming a face is a
+				//     legitimate override and is NOT what this asserts.
+				{
+					pref := t.body_pref
+					t.body_pref = ""
+					fam, fam_ok := plat.text_load_body_face(&t)
+					fmt.printfln("    body face with no preference: %q (ok=%v)", fam, fam_ok)
+					fnt_chk(bad, fam_ok && fam == "Segoe UI", fmt.tprintf("the preview's default body face is Segoe UI, not a serif (got %q)", fam))
+					t.body_pref = pref
+					plat.text_load_body_face(&t) // put the chain back for the checks below
+				}
+
 				// 3. The styled body chains loaded the BODY family, not the mono
 				//    one. find_family tests FONT_SETS[set].base rather than
 				//    `set == .Body`; with the naive test every styled chain would
@@ -10850,6 +10885,11 @@ when NEWTPAD_TESTS {
 				// confused for one another in the save format's argument order.
 				ui_font_family  = "Cascadia Code",
 				split_frac      = 0.25, // non-zero, non-default, exact in binary float (survives %.4f round-trip)
+				// Same rule again, and it applies to every enum whose default IS its
+				// zero value: .Full is both, so leaving this unset would compare equal
+				// on both sides whether or not the field is written or read at all.
+				// .Centre is neither.
+				md_column       = .Centre,
 				theme_name      = "Light", // non-blank, non-default -- see the blank-normalises check below for ""
 			}
 			settings_save(w)
@@ -12029,6 +12069,64 @@ when NEWTPAD_TESTS {
 				bar_chk(&bad, wide_ok && !narrow_ok, fmt.tprintf("present at 1920 and dropped at 318 (%v / %v) -- else the drop case is untested", wide_ok, narrow_ok))
 			}
 
+			// THE PREVIEW'S CONTEXT MENU (C7 / W6). Wyatt could not right-click the
+			// preview, and the reason was that nothing had been built to receive it.
+			{
+				pm_chk :: proc(bad: ^int, ok: bool, msg: string) {
+					fmt.printfln("  %-72s %s", msg, "OK" if ok else "FAIL")
+					if !ok {bad^ += 1}
+				}
+				// Every row names a real command and carries an `enabled` predicate.
+				// A row with none is a row that offers a command which silently
+				// no-ops, which the Menu_Item comment calls "lying about what it
+				// does".
+				rows, gaps := 0, 0
+				for it in preview_menu_items {
+					if it.cmd == .None {continue} // a separator
+					rows += 1
+					if it.enabled == nil {gaps += 1}
+				}
+				pm_chk(&bad, rows >= 3, fmt.tprintf("the preview menu has rows (%d)", rows))
+				pm_chk(&bad, gaps == 0, fmt.tprintf("...and every one of them says when it is available (%d without)", gaps))
+
+				// COPY IS ENABLED BY A PREVIEW SELECTION, and this is the assertion
+				// the menu was most likely to get wrong. `has_sel` asks doc_has_sel,
+				// which is the EDITOR's selection; a preview highlight leaves it
+				// false, so a menu built on it would grey out Copy in exactly the
+				// situation the menu exists for. The two selections are mutually
+				// exclusive by construction, so this is not a case that can be
+				// covered by the editor's own state.
+				d := app_active(&a)
+				if d != nil {
+					copy_row := preview_menu_items[0]
+					pm_chk(&bad, copy_row.cmd == .Copy, "the first row is Copy")
+					d.md_sel_on = false
+					off := copy_row.enabled != nil && copy_row.enabled(&a)
+					d.md_sel_on = true
+					// A range, not a bare flag: md_sel_range refuses a zero-width
+					// selection, and `on` alone is what a bare click leaves behind.
+					d.md_sel_a, d.md_sel_b = Md_Pos{block = 0, span = 0, off = 0}, Md_Pos{block = 0, span = 0, off = 4}
+					on := copy_row.enabled != nil && copy_row.enabled(&a)
+					d.md_sel_on = false
+					// A BARE CLICK sets md_sel_on with both ends equal, and
+					// md_sel_range refuses that ("a bare click selects nothing"). A
+					// predicate keyed on the FLAG therefore offered Copy after every
+					// click in the preview, and choosing it reached .Copy's failure
+					// branch and said "the selection is too large for the clipboard"
+					// -- the wrong sentence for an empty one. Found by the
+					// whole-branch review.
+					d.md_sel_on = true
+					d.md_sel_a, d.md_sel_b = Md_Pos{block = 0, span = 0, off = 3}, Md_Pos{block = 0, span = 0, off = 3}
+					bare := copy_row.enabled != nil && copy_row.enabled(&a)
+					d.md_sel_on = false
+					pm_chk(&bad, on, "Copy is enabled while a PREVIEW selection is live")
+					pm_chk(&bad, !off, "...and disabled with no selection of either kind, so the row is not simply always on")
+					pm_chk(&bad, !bare, "...and disabled for a BARE CLICK, which sets the flag but selects nothing")
+				} else {
+					pm_chk(&bad, false, "menutest has an active document to hang a selection on")
+				}
+			}
+
 			// Non-zero exit, for the reason keytest grew one: a mode that only ever
 			// prints its verdict is a mode whose verdict a sweep can miss.
 			mode_done("menutest", bad)
@@ -12243,7 +12341,19 @@ when NEWTPAD_TESTS {
 				// A second producer of these positions, yes -- deliberately, and only
 				// in the test: it drives plat.shape_spans directly, so it can disagree
 				// with the layout only if the layout stopped going through the shaper.
-				task_ind := m.task_box + m.list_indent * 0.25
+				// The PROSE indent md_layout_build gives a top-level task item, which
+				// C7 changed: the item's content is the anchor now (Obsidian's 3ch) and
+				// the checkbox hangs to its left, where before the marker sat at the
+				// nesting depth and the prose was pushed a further step right. The old
+				// expression here mirrored that one, and mirroring is what it is: a
+				// second producer of the layout's number, which is why it had to be
+				// edited in lockstep. It stays a mirror only because nothing in this
+				// mode can reach a Md_Layout -- md_layout_ensure needs a walk -- and the
+				// sample window has to be placed before anything is rendered.
+				//
+				// md_list's depth is 0 for a top-level item (`depth /= 2` over the
+				// leading spaces), so level is 0 here and no list_step is added.
+				task_ind := m.list_indent
 				probe_spans := []plat.Shape_Span{
 					{text = "IIII ", px = m.body, set = .Body},
 					{text = "II", px = m.code, set = .Doc},
@@ -12413,8 +12523,8 @@ when NEWTPAD_TESTS {
 					// ...and the 40px padding to its LEFT really is bare canvas, or
 					// "the card starts at cx" would also be satisfied by a card that
 					// starts further left and happens to cover cx.
-					pb, pg, pr, _ := sample(buf, W, int(x0) + 3, int(ytop) + 3)
-					dchk(&bad, !near(g_theme[.Md_Code_Bg], pb, pg, pr, 3), "front matter: the 40px left padding is not part of the card")
+					pb, pg, pr, _ := sample(buf, W, max(0, int(cx) - 4), int(ytop) + 3)
+					dchk(&bad, !near(g_theme[.Md_Code_Bg], pb, pg, pr, 3), "front matter: the left margin is not part of the card")
 
 					// The RULE line ("***") right after the block is a SOLID,
 					// unantialiased-interior quad -- unlike prose, its colour is
@@ -12794,15 +12904,37 @@ when NEWTPAD_TESTS {
 				// body-sized budget is the WRONG budget for this block, which is what
 				// `!=` says. The direction that reproduces the original defect is
 				// covered by the separate check after the loop.
+				//
+				// H6 IS NOW DEGENERATE ON PURPOSE, and that is asserted rather than
+				// skipped. Under C7's Obsidian scale --h6-size is 1em and
+				// --h6-line-height is --line-height-normal, the same 1.5 body prose
+				// gets, so an h6 block is EXACTLY a body block and differs only in
+				// weight (600 against 400 -- and even that collapses to our bold,
+				// spec §3.2). It was non-degenerate before only because body leading
+				// was 1.65 against a heading's 1.5, and that gap was the thing C7
+				// removed. Excluding h6 silently would let head[6] or head_lead[6]
+				// drift unnoticed; asserting the equality is the same check pointed
+				// the other way, and it fails if either moves.
+				//
+				// The leading here is m.head_lead[lvl], not line_height() -- the
+				// comment above says "the same shaper the layout uses" and the layout
+				// stopped using line_height() for headings with C7.
 				cx, measure := md_content_span(&m, x0, x1)
 				_ = cx
-				hh := plat.shape_run(&h.gfx, &h.text, "Hgjpqy", m.head[lvl], measure, line_height(m.head[lvl]), .Body, context.temp_allocator).height
+				hh := plat.shape_run(&h.gfx, &h.text, "Hgjpqy", m.head[lvl], measure, m.head_lead[lvl], .Body, context.temp_allocator).height
 				bh := plat.shape_run(&h.gfx, &h.text, "body", m.body, measure, m.body_lead, .Body, context.temp_allocator).height
 				if hh > bh {taller += 1}
-				hchk(
-					&bad, hh != bh,
-					fmt.tprintf("h%d: fixture is non-degenerate -- its block is %.0fpx against a body block's %.0f", lvl, hh, bh),
-				)
+				if lvl == 6 {
+					hchk(
+						&bad, hh == bh,
+						fmt.tprintf("h6 is EXACTLY a body block by design (1em, --line-height-normal): %.0fpx against %.0f", hh, bh),
+					)
+				} else {
+					hchk(
+						&bad, hh != bh,
+						fmt.tprintf("h%d: fixture is non-degenerate -- its block is %.0fpx against a body block's %.0f", lvl, hh, bh),
+					)
+				}
 
 				// Sweep every ybot across the window where the heading goes from
 				// "admitted" to "not admitted", plus a margin either side. At every
@@ -13976,10 +14108,15 @@ when NEWTPAD_TESTS {
 			// same face and size. A probe, not a second producer: if the layout stopped
 			// going through the shaper this would stop agreeing with it.
 			trow := plat.shape_run(&h.gfx, &h.text, "x", m.table, 1e6, md_table_lead(&m), .Doc, context.temp_allocator).line_h
-			// The span IS the pane now (§9.3's cap is per-kind, in md_layout_build), and
-			// the pane must still exceed the prose cap or the table cases below would not
-			// be exercising a table that gets MORE room than a paragraph would.
-			tchk(&bad, abs(measure - (x1 - cx)) < 1.5, fmt.tprintf("pane: md_content_span returns the pane (measure %.0f, pane %.0f)", measure, x1 - cx))
+			// Under .Full -- the default -- there is no readable-width cap, so the
+			// column is the whole pane less one margin at EACH side. That right margin
+			// is the part worth asserting: §9.3 gave the preview a left padding and
+			// nothing else, so its text ran into the scrollbar, and Obsidian's
+			// --file-margins is symmetric.
+			//
+			// The pane must still exceed m.measure or the table cases below would not be
+			// exercising a table that gets more room than a bound column would give it.
+			tchk(&bad, abs(measure - ((x1 - cx) - m.pad)) < 1.5, fmt.tprintf("pane: under .Full the column is the pane less its RIGHT margin too (column %.0f, to the pane edge %.0f, margin %.0f)", measure, x1 - cx, m.pad))
 			tchk(&bad, x1 - cx > m.measure + 100, fmt.tprintf("pane: ...and the pane exceeds the 72ch prose cap, so a table gains by it (%.0f vs %.0f)", x1 - cx, m.measure))
 			tchk(&bad, char_w > 0 && trow > 0, fmt.tprintf("pane: the table face resolves (char_w %.2f, row %.1f)", char_w, trow))
 
@@ -14398,32 +14535,54 @@ when NEWTPAD_TESTS {
 						want: f32,
 						what: string,
 					} {
-						{m.head[1], r(s, 1.85), "h1 1.85 S"},
-						{m.head[2], r(s, 1.50), "h2 1.50 S"},
-						{m.head[3], r(s, 1.25), "h3 1.25 S"},
-						{m.head[4], r(s, 1.10), "h4 1.10 S"},
-						{m.head[5], r(s, 1.00), "h5 1.00 S"},
-						{m.head[6], r(s, 1.00), "h6 1.00 S"},
+						// OBSIDIAN'S SCALE, not §9.3's -- decision C7. Read from its
+						// own app.css (--h1-size: 1.618em and down), so these are the
+						// ratios the application we are measured against uses, not a
+						// house scale. §9.3's 1.85/1.50/1.25/1.10 was far more
+						// contrasty and is the rejected one.
+						{m.head[1], r(s, 1.618), "h1 1.618 S"},
+						{m.head[2], r(s, 1.462), "h2 1.462 S"},
+						{m.head[3], r(s, 1.318), "h3 1.318 S"},
+						{m.head[4], r(s, 1.188), "h4 1.188 S"},
+						{m.head[5], r(s, 1.076), "h5 1.076 S"},
+						{m.head[6], r(s, 1.000), "h6 1.000 S"},
 						{m.body, r(s, 1.00), "paragraph 1.00 S"},
-						{m.code, r(s, 0.92), "code 0.92 S"},
-						{m.table, r(s, 0.95), "table 0.95 S"},
+						{m.code, r(s, 0.80), "code 0.80 S (--font-smallest)"},
+						{m.table, r(s, 1.00), "table 1.00 S (--table-text-size)"},
 						{m.caption, r(s, 0.88), "caption 0.88 S"},
-						{m.body_lead, r(s, 1.65), "body leading 1.65 S"},
-						{m.head_above[2], r(s, 1.60), "h2 space above 1.6 S"},
-						{m.head_above[3], r(s, 1.40), "h3 space above 1.4 S"},
-						{m.head_above[4], r(s, 1.20), "h4 space above 1.2 S"},
+						{m.body_lead, r(s, 1.50), "body leading 1.50 S (--line-height-normal)"},
+						// PER-LEVEL heading leading, which §9.3 did not have at all --
+						// every heading used line_height(), the editor grid's flat 1.5.
+						// Derived from m.head, not from S, because Obsidian's
+						// --hN-line-height is a multiple of the HEADING's size.
+						{m.head_lead[1], f32(int(m.head[1] * 1.2 + 0.5)), "h1 leading 1.2"},
+						{m.head_lead[2], f32(int(m.head[2] * 1.2 + 0.5)), "h2 leading 1.2"},
+						{m.head_lead[3], f32(int(m.head[3] * 1.3 + 0.5)), "h3 leading 1.3"},
+						{m.head_lead[4], f32(int(m.head[4] * 1.4 + 0.5)), "h4 leading 1.4"},
+						{m.head_lead[5], f32(int(m.head[5] * 1.5 + 0.5)), "h5 leading 1.5"},
+						{m.head_lead[6], f32(int(m.head[6] * 1.5 + 0.5)), "h6 leading 1.5"},
+						// THE RHYTHM IS FLAT. Obsidian's `h1..h6 { margin-block: 1rem }`
+						// does not vary by level, and the graduated 1.6/1.4/1.2 and
+						// 0.6/0.5/0.4 ladders are gone with §9.3's scale. Every level
+						// is asserted, not just a sample: the whole point is that they
+						// are equal, and a sample cannot see one drifting.
+						{m.head_above[1], r(s, 1.00), "h1 space above 1.0 S"},
+						{m.head_above[2], r(s, 1.00), "h2 space above 1.0 S"},
+						{m.head_above[3], r(s, 1.00), "h3 space above 1.0 S"},
+						{m.head_above[4], r(s, 1.00), "h4 space above 1.0 S"},
 						{m.head_above[5], r(s, 1.00), "h5 space above 1.0 S"},
 						{m.head_above[6], r(s, 1.00), "h6 space above 1.0 S"},
-						{m.head_below[1], r(s, 0.60), "h1 space below 0.6 S"},
-						{m.head_below[2], r(s, 0.50), "h2 space below 0.5 S"},
-						{m.head_below[3], r(s, 0.40), "h3 space below 0.4 S"},
-						{m.head_below[4], r(s, 0.30), "h4 space below 0.3 S"},
-						{m.head_below[5], r(s, 0.30), "h5 space below 0.3 S"},
-						{m.head_below[6], r(s, 0.30), "h6 space below 0.3 S"},
-						{m.para_below, r(s, 0.80), "paragraph space below 0.8 S"},
-						{m.list_gap, r(s, 0.25), "list gap 0.25 S"},
-						{m.quote_above, r(s, 0.80), "blockquote space above 0.8 S"},
-						{m.quote_below, r(s, 0.80), "blockquote space below 0.8 S"},
+						{m.head_below[1], r(s, 1.00), "h1 space below 1.0 S"},
+						{m.head_below[2], r(s, 1.00), "h2 space below 1.0 S"},
+						{m.head_below[3], r(s, 1.00), "h3 space below 1.0 S"},
+						{m.head_below[4], r(s, 1.00), "h4 space below 1.0 S"},
+						{m.head_below[5], r(s, 1.00), "h5 space below 1.0 S"},
+						{m.head_below[6], r(s, 1.00), "h6 space below 1.0 S"},
+						{m.head_pair, r(s, 2.50), "heading-after-content 2.50 S (--heading-spacing)"},
+						{m.para_below, r(s, 1.00), "paragraph space below 1.0 S (--p-spacing)"},
+						{m.list_gap, r(s, 0.15), "list gap 0.15 S (--list-spacing, both edges)"},
+						{m.quote_above, r(s, 1.00), "blockquote space above 1.0 S"},
+						{m.quote_below, r(s, 1.00), "blockquote space below 1.0 S"},
 						{m.fence_above, r(s, 1.00), "fenced code space above 1.0 S"},
 						{m.fence_below, r(s, 1.00), "fenced code space below 1.0 S"},
 					}
@@ -14434,10 +14593,23 @@ when NEWTPAD_TESTS {
 							if first == "" {first = fmt.tprintf("%s: got %.3f want %.3f", row.what, row.got, row.want)}
 						}
 					}
-					mchk(&bad, wrong == 0, fmt.tprintf("scale %.1f S=%.0f: every row of 9.3's table is round(k*S) (%d wrong; %s)", scale, s, wrong, first))
-					// 9.3's own "space above / below" column, which is the part of
-					// the table most easily dropped: h1 alone has no space above.
-					mchk(&bad, m.head_above[1] == 0, fmt.tprintf("scale %.1f S=%.0f: h1 has no space above (9.3's `0 /`)", scale, s))
+					mchk(&bad, wrong == 0, fmt.tprintf("scale %.1f S=%.0f: every row of C7's Obsidian table is round(k*S) (%d wrong; %s)", scale, s, wrong, first))
+					// THE RHYTHM IS FLAT, asserted as a PROPERTY rather than as six
+					// more equalities -- the rows above already pin each value, and
+					// this says the thing those values are FOR. §9.3's graduated
+					// ladder passed every individual row and would fail this.
+					//
+					// h1 used to be the exception here ("h1 alone has no space
+					// above", §9.3's `0 /`). That exception moved: it was really
+					// about the document's FIRST BLOCK, whatever kind it is
+					// (Obsidian's `> :first-child { margin-top: 0 }`), and it is now
+					// the walk's rule -- asserted in the pair-rule case below, where
+					// there is a walk to observe it in.
+					flat := true
+					for lvl in 1 ..= 6 {
+						if m.head_above[lvl] != m.head_above[1] || m.head_below[lvl] != m.head_below[1] {flat = false}
+					}
+					mchk(&bad, flat, fmt.tprintf("scale %.1f S=%.0f: every heading level has the SAME space above and below", scale, s))
 
 					// THE hazard. Every size must survive u16 truncation unchanged,
 					// or it shares an atlas entry with the integer below it.
@@ -14453,7 +14625,7 @@ when NEWTPAD_TESTS {
 					// being testable here and the sweep needs a size that exercises
 					// it, not a weaker assertion.
 					if s == 16 {
-						mchk(&bad, m.code == 15 && int(0.92 * s) == 14, fmt.tprintf("S=16: 0.92*S rounds to %.0f, where TRUNCATING it would key %d instead", m.code, int(0.92 * s)))
+						mchk(&bad, m.code == 13 && int(0.80 * s) == 12, fmt.tprintf("S=16: 0.80*S rounds to %.0f, where TRUNCATING it would key %d instead", m.code, int(0.80 * s)))
 					}
 				}
 			}
@@ -14465,7 +14637,19 @@ when NEWTPAD_TESTS {
 			UI_SCALE = 2
 			m2 := md_metrics(t, 16)
 			mchk(&bad, m1.body == m2.body && m1.head[1] == m2.head[1], "type sizes are multiples of S, not of UI_SCALE")
-			mchk(&bad, m2.list_indent > m1.list_indent && m2.fence_pad > m1.fence_pad && m2.pad_left > m1.pad_left, "the fixed-pixel insets (24/12/40px) DO scale with the UI")
+			mchk(&bad, m2.fence_pad > m1.fence_pad && m2.pad > m1.pad && m2.quote_inset > m1.quote_inset, "the fixed-pixel decorations DO scale with the UI")
+			// LIST INDENTATION CHANGED SIDES, and that is the fix rather than a
+			// regression. §9.2 item 5 said "24px per list level", so it was sx(24)
+			// and moved with the MONITOR only: a reader who raised the preview font
+			// size got the same 24px under twice the text. Obsidian denominates it in
+			// text instead -- `3ch` for the first level, 2.25em below it -- so it now
+			// belongs on the S side of this very split, with the type sizes.
+			//
+			// Both halves asserted. "Does not move with UI" alone would pass against
+			// a constant, which is the obvious way to get this wrong.
+			mchk(&bad, m1.list_indent == m2.list_indent && m1.list_step == m2.list_step, "list indentation is TEXT-derived, so UI_SCALE alone does not move it")
+			m3 := md_metrics(t, 32)
+			mchk(&bad, m3.list_indent > m2.list_indent && m3.list_step > m2.list_step && m3.list_hang > m2.list_hang, "...but doubling S does move it, so it is not merely a constant")
 			return
 		}
 
@@ -15008,8 +15192,12 @@ when NEWTPAD_TESTS {
 			}
 			defer headless_gpu_destroy(&h)
 			saved_theme, saved_scale := g_theme, UI_SCALE
+			// The column state is global for the same reason UI_SCALE is, so it gets
+			// the same save/restore: this proc drives all four states and must not
+			// leave the last one behind for whatever runs next in the mode.
+			saved_column := g_md_column
 			g_theme, UI_SCALE = theme_dark(), 1
-			defer {g_theme, UI_SCALE = saved_theme, saved_scale}
+			defer {g_theme, UI_SCALE = saved_theme, saved_scale;g_md_column = saved_column}
 
 			px_ := f32(20)
 			x0, x1 := f32(40), f32(1340)
@@ -15020,38 +15208,124 @@ when NEWTPAD_TESTS {
 				return doc_from_content(content, name, .UTF8)
 			}
 
-			// --- (1) 9.3's "measure: 72ch max" (M2) ------------------------------
+			// --- (1) C7's readable column, all four states (M2) ------------------
+			//
+			// §9.3's "measure 72ch max, left-aligned" is gone. It is now a reader
+			// CHOICE with four states, defaulting to .Full -- no column at all --
+			// because that is what Wyatt's Obsidian does (his app.json sets
+			// readableLineLength false) and so is the thing our preview is measured
+			// against. .Left/.Centre/.Right apply m.measure (43.75 S, Obsidian's
+			// 700px-at-16px expressed as a ratio) and place it.
+			//
+			// md_content_span is the single producer of BOTH numbers, so every
+			// assertion here is on its output rather than on arithmetic repeated
+			// beside it.
+			g_md_column = .Full
 			m := md_metrics(&h.text, px_)
 			cx, meas := md_content_span(&m, x0, x1)
+			// The precondition. Every claim below distinguishes "column" from "pane",
+			// so the pane has to be comfortably wider than the column or they are the
+			// same number and nothing here can fail.
 			kchk(
 				&bad, x1 - cx > m.measure * 1.25,
-				fmt.tprintf("measure: the fixture pane is genuinely wider than 72ch (%.0fpx of room against a %.0fpx measure)", x1 - cx, m.measure),
+				fmt.tprintf("column: the fixture pane is genuinely wider than the column (%.0fpx of room against %.0fpx)", x1 - cx, m.measure),
 			)
-			// md_content_span returns the PANE. §9.3's 72ch is a PROSE rule and now
-			// lives in md_layout_build, where the kind is known -- a table gets the
-			// whole pane, because capping one made its columns narrower and its cells
-			// wrap MORE, which is the opposite of what a measure is for.
+			// .Full: no cap at all -- the column is everything between the margins,
+			// which is why it is much wider than m.measure on this pane.
+			//
+			// Asserted against m.measure and against the OTHER states' outputs below,
+			// not against a margin formula repeated here. md_content_span is the
+			// single producer of this arithmetic (and it is not symmetric: the left
+			// margin is clamped to x0 because md_preview_pos_at refuses presses left
+			// of it), so a copy of the formula in the test is a second producer that
+			// has to be edited in lockstep -- which is exactly what happened when the
+			// clamp went in.
 			kchk(
-				&bad, abs(meas - (x1 - cx)) < 1.5,
-				fmt.tprintf("measure: ...so md_content_span returns the pane, not the 72ch cap (%.0f, pane %.0f)", meas, x1 - cx),
+				&bad, meas > m.measure * 1.25,
+				fmt.tprintf("column .Full: no cap -- the column is far wider than the readable width (%.0f against %.0f)", meas, m.measure),
 			)
-			// ...and the cap is 72 of the BODY face's '0', CSS's own definition of
-			// `ch` -- not 72 of the editor's monospace cell, which is what a preview
-			// that forgot it went proportional would use.
-			adv := plat.text_advance(nil, &h.text, '0', m.body, .Body)
-			kchk(&bad, abs(m.measure - 72 * adv) < 0.01, fmt.tprintf("measure: 72ch is 72 body-face '0' advances (%.2f vs %.2f)", m.measure, 72 * adv))
-			// The other side: in a NARROW pane the pane binds, or "the cap binds"
-			// above would also be satisfied by a measure that ignores the pane.
-			ncx, nmeas := md_content_span(&m, x0, x0 + 300)
-			kchk(
-				&bad, nmeas == x0 + 300 - ncx && nmeas < m.measure,
-				fmt.tprintf("measure: in a narrow pane the PANE binds instead (%.0f, cap %.0f)", nmeas, m.measure),
-			)
+			// ...and the other three DO cap, at exactly m.measure.
+			for st in ([]Md_Column{.Left, .Centre, .Right}) {
+				g_md_column = st
+				ms := md_metrics(&h.text, px_)
+				_, w := md_content_span(&ms, x0, x1)
+				kchk(&bad, abs(w - ms.measure) < 1.5, fmt.tprintf("column %v: caps at the readable width (%.0f, want %.0f)", st, w, ms.measure))
+			}
+			// WHERE the column sits, and this is the half an origin-only assertion
+			// would miss: .Full and .Left share an origin and differ in WIDTH, while
+			// .Left/.Centre/.Right share a width and differ in ORIGIN. Both terms are
+			// checked, for all four, or two of the states are indistinguishable.
+			{
+				g_md_column = .Full
+				mfu := md_metrics(&h.text, px_)
+				cfu, wfu := md_content_span(&mfu, x0, x1)
+				g_md_column = .Left
+				ml := md_metrics(&h.text, px_)
+				cl, wl := md_content_span(&ml, x0, x1)
+				g_md_column = .Centre
+				mc := md_metrics(&h.text, px_)
+				cc, wc := md_content_span(&mc, x0, x1)
+				g_md_column = .Right
+				mr := md_metrics(&h.text, px_)
+				cr, wr := md_content_span(&mr, x0, x1)
+				kchk(&bad, abs(cfu - cl) < 1.5 && wfu > wl + 1, fmt.tprintf("column: .Full and .Left share an ORIGIN and differ in WIDTH (%.0f/%.0f vs %.0f/%.0f)", cfu, wfu, cl, wl))
+				kchk(&bad, abs(wl - wc) < 1.5 && abs(wc - wr) < 1.5, "column: .Left/.Centre/.Right share a width")
+				kchk(&bad, cl < cc && cc < cr, fmt.tprintf("column: ...and step rightwards in origin (%.0f < %.0f < %.0f)", cl, cc, cr))
+				// Centre really is CENTRED, not merely somewhere in between: its
+				// origin is exactly midway between .Left's and .Right's. Stated in
+				// terms of the producer's own three answers rather than against a
+				// margin formula copied here -- the margins are not symmetric (the
+				// left one is clamped to x0, see md_content_span) and a copy of that
+				// arithmetic in the test is a second producer to keep in step.
+				kchk(
+					&bad, abs(cc - (cl + cr) * 0.5) < 1.5,
+					fmt.tprintf("column .Centre: sits exactly midway between .Left and .Right (%.0f vs %.0f)", cc, (cl + cr) * 0.5),
+				)
+				// .Right ends where .Full ends: both are flush with the right margin,
+				// and .Full's right edge is the only one derived without any slack.
+				kchk(
+					&bad, abs((cr + wr) - (cfu + wfu)) < 1.5,
+					fmt.tprintf("column .Right: ends flush with the right margin, as .Full does (%.0f vs %.0f)", cr + wr, cfu + wfu),
+				)
+			}
+			// In a pane NARROWER than the column, all four collapse to the same
+			// geometry -- the pane binds and there is no slack to place anything in.
+			// Without this, a cap that ignored the pane would satisfy everything
+			// above; and it is the usual case in Split, where the preview half is
+			// narrow.
+			{
+				narrow_cx, narrow_w := f32(0), f32(0)
+				same := true
+				for st, i in ([]Md_Column{.Full, .Left, .Centre, .Right}) {
+					g_md_column = st
+					ms := md_metrics(&h.text, px_)
+					c2, w2 := md_content_span(&ms, x0, x0 + 300)
+					if i == 0 {narrow_cx, narrow_w = c2, w2} else if abs(c2 - narrow_cx) > 0.5 || abs(w2 - narrow_w) > 0.5 {same = false}
+					if w2 >= ms.measure {same = false} // the pane really is the binding one
+				}
+				kchk(&bad, same, fmt.tprintf("column: in a pane narrower than the column all four states agree (origin %.0f, width %.0f)", narrow_cx, narrow_w))
+			}
+			g_md_column = .Full
 
-			// The cap as the draw actually applies it, not as arithmetic: a
-			// paragraph far too long for one line must wrap AT the measure, leaving
-			// the rest of this very wide pane empty. Without the cap the same
-			// paragraph runs to the pane edge, which is ~560px further right.
+			// The column as the DRAW actually applies it, not as arithmetic: a
+			// paragraph far too long for one line must wrap AT the column, leaving
+			// the rest of this very wide pane empty, and must START at the centred
+			// origin rather than at the pane's left margin.
+			//
+			// Under .Centre deliberately. .Full has no column to stop at, and .Left
+			// would be satisfied by a draw that ignored the origin entirely -- only a
+			// centred column puts BOTH edges of the text somewhere the pane's own
+			// edges are not.
+			//
+			// The metrics and origin for this case are LOCAL. The outer `m` and `cx`
+			// belong to the sections below (the theme case samples pixels at an
+			// origin derived from them), and reassigning them here left those
+			// sections looking for a centred column while the draw they inspect ran
+			// under .Full -- five assertions failed for a reason that had nothing to
+			// do with what they test.
+			g_md_column = .Centre
+			mcen := md_metrics(&h.text, px_)
+			cxcen, _ := md_content_span(&mcen, x0, x1)
 			{
 				long := strings.repeat("wrap ", 200, context.temp_allocator)
 				doc := mk(strings.concatenate({long, "\n"}, context.temp_allocator), "measure.md")
@@ -15075,34 +15349,155 @@ when NEWTPAD_TESTS {
 							miny, maxy = min(miny, yy), max(maxy, yy)
 						}
 					}
-					// Bounded against 72 body-face advances computed HERE, not
-					// against md_content_span's own answer: with the cap deleted
-					// `meas` becomes the pane and a bound derived from it moves out
-					// to the pane edge with the ink, passing.
-					cap72 := 72 * adv
+					// Bounded against m.measure computed HERE from the metrics, not
+					// against md_content_span's answer for whatever state is
+					// current: under .Full that answer IS the pane, so a bound
+					// derived from it moves out to the pane edge with the ink and
+					// passes against anything.
 					kchk(
-						&bad, maxx >= 0 && f32(maxx) <= cx + cap72 + 2,
-						fmt.tprintf("measure: the drawn paragraph stops at the 72ch measure (rightmost ink x=%d, 72ch ends at %.0f, pane at %.0f)", maxx, cx + cap72, x1),
+						&bad, maxx >= 0 && f32(maxx) <= cxcen + mcen.measure + 2,
+						fmt.tprintf("column .Centre: the drawn paragraph stops at the column (rightmost ink x=%d, column ends at %.0f, pane at %.0f)", maxx, cxcen + mcen.measure, x1),
 					)
-					// ...and it really did fill the measure and wrap, or the bound
+					// ...and it really did fill the column and wrap, or the bound
 					// above is satisfied by any short line.
-					kchk(&bad, f32(maxx) > cx + cap72 * 0.8, fmt.tprintf("measure: ...having actually filled it (rightmost ink x=%d of %.0f)", maxx, cx + cap72))
+					kchk(&bad, f32(maxx) > cxcen + mcen.measure * 0.8, fmt.tprintf("column .Centre: ...having actually filled it (rightmost ink x=%d of %.0f)", maxx, cxcen + mcen.measure))
 					kchk(
-						&bad, f32(maxy - miny) > line_height(m.body) * 1.5,
-						fmt.tprintf("measure: ...over several wrapped lines (ink spans %dpx, one line is %.0f)", maxy - miny, line_height(m.body)),
+						&bad, f32(maxy - miny) > line_height(mcen.body) * 1.5,
+						fmt.tprintf("column .Centre: ...over several wrapped lines (ink spans %dpx, one line is %.0f)", maxy - miny, line_height(mcen.body)),
 					)
-					_ = minx
+					// The ink starts at the column, not at the pane's left margin --
+					// which is the only thing here that can see CENTRING as opposed
+					// to a narrower left-aligned column.
+					kchk(
+						&bad, minx < W && f32(minx) >= cxcen - 2,
+						fmt.tprintf("column .Centre: ...beginning at the centred origin, not the pane's edge (leftmost ink x=%d, origin %.0f)", minx, cxcen),
+					)
+				}
+			}
+			// A FULL-WIDTH BAND STOPS AT THE COLUMN TOO, and this is the half of the
+			// seam that was missing.
+			//
+			// The checks above measure GLYPH ink, and glyphs stop at the wrap width by
+			// construction -- so they cannot see a background band, a thematic break
+			// or a front-matter card that stretches to the pane instead. And
+			// mdhittest's four-state check compares md_content_span's own return
+			// against md_content_span's own return for another state, which is the
+			// producer agreeing with itself. Between them they left five draws
+			// (markdown.odin's .Rule, .Fence_Open, .Fence_Close, .Fence_Body and the
+			// front-matter card) re-deriving their width from the PANE's right edge,
+			// painting 222px past the reader's column under .Centre. The whole-branch
+			// review found it; this is the assertion that would have.
+			//
+			// A FENCE is the probe because its band is the widest thing the preview
+			// paints and its colour is its own role. Md_Code_Bg is only eight units
+			// off Bg_Base (the register's own warning about quiet values), so the test
+			// is "close to the band AND measurably not the canvas" rather than a bare
+			// distance -- a loose threshold here would call the background the band
+			// and pass everywhere.
+			{
+				g_md_column = .Centre
+				mfen := md_metrics(&h.text, px_)
+				cxf2, wf2 := md_content_span(&mfen, x0, x1)
+				doc := mk("```\ncode\n```\n", "fenceband.md")
+				defer doc_close(&doc)
+				bg := g_theme[.Bg_Base]
+				band := g_theme[.Md_Code_Bg]
+				plat.gfx_begin_frame(&h.gfx, bg[0], bg[1], bg[2])
+				markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, x0, x1, ytop, ybot, Md_Anchor{})
+				pix, ok := plat.gfx_readback_bgra(&h.gfx, context.temp_allocator)
+				kchk(&bad, ok, "column .Centre: fence readback")
+				if ok {
+					near_band :: proc(pix: []u8, W, xx, yy: int, band, bg: [4]f32) -> bool {
+						i := (yy * W + xx) * 4
+						db :=
+							abs(int(pix[i]) - int(band[2] * 255)) +
+							abs(int(pix[i + 1]) - int(band[1] * 255)) +
+							abs(int(pix[i + 2]) - int(band[0] * 255))
+						dg :=
+							abs(int(pix[i]) - int(bg[2] * 255)) +
+							abs(int(pix[i + 1]) - int(bg[1] * 255)) +
+							abs(int(pix[i + 2]) - int(bg[0] * 255))
+						return db <= 6 && dg > 6
+					}
+					bmin, bmax := W, -1
+					for yy in int(ytop) ..< int(ybot) {
+						for xx in int(x0) ..< min(W, int(x1)) {
+							if near_band(pix, W, xx, yy, band, bg) {bmin, bmax = min(bmin, xx), max(bmax, xx)}
+						}
+					}
+					// The precondition: the band is on screen at all, and is wide
+					// enough that "stops at the column" is a real claim rather than
+					// something a one-pixel artefact satisfies.
+					kchk(&bad, bmax - bmin > 100, fmt.tprintf("column .Centre: the fence band is drawn and wide (%d..%d)", bmin, bmax))
+					kchk(
+						&bad, bmax >= 0 && f32(bmax) <= cxf2 + wf2 + 2,
+						fmt.tprintf("column .Centre: the fence BAND stops at the column, not the pane (right edge %d, column ends %.0f, pane at %.0f)", bmax, cxf2 + wf2, x1),
+					)
+					kchk(
+						&bad, bmin >= 0 && f32(bmin) >= cxf2 - 2,
+						fmt.tprintf("column .Centre: ...and starts at it (left edge %d, origin %.0f)", bmin, cxf2),
+					)
+				}
+				g_md_column = .Full
+			}
+
+			// THE SAME PARAGRAPH UNDER .Full REACHES THE PANE, which is what makes
+			// the bound above an assertion about the column rather than about the
+			// fixture being short. Under §9.3's old always-on 72ch cap this case
+			// could not have existed.
+			{
+				g_md_column = .Full
+				mfull := md_metrics(&h.text, px_)
+				cxf, wf := md_content_span(&mfull, x0, x1)
+				long := strings.repeat("wrap ", 200, context.temp_allocator)
+				doc := mk(strings.concatenate({long, "\n"}, context.temp_allocator), "full.md")
+				defer doc_close(&doc)
+				bg := g_theme[.Bg_Base]
+				plat.gfx_begin_frame(&h.gfx, bg[0], bg[1], bg[2])
+				markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, x0, x1, ytop, ybot, Md_Anchor{})
+				pix, ok := plat.gfx_readback_bgra(&h.gfx, context.temp_allocator)
+				kchk(&bad, ok, "column .Full: readback")
+				if ok {
+					maxx := -1
+					for yy in int(ytop) ..< int(ybot) {
+						for xx in int(x0) ..< min(W, int(x1)) {
+							i := (yy * W + xx) * 4
+							d :=
+								abs(int(pix[i]) - int(bg[2] * 255)) +
+								abs(int(pix[i + 1]) - int(bg[1] * 255)) +
+								abs(int(pix[i + 2]) - int(bg[0] * 255))
+							if d > 24 {maxx = max(maxx, xx)}
+						}
+					}
+					kchk(
+						&bad, f32(maxx) > cxf + mfull.measure * 1.1,
+						fmt.tprintf("column .Full: the same paragraph runs PAST the readable width (rightmost ink x=%d, column would end at %.0f, pane ends at %.0f)", maxx, cxf + mfull.measure, cxf + wf),
+					)
 				}
 			}
 
 			// --- (2) UI_SCALE is part of the key (H1b) ---------------------------
 			//
-			// `indent` bakes sx()-scaled insets at BUILD time (a list's 24px per
-			// level, a quote's 16px, a fenced block's 12px pad). A monitor change
-			// with no window-size change moves every one of them while `measure`,
-			// `px`, `src`, `start`, `end` and `theme` all stay put -- so without
-			// ui_scale in the key every cached block keeps the old DPI's insets and
-			// the preview's left edge is wrong until something else evicts it.
+			// `indent` bakes sx()-scaled insets at BUILD time (a quote's 24px per
+			// level, a fenced block's 16px pad). A monitor change with no
+			// window-size change moves every one of them while `measure`, `px`,
+			// `src`, `start`, `end` and `theme` all stay put -- so without ui_scale
+			// in the key every cached block keeps the old DPI's insets and the
+			// preview's left edge is wrong until something else evicts it.
+			//
+			// THE OBSERVABLE IS A BLOCKQUOTE'S INSET, and it used to be a LIST's.
+			// C7 moved list indentation onto the TEXT -- Obsidian's 3ch and 2.25em
+			// rather than a flat 24px -- so at a fixed S it no longer moves with
+			// UI_SCALE at all, and this case would have kept passing while watching
+			// a quantity that had stopped varying. A quote's inset is still sx(24)
+			// (--size-4-6) and is still baked into `indent`, so this is the same
+			// test with a term that still moves.
+			//
+			// Written down rather than quietly swapped: a cache-key test whose
+			// observable stops varying does not fail, it passes VACUOUSLY, and the
+			// next change to the spacing model should look here first. The
+			// `m2.quote_inset > m1.quote_inset` line below is the guard against
+			// exactly that -- it asserts the observable is still an observable.
 			//
 			// Probed through markdown_links because a link rect's x IS the block's
 			// glyph origin (md_block_origin), which is exactly the quantity `indent`
@@ -15111,7 +15506,7 @@ when NEWTPAD_TESTS {
 				// The label is NOT "x": `- [x]` is GFM task-list syntax, so
 				// `- [x](url)` classifies as a checked task whose content is
 				// "(url) ..." and the link disappears before md_inline sees it.
-				doc := mk("- [see](http://ui.example) item text\n", "ui.md")
+				doc := mk("> [see](http://ui.example) quoted text\n", "ui.md")
 				defer doc_close(&doc)
 				first_x :: proc(hits: []Md_Link_Hit, url: string) -> (x: f32, ok: bool) {
 					for hh in hits {
@@ -15140,14 +15535,14 @@ when NEWTPAD_TESTS {
 				// still serves the assertions below, is that the prose cap binds at
 				// both scales: a paragraph is capped either way, so the indent really
 				// is what moves.
-				kchk(&bad, meas1 > m1.measure && meas2 > m2.measure, fmt.tprintf("ui scale: the prose cap binds at BOTH scales (pane %.0f vs %.0f, %.0f vs %.0f)", meas1, m1.measure, meas2, m2.measure))
-				kchk(&bad, m2.list_indent > m1.list_indent, fmt.tprintf("ui scale: ...while the list indent really does move (%.0f -> %.0f)", m1.list_indent, m2.list_indent))
+				kchk(&bad, meas1 > m1.measure && meas2 > m2.measure, fmt.tprintf("ui scale: the column is UNCAPPED at both scales, so the inset is what moves (pane %.0f vs %.0f, %.0f vs %.0f)", meas1, m1.measure, meas2, m2.measure))
+				kchk(&bad, m2.quote_inset > m1.quote_inset, fmt.tprintf("ui scale: ...while the quote inset really does move (%.0f -> %.0f)", m1.quote_inset, m2.quote_inset))
 				xa, oka := first_x(h1, "http://ui.example")
 				xb, okb := first_x(h2, "http://ui.example")
-				kchk(&bad, oka && okb, fmt.tprintf("ui scale: the list item's link is placed at both scales (%d rects at 100%%, %d at 200%%)", len(h1), len(h2)))
+				kchk(&bad, oka && okb, fmt.tprintf("ui scale: the quote's link is placed at both scales (%d rects at 100%%, %d at 200%%)", len(h1), len(h2)))
 				if oka && okb {
-					kchk(&bad, abs(xa - (cx1 + m1.list_indent)) <= 1, fmt.tprintf("ui scale: at 100%% the item's prose starts at one list indent (%.1f vs %.1f)", xa, cx1 + m1.list_indent))
-					kchk(&bad, abs(xb - (cx2 + m2.list_indent)) <= 1, fmt.tprintf("ui scale: at 200%% it starts at the SCALED indent, not the cached one (%.1f vs %.1f)", xb, cx2 + m2.list_indent))
+					kchk(&bad, abs(xa - (cx1 + m1.quote_inset)) <= 1, fmt.tprintf("ui scale: at 100%% the quote's prose starts at one quote inset (%.1f vs %.1f)", xa, cx1 + m1.quote_inset))
+					kchk(&bad, abs(xb - (cx2 + m2.quote_inset)) <= 1, fmt.tprintf("ui scale: at 200%% it starts at the SCALED inset, not the cached one (%.1f vs %.1f)", xb, cx2 + m2.quote_inset))
 				}
 			}
 
@@ -15426,9 +15821,29 @@ when NEWTPAD_TESTS {
 						// end on a non-straddling one asserts nothing. A first draft
 						// swept 2..21 spans and the last three paragraphs came out
 						// identical under both families.
+						// THE COLUMN IS PINNED for this fixture, and that is the fix
+						// for a check that went quiet twice in one batch.
+						//
+						// Its job is to be a document whose layout MOVES under a
+						// family change, so it needs the two families' accumulated
+						// advance difference to cross a WRAP boundary. Twice now the
+						// spacing work has stopped it doing that: first when inline
+						// code shrank from 0.92 S to 0.80 S (spans got narrower, so
+						// fewer wraps), then again when .Full removed the readable-width
+						// cap (the pane got much wider, so fewer wraps still). Both
+						// times both ceilings came out identical and the assertion
+						// below could not fail.
+						//
+						// Raising the span count fixed it once and would have to be
+						// raised again every time; binding the column fixes the
+						// CAUSE. .Left gives a fixed 43.75 S of width regardless of
+						// the pane, so the number of wraps is a property of the FACE,
+						// which is the only variable this case is about.
+						g_md_column = .Left
+						defer g_md_column = .Full
 						for i in 0 ..< 60 {
 							fmt.sbprintf(&fb, "line %02d of prose with ", i)
-							for k in 0 ..< 19 {fmt.sbprintf(&fb, "`code_%02d_span` and ", k)}
+							for k in 0 ..< 31 {fmt.sbprintf(&fb, "`code_%02d_span` and ", k)}
 							strings.write_string(&fb, "a tail.\n\n")
 						}
 						fsrc := strings.to_string(fb)
@@ -15546,26 +15961,34 @@ when NEWTPAD_TESTS {
 			fence_h := m.fence_pad * 2 + one_line(&h, "code", m.code, measure - m.fence_pad, line_height(m.code), .Doc)
 
 			Row :: struct {
-				what:   string,
-				src:    string, // the block under test, WITHOUT its trailing newline
-				height: f32,
-				above:  f32,
-				below:  f32,
-				para:   bool, // is this block a bare prose line, which now JOINS?
+				what:    string,
+				src:     string, // the block under test, WITHOUT its trailing newline
+				height:  f32,
+				above:   f32,
+				below:   f32,
+				para:    bool, // is this block a bare prose line, which now JOINS?
+				// Is this a HEADING, so that C7's pair rule applies to it? A heading
+				// following CONTENT takes --heading-spacing (2.5 S) rather than the
+				// 1.0 S it carries on its own; following another heading it does not.
+				// The `above` field stays the block's OWN value and the pair is
+				// resolved in the loop, so the two cases share one row.
+				heading: bool,
 			}
 			rows := []Row {
-				{"paragraph", "block text", body_h, 0, m.para_below, true},
+				{"paragraph", "block text", body_h, 0, m.para_below, true, false},
 				// A list item and a quote lay out at the body face and do not wrap
 				// at this measure, so their block height is a paragraph's.
-				{"list item", "- block text", body_h, 0, m.list_gap, false},
-				{"blockquote", "> block text", body_h, m.quote_above, m.quote_below, false},
+				{"list item", "- block text", body_h, 0, m.list_gap, false, false},
+				{"blockquote", "> block text", body_h, m.quote_above, m.quote_below, false, false},
 				// h1 and h2 carry their rule INSIDE their own height (9.2 item 1).
-				{"h1", "# block text", one_line(&h, "block text", m.head[1], measure, line_height(m.head[1]), bold) + hairline(), m.head_above[1], m.head_below[1], false},
-				{"h2", "## block text", one_line(&h, "block text", m.head[2], measure, line_height(m.head[2]), bold) + hairline(), m.head_above[2], m.head_below[2], false},
-				{"h3", "### block text", one_line(&h, "block text", m.head[3], measure, line_height(m.head[3]), bold), m.head_above[3], m.head_below[3], false},
-				{"h4", "#### block text", one_line(&h, "block text", m.head[4], measure, line_height(m.head[4]), bold), m.head_above[4], m.head_below[4], false},
-				{"fenced code", "```\ncode\n```", fence_h, m.fence_above, m.fence_below, false},
-				{"thematic break", "***", hairline(), m.rule_gap, m.rule_gap, false},
+				// Leading is m.head_lead[n], not line_height(): C7 gave headings a
+				// per-level leading and the layout stopped using the editor grid's.
+				{"h1", "# block text", one_line(&h, "block text", m.head[1], measure, m.head_lead[1], bold), m.head_above[1], m.head_below[1], false, true},
+				{"h2", "## block text", one_line(&h, "block text", m.head[2], measure, m.head_lead[2], bold), m.head_above[2], m.head_below[2], false, true},
+				{"h3", "### block text", one_line(&h, "block text", m.head[3], measure, m.head_lead[3], bold), m.head_above[3], m.head_below[3], false, true},
+				{"h4", "#### block text", one_line(&h, "block text", m.head[4], measure, m.head_lead[4], bold), m.head_above[4], m.head_below[4], false, true},
+				{"fenced code", "```\ncode\n```", fence_h, m.fence_above, m.fence_below, false, false},
+				{"thematic break", "***", m.rule_h, m.rule_gap, m.rule_gap, false, false},
 			}
 			leads := []struct {
 				what:  string,
@@ -15581,7 +16004,20 @@ when NEWTPAD_TESTS {
 				// the `want` formula below would be the right question for them
 				// again.
 				absorbs: bool,
-			}{{"a paragraph", "lead text", m.para_below, true}, {"a list item", "- lead text", m.list_gap, true}}
+				// Is this lead CONTENT for C7's heading pair rule? Obsidian's
+				// selector is `:is(p,pre,table,ul,ol) + :is(h1..h6)`, so a paragraph
+				// and a list item are, and a HEADING deliberately is not. The heading
+				// lead is here to be the negative case: without it every lead in this
+				// table would fire the pair rule and an implementation that applied
+				// 2.5 S to every heading unconditionally would pass.
+				content: bool,
+			} {
+				{"a paragraph", "lead text", m.para_below, true, true},
+				{"a list item", "- lead text", m.list_gap, true, true},
+				// A heading absorbs nothing -- the prose line under it is its own
+				// block -- so `absorbs` is false and every row is measured.
+				{"a heading", "## lead text", m.head_below[2], false, false},
+			}
 
 			for ld in leads {
 				base_src := strings.concatenate({ld.src, "\n", PROBE, "\n"}, context.temp_allocator)
@@ -15599,7 +16035,14 @@ when NEWTPAD_TESTS {
 					// lead's own below is already inside y_base, so it comes back
 					// out. K.below is the collapsed gap under it (a paragraph has
 					// no space above, so the max is K.below itself).
-					want := max(ld.below, r.above) - ld.below + r.height + r.below
+					// C7's PAIR RULE: a heading after content takes --heading-spacing
+					// (2.5 S) in place of the 1.0 S it carries alone. Resolved here
+					// rather than baked into the row, so the same row asserts BOTH
+					// directions -- 2.5 S under the two content leads, 1.0 S under the
+					// heading lead.
+					above := r.above
+					if r.heading && ld.content {above = max(above, m.head_pair)}
+					want := max(ld.below, above) - ld.below + r.height + r.below
 					got := y - y_base
 					if ld.absorbs && r.para {
 						// A prose line under a lead that absorbs one is the SAME block
@@ -15617,22 +16060,231 @@ when NEWTPAD_TESTS {
 					}
 					gchk(
 						&bad, abs(got - want) <= 1,
-						fmt.tprintf("gap: [%s] a %s costs h=%.0f + above=%.0f + below=%.0f (got %.1f, want %.1f)", ld.what, r.what, r.height, r.above, r.below, got, want),
+						fmt.tprintf("gap: [%s] a %s costs h=%.0f + above=%.0f + below=%.0f (got %.1f, want %.1f)", ld.what, r.what, r.height, above, r.below, got, want),
 					)
 				}
 			}
+			// NO HEADING CARRIES A RULE UNDER IT (C7; Wyatt, 2026-09-03). Obsidian
+			// draws no heading border, and 9.2 item 1 asked for one on h1 and h2.
+			//
+			// Asserted EXACTLY, and separately from the gap table above, for the same
+			// reason the thematic break needed its own check: a rule is one hairline
+			// and that table compares with a +/-1px tolerance, so it cannot tell a
+			// heading with a rule from one without. Both h1 rows in that table used to
+			// carry `+ hairline()` and kept passing after the rule was removed.
+			{
+				for lvl in 1 ..= 2 {
+					hashes := strings.repeat("#", lvl, context.temp_allocator)
+					hsrc := strings.concatenate({hashes, " block text\n"}, context.temp_allocator)
+					hcontent := make([]u8, len(hsrc))
+					copy(hcontent, hsrc)
+					hdoc := doc_from_content(hcontent, "h2.md", .UTF8)
+					defer doc_close(&hdoc)
+					hlay := md_layout_build_for_test(&h.gfx, &h.text, &hdoc, &m, 0, measure)
+					defer md_layout_free(&hlay)
+					want_h := one_line(&h, "block text", m.head[lvl], measure, m.head_lead[lvl], bold)
+					gchk(
+						&bad, hlay.h == want_h,
+						fmt.tprintf("h%d carries NO rule under it: its height is exactly its text (%.1f vs %.1f; a rule would add %.1f)", lvl, hlay.h, want_h, hairline()),
+					)
+				}
+				// md_head_rules itself is deliberately not asserted here: it is
+				// @(private = "file") and should stay that way. The height above is
+				// the behaviour, and the predicate is an implementation detail of it.
+			}
+
+			// THE FIXED-PIXEL DECORATIONS, BY VALUE. Nothing asserted these: the
+			// scale table above covers only the S-derived rows, and the UI_SCALE case
+			// asserts they MOVE without ever saying what they are. Sabotaging
+			// quote_inset 24 -> 16 and the thematic break 2px -> hairline left the
+			// whole mode green, which is how this gap was found rather than guessed.
+			//
+			// Values, not bounds. Each is one of Obsidian's spacing tokens and each
+			// is exactly derivable, so a bound here would be the slack the register
+			// warns about.
+			for _, i in ([]int{0}) {
+				_ = i
+				dec := []struct {
+					got:  f32,
+					want: f32,
+					what: string,
+				} {
+					{m.rule_gap, sx(24), "thematic break gap 24px"},
+					{m.rule_h, sx(2), "thematic break 2px thick (--hr-thickness)"},
+					{m.fence_pad, sx(12), "fence vertical pad 12px (--size-4-3)"},
+					{m.fence_pad_x, sx(16), "fence horizontal pad 16px (--size-4-4)"},
+					{m.code_radius, sx(4), "inline code radius 4px (--radius-s)"},
+					{m.fence_radius, sx(4), "fence radius 4px (the SAME --radius-s)"},
+					{m.quote_inset, sx(24), "blockquote inset 24px (--size-4-6)"},
+					{m.quote_bar_w, sx(2), "blockquote bar 2px (--blockquote-border-thickness)"},
+					{m.task_box, sx(14), "checkbox 14px"},
+				}
+				wrongd, firstd := 0, ""
+				for d in dec {
+					if d.got != d.want {
+						wrongd += 1
+						if firstd == "" {firstd = fmt.tprintf("%s: got %.1f want %.1f", d.what, d.got, d.want)}
+					}
+				}
+				gchk(&bad, wrongd == 0, fmt.tprintf("the fixed-pixel decorations are Obsidian's tokens (%d wrong; %s)", wrongd, firstd))
+				// The two radii are the SAME token and must move together. Asserted
+				// separately because they were 3 and 6 before -- two numbers that
+				// looked deliberate and were not -- and equality is the actual claim.
+				gchk(&bad, m.code_radius == m.fence_radius, fmt.tprintf("...and both radii are one token, not two (%.1f vs %.1f)", m.code_radius, m.fence_radius))
+			}
+
+			// THE THEMATIC BREAK IS m.rule_h TALL, asserted EXACTLY and on the block
+			// rather than on the metric. The metric check above only says rule_h is 2px;
+			// it says nothing about whether the Rule case uses it, and sabotaging
+			// `e.h = m.rule_h` back to `hairline()` left this mode green twice over --
+			// once because the gap table above named hairline() as the expected height
+			// (the test agreeing with the bug), and once because that table compares
+			// with a +/-1px tolerance, which is exactly the 2-against-1 difference the
+			// sabotage makes. An assertion whose slack is the size of the defect is the
+			// register's named trap, so this one is an equality on the value.
+			{
+				src := "***\n"
+				content := make([]u8, len(src))
+				copy(content, src)
+				rdoc := doc_from_content(content, "r.md", .UTF8)
+				defer doc_close(&rdoc)
+				rlay := md_layout_build_for_test(&h.gfx, &h.text, &rdoc, &m, 0, measure)
+				defer md_layout_free(&rlay)
+				gchk(
+					&bad, rlay.cls.kind == .Rule && rlay.h == m.rule_h,
+					fmt.tprintf("a thematic break is --hr-thickness tall, not a hairline (kind %v, h %.1f, want %.1f; hairline is %.1f)", rlay.cls.kind, rlay.h, m.rule_h, hairline()),
+				)
+			}
+
+			// THE LIST MARKER HANGS OFF THE PROSE, rather than the prose sitting a
+			// whole indent step right of the marker. Obsidian anchors the item's
+			// CONTENT (3ch, then 2.25em per level) and floats the bullet back out of
+			// it by 0.8em; ours put the marker at the nesting depth and pushed the
+			// text a further full step, so a bullet sat almost a tab from its words.
+			//
+			// Driven through md_layout_build_for_test because `marker` and `indent`
+			// are Md_Layout fields, not metrics -- md_metrics cannot see this, which
+			// is why the metric assertions above do not cover it.
+			{
+				list_lay :: proc(h: ^Headless_Gpu, m: ^Md_Metrics, src: string, measure: f32) -> (indent, marker: f32) {
+					content := make([]u8, len(src))
+					copy(content, src)
+					doc := doc_from_content(content, "l.md", .UTF8)
+					defer doc_close(&doc)
+					lay := md_layout_build_for_test(&h.gfx, &h.text, &doc, m, 0, measure)
+					defer md_layout_free(&lay)
+					return lay.indent, lay.marker
+				}
+				i0, mk0 := list_lay(&h, &m, "- item text\n", measure)
+				gchk(
+					&bad, abs(i0 - m.list_indent) <= 0.5,
+					fmt.tprintf("list: a top-level item's PROSE sits at 3ch (%.1f vs %.1f)", i0, m.list_indent),
+				)
+				gchk(
+					&bad, abs((i0 - mk0) - m.list_hang) <= 0.5,
+					fmt.tprintf("list: ...and its bullet hangs 0.8em to the LEFT of it (gap %.1f, want %.1f)", i0 - mk0, m.list_hang),
+				)
+				i1, _ := list_lay(&h, &m, "  - nested item\n", measure)
+				gchk(
+					&bad, abs(i1 - (m.list_indent + m.list_step)) <= 0.5,
+					fmt.tprintf("list: one level down adds --list-indent (2.25em), not another 3ch (%.1f vs %.1f)", i1, m.list_indent + m.list_step),
+				)
+			}
+
+			// THE REQUESTED BODY LEADING IS ACTUALLY WHAT COMES OUT, and until now
+			// nothing checked it. Md_Metrics.body_lead's own comment says it is a
+			// FLOOR rather than the leading you get -- the shaper clamps up for a
+			// face whose ascent + descent exceeds it -- and tells the reader to read
+			// Shaped.line_h back. This is that read.
+			//
+			// It matters more after C7 than it did before. Body leading came down
+			// from 1.65 S to 1.50 S at the same moment the body face changed from
+			// Georgia (asc+desc 1.136 em) to Segoe UI, so BOTH sides of the clamp
+			// moved in the same commit. If Segoe UI's box exceeds 1.50 S the whole
+			// rhythm silently becomes something other than what §3 specifies, and
+			// every heading's tighter head_lead is clamped too.
+			//
+			// body_h is a ONE-LINE run, so it is exactly the line height the shaper
+			// produced. Asserted as equality, not `<=`: a bound here is the "assertion
+			// with slack" the register warns about, and the interesting failure is
+			// the shaper quietly giving us MORE than we asked for.
+			gchk(
+				&bad, abs(body_h - m.body_lead) <= 1,
+				fmt.tprintf("the body face actually achieves the requested leading (got %.1f, asked %.1f at S=%.0f)", body_h, m.body_lead, m.s),
+			)
+
+			// THE FIRST BLOCK HAS NO SPACE ABOVE IT, whatever kind it is --
+			// Obsidian's `.markdown-rendered > :first-child { margin-top: 0 }`. This
+			// generalises what m.head_above[1] used to hardcode as 0 for h1 alone,
+			// and it lives in the walk's collapse rather than in any block's layout,
+			// so it needs a document to be observed in.
+			//
+			// The THEMATIC BREAK is the probe kind, chosen because its space-above is
+			// the largest in the table (m.rule_gap, a fixed 24px rather than a
+			// fraction of S) and because it is the only kind whose above and below
+			// are equal -- so the two readings below differ by exactly one rule_gap
+			// and by nothing else. A heading would work too, but its above is now
+			// entangled with the pair rule above, and a test should not depend on two
+			// rules to demonstrate one.
+			//
+			// y_bare measures the constant inset markdown_links applies before any
+			// block; subtracting it is what makes this an assertion about the GAP
+			// rather than about the pane's padding.
+			y_bare := probe_y(&h, PROBE + "\n", px_, x0, x1, ytop, ybot)
+			y_rule_first := probe_y(&h, "***\n" + PROBE + "\n", px_, x0, x1, ytop, ybot)
+			gchk(&bad, y_bare >= 0 && y_rule_first >= 0, "first-block: both probes are placed")
+			if y_bare >= 0 && y_rule_first >= 0 {
+				// With the rule: the break's own 24px above is dropped, so the probe
+				// sits one rule height plus one rule_gap (its BELOW) down.
+				// Without it: 24px more. Deleting `if lay.start <= 0 {gap = 0}` from
+				// md_walk moves this by exactly m.rule_gap and nothing else.
+				want_first := hairline() + m.rule_gap
+				got_first := y_rule_first - y_bare
+				gchk(
+					&bad, abs(got_first - want_first) <= 1,
+					fmt.tprintf("first-block: an opening thematic break has NO space above it (got %.1f, want %.1f; its above would be %.0f)", got_first, want_first, m.rule_gap),
+				)
+			}
+			// ...and the rule is about being FIRST, not about being a thematic break:
+			// the same break lower down keeps its space-above in full. Without this
+			// half, `gap = 0` applied to EVERY block would pass the check above.
+			y_lead := probe_y(&h, "lead text\n" + PROBE + "\n", px_, x0, x1, ytop, ybot)
+			y_lead_rule := probe_y(&h, "lead text\n***\n" + PROBE + "\n", px_, x0, x1, ytop, ybot)
+			if y_lead >= 0 && y_lead_rule >= 0 {
+				want_after := max(m.para_below, m.rule_gap) - m.para_below + hairline() + m.rule_gap
+				got_after := y_lead_rule - y_lead
+				gchk(
+					&bad, abs(got_after - want_after) <= 1,
+					fmt.tprintf("first-block: ...but a break LOWER DOWN keeps its space above (got %.1f, want %.1f)", got_after, want_after),
+				)
+			}
+
 			// Non-degeneracy: if every kind happened to carry the same space, the
 			// table above would pass against an implementation that applied one
 			// number everywhere -- which is very nearly the sabotage.
-			distinct_below := 0
-			for r, i in rows {
-				seen := false
-				for j in 0 ..< i {
-					if abs(rows[j].below - r.below) < 0.5 {seen = true}
-				}
-				if !seen {distinct_below += 1}
+			//
+			// THE COUNT USED TO BE THE ASSERTION (`distinct_below >= 4`) and C7 broke
+			// it honestly: Obsidian's rhythm gives a paragraph, a heading, a quote and
+			// a fence the SAME 1.0 S below, so the count fell to three and the old
+			// bound could only be met by lowering it. Lowering a threshold until a
+			// test passes is the "assertion with slack" trap, so the assertion is
+			// restated as the STRUCTURE it was always reaching for:
+			//
+			//   * most kinds share one space-below -- that IS C7's flat rhythm, and an
+			//     implementation with a graduated ladder fails it;
+			//   * and at least two kinds deliberately do NOT -- the list gap (0.15 S,
+			//     much tighter, because items are one list) and the thematic break
+			//     (24 px, a fixed decoration rather than type) -- which is what an
+			//     implementation applying one number everywhere fails.
+			//
+			// Both halves are needed. Either alone passes against a real defect.
+			common := m.para_below
+			shared, deviant := 0, 0
+			for r in rows {
+				if abs(r.below - common) < 0.5 {shared += 1} else {deviant += 1}
 			}
-			gchk(&bad, distinct_below >= 4, fmt.tprintf("gap: the fixture spans several DIFFERENT space-below values (%d distinct)", distinct_below))
+			gchk(&bad, shared >= 4, fmt.tprintf("gap: C7's rhythm is FLAT -- most kinds share one space-below (%d of %d at %.0fpx)", shared, len(rows), common))
+			gchk(&bad, deviant >= 2, fmt.tprintf("gap: ...but not uniform -- the list gap and the rule keep their own (%d deviate)", deviant))
 			return
 		}
 
@@ -16341,13 +16993,11 @@ when NEWTPAD_TESTS {
 				pchk(&bad, box_ok, "indent: the fixture has a preview pane")
 				m := md_metrics(&h.text, px_)
 				cx, meas := md_content_span(&m, x0, x1)
-				// The cap must BIND, or every bound below is the pane's and the
-				// property is untestable on this fixture.
-				// md_content_span returns the PANE now; §9.3's 72ch moved into
-				// md_layout_build, where the block kind is known. Both halves are pinned:
-				// the span is the pane, AND the pane is wide enough for the prose cap to
-				// bind on the blocks below, or their limits would be untestable here.
-				pchk(&bad, abs(meas - (x1 - cx)) < 1.5, fmt.tprintf("indent: md_content_span returns the pane (%.0f of %.0fpx)", meas, x1 - cx))
+				// Under .Full -- the default this mode runs at -- md_content_span's width
+				// is the whole pane less one margin at each side. There is no readable-width
+				// cap to bind, which is what the blocks below want: their indents are
+				// measured against the full column.
+				pchk(&bad, abs(meas - ((x1 - cx) - m.pad)) < 1.5, fmt.tprintf("indent: the column is the pane less its right margin (%.0f of %.0fpx, margin %.0f)", meas, x1 - cx, m.pad))
 				pchk(&bad, x1 - cx > m.measure + sx(100), fmt.tprintf("indent: ...and the pane is wide enough that the prose cap still binds (%.0f vs %.0f)", x1 - cx, m.measure))
 
 				markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, x0, x1, ytop, ybot, Md_Anchor{})
@@ -17090,6 +17740,152 @@ when NEWTPAD_TESTS {
 				mf_chk(&bad, seed_in, "indent fixture: seed at body text also says inside a fence")
 				mf_chk(&bad, seed_in == truth[2], "indent fixture: seed agrees with the walk from byte 0")
 			}
+
+			// --- C7: the fence's FACE and its language aliases -------------------
+			//
+			// Two defects the 2026-08-04 sweep diagnosed and nothing had closed.
+			{
+				// 1. ```powershell resolves a lexer. EXT_LEXERS has carried a real
+				//    PowerShell lexer at .ps1 the whole time and md_fence_lexer had no
+				//    alias for it, so the language most of Wyatt's notes are written in
+				//    got neither the mono face nor the colours that already existed.
+				//
+				//    `sh` is the control: it proves the alias table is reached at all,
+				//    so a failure on powershell means the alias is missing rather than
+				//    that lexer resolution is broken generally.
+				mf_chk(&bad, md_fence_lexer("```sh") != nil, "control: ```sh resolves a lexer, so the alias table is reachable")
+				for tag in ([]string{"powershell", "pwsh", "posh", "PowerShell", "POWERSHELL"}) {
+					line := strings.concatenate({"```", tag}, context.temp_allocator)
+					mf_chk(&bad, md_fence_lexer(line) != nil, fmt.tprintf("```%s resolves the .ps1 lexer", tag))
+				}
+				// ...and a genuinely unknown language still resolves nothing, or the
+				// check above would pass against a md_fence_lexer that returned some
+				// lexer for everything.
+				mf_chk(&bad, md_fence_lexer("```notalanguage") == nil, "...while an unknown language still resolves no lexer")
+
+				// 2. A fence body whose language resolves NO lexer is still set in the
+				//    MONO face. `fallback_set` defaulted to .Body, and the mono path is
+				//    gated on `fence_lex != nil`, so exactly those blocks fell back to
+				//    the proportional body face -- code in a proportional face, beside
+				//    inline code that was correctly mono.
+				//
+				//    Asserted on the shape span's SET, which is what the shaper was
+				//    actually handed, rather than on a colour: the bug is about the
+				//    face and a colour check would pass with the face still wrong.
+				// THE THEME HAS TO BE REAL for any colour claim below to mean
+				// anything. mdfencetest never set it -- every other visual mode does
+				// -- so g_theme was the zero value and every syntax role resolved to
+				// the same {0,0,0,0}. The tokenisation control below counted eight
+				// spans in "one colour" and failed, which looked like broken
+				// highlighting and was an unpainted palette.
+				g_theme, UI_SCALE = theme_dark(), 1
+				h: Headless_Gpu
+				if !headless_gpu_init(&h, 900, 700, "mdfencetest") {
+					mf_chk(&bad, false, "an offscreen device came up, so a fence body could be shaped")
+				} else {
+					defer headless_gpu_destroy(&h)
+					m := md_metrics(&h.text, 16)
+					fence_set :: proc(h: ^Headless_Gpu, m: ^Md_Metrics, lang: string) -> (plat.Font_Set, bool) {
+						src := strings.concatenate({"```", lang, "\ncode_text\n```\n"}, context.temp_allocator)
+						content := make([]u8, len(src))
+						copy(content, src)
+						doc := doc_from_content(content, "f.md", .UTF8)
+						defer doc_close(&doc)
+						// Line 1 is the fence BODY; line 0 is the opening fence.
+						body := min(base.pt_line_end_cap(&doc.pt, 0, RENDER_LINE_CAP) + 1, doc.pt.length)
+						// SEEDED from the document: md_layout_build_for_test hands
+						// in_fence = false unconditionally, so this line classified as
+						// a .Para -- a paragraph, in the body face, which the first
+						// draft of this check then reported as the bug it was looking
+						// for. The control (a fence WITH a lexer, long known correct)
+						// failing too is what gave it away.
+						lay := md_layout_build_fenced_for_test(&h.gfx, &h.text, &doc, m, body, 600)
+						defer md_layout_free(&lay)
+						if lay.cls.kind != .Fence_Body || len(lay.shape) == 0 {return .Body, false}
+						return lay.shape[0].set, true
+					}
+					unk, uok := fence_set(&h, &m, "notalanguage")
+					mf_chk(&bad, uok && unk == .Doc, fmt.tprintf("a fence with NO lexer is still mono (.Doc), not the proportional body face (got %v)", unk))
+					bare, bok := fence_set(&h, &m, "")
+					mf_chk(&bad, bok && bare == .Doc, fmt.tprintf("...and so is a fence naming no language at all (got %v)", bare))
+					// The control, and it has to prove the LEXER path specifically,
+					// not just that the result is mono. Both paths emit .Doc now, so
+					// "is it .Doc" cannot tell them apart -- the first version of this
+					// check asked exactly that and passed while the lexer path was not
+					// being reached at all (md_layout_build_fenced_for_test used to
+					// seed via md_fence_seed, which cannot recover a lexer without the
+					// background line index a fresh test document has never built).
+					//
+					// A tokenised fence emits one span per token, so SEVERAL spans in
+					// more than one colour is the signature the fall-through cannot
+					// produce: it emits exactly one span in one colour.
+					lexed :: proc(h: ^Headless_Gpu, m: ^Md_Metrics, lang, body: string) -> (spans, colors: int) {
+						src := strings.concatenate({"```", lang, "\n", body, "\n```\n"}, context.temp_allocator)
+						content := make([]u8, len(src))
+						copy(content, src)
+						doc := doc_from_content(content, "f3.md", .UTF8)
+						defer doc_close(&doc)
+						off := min(base.pt_line_end_cap(&doc.pt, 0, RENDER_LINE_CAP) + 1, doc.pt.length)
+						lay := md_layout_build_fenced_for_test(&h.gfx, &h.text, &doc, m, off, 600)
+						defer md_layout_free(&lay)
+						seen: [dynamic][4]f32
+						defer delete(seen)
+						for sp in lay.spans {
+							dup := false
+							for c in seen {if c == sp.color {dup = true}}
+							if !dup {append(&seen, sp.color)}
+						}
+						return len(lay.spans), len(seen)
+					}
+					ns, nc := lexed(&h, &m, "json", "{ \"key\": 42 }")
+					mf_chk(&bad, ns > 1 && nc > 1, fmt.tprintf("control: a fence WITH a lexer is TOKENISED (%d spans, %d colours)", ns, nc))
+					// ...and the one without is not, which is what makes the counts
+					// above a signature rather than a number.
+					us, uc := lexed(&h, &m, "notalanguage", "{ \"key\": 42 }")
+					mf_chk(&bad, us == 1 && uc == 1, fmt.tprintf("...and one without a lexer is a single flat span (%d spans, %d colours)", us, uc))
+
+					// 3. MARKDOWN IS NOT PARSED INSIDE A FENCE. The same fall-through
+					//    that gave a lexer-less fence the proportional face also ran
+					//    md_inline over it, so `**x**` rendered as emphasis and its
+					//    asterisks vanished -- from a block whose entire purpose is
+					//    showing bytes as written.
+					//
+					//    Asserted on the SPAN TEXT rather than on the span count: a
+					//    correct implementation may split the line for its own reasons
+					//    (bare-link splitting, the lexer's tokens), and what must hold
+					//    is that the asterisks survive into what gets drawn.
+					fence_text :: proc(h: ^Headless_Gpu, m: ^Md_Metrics, lang, body: string) -> string {
+						src := strings.concatenate({"```", lang, "\n", body, "\n```\n"}, context.temp_allocator)
+						content := make([]u8, len(src))
+						copy(content, src)
+						doc := doc_from_content(content, "f2.md", .UTF8)
+						defer doc_close(&doc)
+						off := min(base.pt_line_end_cap(&doc.pt, 0, RENDER_LINE_CAP) + 1, doc.pt.length)
+						lay := md_layout_build_fenced_for_test(&h.gfx, &h.text, &doc, m, off, 600)
+						defer md_layout_free(&lay)
+						sb := strings.builder_make(context.temp_allocator)
+						for sp in lay.shape {strings.write_string(&sb, sp.text)}
+						return strings.clone(strings.to_string(sb), context.temp_allocator)
+					}
+					got_raw := fence_text(&h, &m, "notalanguage", "keep **these** and _these_ marks")
+					mf_chk(
+						&bad, got_raw == "keep **these** and _these_ marks",
+						fmt.tprintf("a fence's bytes are shown as written, not parsed as markdown (%q)", got_raw),
+					)
+				}
+			}
+			// NO LANGUAGE LABEL IS DRAWN, and that is a decision rather than an
+			// omission. The 2026-08-04 sweep filed "no language label on the fence"
+			// as the third fence defect, on §9's authority. C7 makes Obsidian the
+			// authority where the two conflict, and Obsidian's READING view has no
+			// label: `.code-block-flair` exists only under
+			// `.markdown-source-view.mod-cm6`, its editor. What its reading view puts
+			// on a fence is a copy button, revealed on hover
+			// (`pre:not(:hover) > button.copy-code-button { display: none }`), which
+			// is a different feature and is not this batch's.
+			//
+			// Written here rather than in a doc because the next reader of the sweep
+			// will otherwise file it again.
 
 			// Exits non-zero, the guard palettetest carries. Demonstrated rather than
 			// assumed: sabotaging md_fence_seed made this mode print "8 failures" and
@@ -30736,6 +31532,63 @@ when NEWTPAD_TESTS {
 				fail = true
 			}
 
+			// --- C9: the sync interpolates INSIDE a block --------------------------
+			//
+			// Wyatt, 2026-09-03: "the scroll is weird, it's blocky… it should be
+			// smooth". md_anchor_top_byte threw the anchor's sub-block pixels away and
+			// returned the block's own first line, so scrolling the preview left the
+			// editor still until the anchor crossed into the next block, then jumped
+			// it a whole paragraph at once.
+			//
+			// THE ASSERTION THAT CANNOT PASS WITH BLOCK QUANTISATION PRESENT: for an
+			// anchor part way down a TALL block, the editor's top line must not be
+			// that block's first line. Comparing content, or comparing against a
+			// hand-computed expected byte, would both be satisfiable by the old
+			// behaviour on a short-enough fixture; "it moved at all, without leaving
+			// the block" is the property itself.
+			{
+				h: Headless_Gpu
+				if !headless_gpu_init(&h, 900, 700, "splittest") {
+					chk("an offscreen device came up, so an anchor could be resolved", false, &fail)
+				} else {
+					defer headless_gpu_destroy(&h)
+					saved_theme, saved_scale := g_theme, UI_SCALE
+					g_theme, UI_SCALE = theme_dark(), 1
+					defer {g_theme, UI_SCALE = saved_theme, saved_scale}
+					// ONE paragraph of many hard-wrapped lines. It joins into a single
+					// tall block, so every line after the first is interior to it --
+					// which is exactly the region the old mapping could not address.
+					sb := strings.builder_make(context.temp_allocator)
+					for i in 0 ..< 60 {fmt.sbprintf(&sb, "line %02d of one long hard wrapped paragraph\n", i)}
+					src := strings.to_string(sb)
+					content := make([]u8, len(src))
+					copy(content, src)
+					sdoc := doc_from_content(content, "sync.md", .UTF8)
+					defer doc_close(&sdoc)
+					defer md_layout_reset(&sdoc)
+					sdoc.md_mode = .Preview
+					if c, cok := md_scroll_ctx(&h.gfx, &h.text, &sdoc, 16, 900, 700, 0.5); cok {
+						first := md_anchor_from_top(&c, 0)
+						_, bnext, bslot := md_block_at_byte(&c, first.block)
+						chk(fmt.tprintf("sync: the fixture's first block is tall and long (%.0fpx, %d bytes)", bslot, bnext - first.block), bslot > 200 && bnext - first.block > 400, &fail)
+						top0 := md_anchor_top_byte(&c, {first.block, 0})
+						mid := md_anchor_top_byte(&c, {first.block, bslot * 0.5})
+						end := md_anchor_top_byte(&c, {first.block, bslot * 0.95})
+						chk(fmt.tprintf("sync: at the block's top the editor is at its first line (%d)", top0), top0 == base.pt_line_start(&sdoc.pt, first.block), &fail)
+						chk(fmt.tprintf("sync: HALF WAY DOWN it is NOT -- the editor moved inside the block (%d vs %d)", mid, top0), mid > top0, &fail)
+						chk(fmt.tprintf("sync: ...and further down it moves further still (%d > %d)", end, mid), end > mid, &fail)
+						// ...while never leaving the block, which is what keeps §9.4's
+						// drift argument intact: the identity is still the block.
+						chk(fmt.tprintf("sync: ...but never past the block's own end (%d < %d)", end, bnext), end < bnext, &fail)
+						// And it is a LINE start, not an arbitrary interior byte --
+						// doc.top's whole coordinate system assumes one.
+						chk(fmt.tprintf("sync: every mapped byte is a line start (%d)", mid), base.pt_line_start(&sdoc.pt, mid) == mid, &fail)
+					} else {
+						chk("sync: a scroll context came up", false, &fail)
+					}
+				}
+			}
+
 			return mode_done_flag("splittest", fail)
 		}
 
@@ -38885,6 +39738,309 @@ when NEWTPAD_TESTS {
 		// re-flowed block and the cache holding across repeated md_layout_ensure
 		// calls. Hard breaks, lazy continuation and setext are later tasks in this
 		// batch and do not exist yet.
+		// `newtpad mdhittest` -- CAN THE MOUSE REACH THE PREVIEW AT ALL?
+		//
+		// Wyatt, live use 2026-08-06: *"i can't drag, right-click, etc, copy,
+		// anything on the preview"*. The preview is inert to the mouse, which is one
+		// bug and not three: main.odin's read-only block SWALLOWS every press over a
+		// preview (it zeroes mouse_pressed, mouse_middle_pressed and mouse_down so
+		// the caret cannot be placed there), and the only thing that acts on a press
+		// BEFORE the swallow is the selection start. If md_preview_pos_at does not
+		// resolve a position, the press is set aside and consumed and the surface is
+		// dead to everything.
+		//
+		// mdseltest cannot see this. It drives md_preview_sel_text_for_test, which
+		// takes a measure directly and never touches the pixel -> position mapping;
+		// its own comment says so. This drives the mapping the FRAME LOOP calls, with
+		// a real device, which is the only version of the question that matters.
+		if os.args[1] == "mdhittest" {
+			mh_run :: proc() -> int {
+				bad := 0
+				mh_chk :: proc(bad: ^int, ok: bool, label: string) {
+					if !ok {bad^ += 1}
+					fmt.printfln("  %-6s %s", "ok" if ok else "FAIL", label)
+				}
+				h: Headless_Gpu
+				if !headless_gpu_init(&h, 1280, 900, "mdhittest") {
+					mh_chk(&bad, false, "an offscreen device came up, so the hit-test could be driven")
+					return bad
+				}
+				defer headless_gpu_destroy(&h)
+
+				// DENSE ON PURPOSE. The probes below sit at fixed pixel offsets, so the
+				// fixture has to put real glyphs at those offsets -- and C7 changed
+				// every block height and gap underneath them. The first version was
+				// one heading, one short paragraph, a list item and a paragraph
+				// (~150px of content at S=16); after C7 the h1 is 31px rather than 45,
+				// so the +40 probe fell into the gap BELOW the heading and the +120
+				// probe into another gap, both resolved to the same position, and the
+				// selection between them came back empty.
+				//
+				// Several full paragraphs instead, each long enough to wrap, so every
+				// offset from +8 to +160 lands on prose regardless of what the rhythm
+				// does next. The `a != b` assertion added below is what names this
+				// failure directly if it ever recurs -- an empty copy on its own does
+				// not say WHY it was empty.
+				src :=
+					"# Heading\n\n" +
+					"A paragraph with enough words in it to occupy several lines of the measure, so that a probe " +
+					"landing anywhere inside it finds a glyph rather than the space between two blocks.\n\n" +
+					"A second paragraph, equally long, for the same reason: the probes below walk down the pane at " +
+					"fixed offsets and each one has to land on something the hit-test can resolve.\n\n" +
+					"- A list item, also long enough to wrap at the measure rather than ending mid-line\n" +
+					"- A second list item, so the list itself occupies more than a single row of the pane\n\n" +
+					"A third paragraph, closing the fixture, long enough that the deepest probe still lands on prose " +
+					"and not past the end of the document.\n"
+				content := make([]u8, len(src))
+				copy(content, transmute([]u8)src)
+				doc := doc_from_content(content, "hit.md", .UTF8)
+				defer doc_close(&doc)
+				px := f32(16)
+				W, H := f32(1280), f32(900)
+
+				// Both modes, because the gate differs between them: full Preview
+				// admits every column, Split only those right of the divider.
+				for mode in ([]Md_Mode{.Preview, .Split}) {
+					doc.md_mode = mode
+					doc.md_top = {}
+					x0, x1, ytop, ybot, box_ok := md_pane_box(&doc, W, H, 0.5)
+					mh_chk(&bad, box_ok, fmt.tprintf("%v: the pane has a box (%.0f..%.0f x %.0f..%.0f)", mode, x0, x1, ytop, ybot))
+					if !box_ok {continue}
+
+					// A point squarely inside the pane, a few lines down from the top
+					// so it lands on real content rather than on the top padding.
+					mx := x0 + (x1 - x0) * 0.25
+					hits, misses := 0, 0
+					first_miss := f32(-1)
+					for dy in ([]f32{8, 24, 40, 60, 80, 120, 160}) {
+						my := ytop + dy
+						if my >= ybot {continue}
+						if _, ok := md_preview_pos_at(&h.gfx, &h.text, &doc, px, W, H, 0.5, mx, my); ok {
+							hits += 1
+						} else {
+							misses += 1
+							if first_miss < 0 {first_miss = dy}
+						}
+					}
+					// THE WHOLE POINT. A preview that resolves no position anywhere is
+					// a preview you cannot select, drag, or copy from -- and because
+					// the press is swallowed either way, one that also eats the click.
+					mh_chk(&bad, hits > 0, fmt.tprintf("%v: a press inside the pane resolves a position (%d hit / %d missed)", mode, hits, misses))
+					mh_chk(&bad, misses == 0, fmt.tprintf("%v: EVERY probe down the pane resolves (first miss at +%.0fpx)", mode, first_miss))
+				}
+
+				// THE SEAM, ACROSS ALL FOUR COLUMN STATES (C7 / W3). What is DRAWN
+				// against what is CLICKABLE, at the one place C7 moved: the content
+				// origin. md_content_span is the single producer of it, and the draw,
+				// the link rects and the pixel->position mapping all consume it -- so
+				// this asserts they consume the same answer rather than three
+				// arithmetics that happen to agree under the default.
+				//
+				// A link rect's x IS the block's glyph origin (md_block_origin reads
+				// md_content_span's cx), so markdown_links is the cheapest honest
+				// probe of where the draw put things.
+				//
+				// BOTH terms, for the reason Md_Column's own comment gives: .Full and
+				// .Left share an origin and differ in width, .Left/.Centre/.Right
+				// share a width and differ in origin. An assertion on the origin
+				// alone cannot tell .Full from .Left; one on the width alone cannot
+				// tell .Left from .Right.
+				{
+					saved_col := g_md_column
+					defer g_md_column = saved_col
+					lsrc := "[see](http://seam.example) and a good deal of following prose so the block is not a stub\n"
+					lcontent := make([]u8, len(lsrc))
+					copy(lcontent, transmute([]u8)lsrc)
+					ldoc := doc_from_content(lcontent, "seam.md", .UTF8)
+					defer doc_close(&ldoc)
+					ldoc.md_mode = .Preview
+					lx0, lx1, lytop, lybot, _ := md_pane_box(&ldoc, W, H, 0.5)
+					seen_x, seen_w := [4]f32{}, [4]f32{}
+					for st, i in ([]Md_Column{.Full, .Left, .Centre, .Right}) {
+						g_md_column = st
+						sm := md_metrics(&h.text, px)
+						scx, swidth := md_content_span(&sm, lx0, lx1)
+						seen_x[i], seen_w[i] = scx, swidth
+						hits := markdown_links(&h.gfx, &h.text, &ldoc, px, lx0, lx1, lytop, lybot, Md_Anchor{}, context.temp_allocator)
+						rx, ry, rh, rok := f32(0), f32(0), f32(0), false
+						for hh in hits {
+							if hh.url == "http://seam.example" {rx, ry, rh, rok = hh.rect.pos.x, hh.rect.pos.y, hh.rect.size.y, true}
+						}
+						mh_chk(&bad, rok, fmt.tprintf("%v: the link is placed at all", st))
+						// The link opens the block, so its rect starts AT the origin.
+						mh_chk(
+							&bad, rok && abs(rx - scx) <= 1,
+							fmt.tprintf("%v: what is CLICKABLE starts at md_content_span's origin (rect x %.0f vs origin %.0f)", st, rx, scx),
+						)
+						// ...and a press INSIDE that rect resolves a position, which
+						// is the other side of the seam: the pixel->position mapping
+						// agrees with the rect the draw produced.
+						//
+						// Probed at the rect's own centre, not at (origin, ytop + 8).
+						// That guessed y sits in the pane's top margin above the first
+						// line's glyphs, and the first version of this check failed
+						// for .Full and .Left on exactly that -- a fixture artefact
+						// that looked like a geometry bug. The rect is where the draw
+						// says the text is, so it is the only y worth probing.
+						if rok {
+							_, pok := md_preview_pos_at(&h.gfx, &h.text, &ldoc, px, W, H, 0.5, rx + 2, ry + rh * 0.5)
+							mh_chk(&bad, pok, fmt.tprintf("%v: ...and a press inside that rect resolves a position", st))
+						}
+					}
+					// The four states really are four, or every row above is the same
+					// row four times. This is the non-degeneracy the seam checks need.
+					mh_chk(
+						&bad, abs(seen_x[0] - seen_x[1]) <= 1 && seen_w[0] > seen_w[1] + 1,
+						fmt.tprintf("column: .Full and .Left share an origin, differ in width (%.0f/%.0f vs %.0f/%.0f)", seen_x[0], seen_w[0], seen_x[1], seen_w[1]),
+					)
+					mh_chk(
+						&bad, seen_x[1] < seen_x[2] && seen_x[2] < seen_x[3] && abs(seen_w[1] - seen_w[3]) <= 1,
+						fmt.tprintf("column: .Left/.Centre/.Right share a width, differ in origin (%.0f < %.0f < %.0f, widths %.0f/%.0f)", seen_x[1], seen_x[2], seen_x[3], seen_w[1], seen_w[3]),
+					)
+				}
+
+				// ...and a press outside the pane must NOT resolve, or the preview
+				// would claim presses belonging to the editor half or the bars.
+				doc.md_mode = .Split
+				x0, _, ytop, _, _ := md_pane_box(&doc, W, H, 0.5)
+				_, left_ok := md_preview_pos_at(&h.gfx, &h.text, &doc, px, W, H, 0.5, x0 - sx(20), ytop + 40)
+				mh_chk(&bad, !left_ok, "Split: a press left of the divider is not the preview's")
+
+				// A selection made through that mapping yields text, which is the
+				// thing the user is actually trying to do.
+				doc.md_mode = .Preview
+				bx0, bx1, bytop, bybot, _ := md_pane_box(&doc, W, H, 0.5)
+				a, aok := md_preview_pos_at(&h.gfx, &h.text, &doc, px, W, H, 0.5, bx0 + sx(4), bytop + 40)
+				b, bok := md_preview_pos_at(&h.gfx, &h.text, &doc, px, W, H, 0.5, bx1 - sx(40), min(bytop + 120, bybot - 1))
+				mh_chk(&bad, aok && bok, "two ends of a drag both resolve")
+				// ...to DIFFERENT positions. md_sel_range refuses a zero-width
+				// selection ("a bare click selects nothing"), so two probes that
+				// resolve to the same Md_Pos copy "" and the assertion below fails
+				// with no indication of why. That is exactly what happened when C7
+				// moved the blocks under these fixed offsets: both probes landed in
+				// inter-block gaps and clamped to the same position. Asserted
+				// separately so the next such move is diagnosed rather than puzzled
+				// over.
+				mh_chk(
+					&bad, !(aok && bok) || !md_pos_eq(a, b),
+					fmt.tprintf("...and to DIFFERENT positions (a=%d/%d/%d b=%d/%d/%d)", a.block, a.span, a.off, b.block, b.span, b.off),
+				)
+				if aok && bok {
+					doc.md_sel_a, doc.md_sel_b = a, b
+					doc.md_sel_on = true
+					s, sok := md_preview_sel_text(&h.gfx, &h.text, &doc, px, W, H, 0.5)
+					mh_chk(&bad, sok && len(s) > 0, fmt.tprintf("...and the selection between them copies as text (%q)", s))
+					doc.md_sel_on = false
+				}
+				return bad
+			}
+			fmt.println("mdhittest:")
+			return mode_done("mdhittest", mh_run())
+		}
+
+		// THE FRAME LOOP'S PRESS DECISION, driven directly.
+		//
+		// Three preview bugs in a row have hidden in main.odin's press routing --
+		// the one path this environment cannot execute -- and each time the answer
+		// was another headless test of a procedure the loop CALLS rather than of the
+		// loop's own decision. mdseltest drives md_preview_sel_text_for_test, which
+		// never touches the pixel->position mapping; mdhittest drives that mapping,
+		// which is not the routing. Both pass. The routing was never reachable at
+		// all until press_route was lifted out (HANDOFF §6cz did the same for the
+		// keyboard, and keyboard bugs stopped hiding).
+		//
+		// So this is a TRUTH TABLE, not a scenario: every gate crossed with every
+		// other, asserted against the meaning each combination should have.
+		if os.args[1] == "pressroutetest" {
+			pr_run :: proc() -> int {
+				bad := 0
+				pr_chk :: proc(bad: ^int, ok: bool, msg: string) {
+					fmt.printfln("  %-74s %s", msg, "OK" if ok else "FAIL")
+					if !ok {bad^ += 1}
+				}
+				CT :: f32(80) // a stand-in CHROME_TOP
+				ED :: f32(600) // the Split divider
+				none := Drag_Latches{}
+				// A plain single left press over the preview half, nothing latched.
+				press :: proc(md_mode: Md_Mode, mx, my: f32, table := false, is_text := true, pressed := true, down := true, ctrl := false, clicks := 1, sel_drag := false, d := Drag_Latches{}) -> Press_Route {
+					return press_route(is_text, table, md_mode, my, CT, mx, ED, pressed, down, ctrl, clicks, sel_drag, d)
+				}
+
+				fmt.println("-- the surface is live at all --")
+				// THE ONE THAT MATTERS. Wyatt, 2026-08-06: "i can't drag,
+				// right-click, etc, copy, anything on the preview". If a plain press
+				// over a preview does not route to Sel_Start, the surface is dead to
+				// everything -- the swallow below consumes the press either way, so
+				// nothing else gets a chance at it.
+				r := press(.Preview, 300, 200)
+				pr_chk(&bad, r.ro && r.action == .Sel_Start, fmt.tprintf("Preview: a plain press starts a selection (ro=%v action=%v)", r.ro, r.action))
+				r = press(.Split, ED + 40, 200)
+				pr_chk(&bad, r.ro && r.action == .Sel_Start, fmt.tprintf("Split: a press RIGHT of the divider starts a selection (ro=%v action=%v)", r.ro, r.action))
+
+				fmt.println("-- and refuses what is not its press --")
+				r = press(.Split, ED - 40, 200)
+				pr_chk(&bad, !r.ro && r.action == .None, fmt.tprintf("Split: a press LEFT of the divider is the editor's (ro=%v action=%v)", r.ro, r.action))
+				r = press(.Off, 300, 200)
+				pr_chk(&bad, !r.ro && r.action == .None, "Off: a press in a plain text document is not the preview's")
+				r = press(.Preview, 300, CT - 10)
+				pr_chk(&bad, !r.ro && r.action == .None, "above CHROME_TOP: the tab strip's, not the preview's")
+				r = press(.Preview, 300, 200, is_text = false)
+				pr_chk(&bad, !r.ro && r.action == .None, "a settings page is not .Text, so nothing routes here")
+
+				fmt.println("-- the modifier and cluster gates --")
+				r = press(.Preview, 300, 200, ctrl = true)
+				pr_chk(&bad, r.ro && r.action == .None, "Ctrl is the link modifier, so it takes no selection")
+				r = press(.Preview, 300, 200, clicks = 2)
+				pr_chk(&bad, r.ro && r.action == .None, "the second press of a cluster belongs to click-to-sync-scroll")
+				r = press(.Preview, 300, 200, clicks = 3)
+				pr_chk(&bad, r.ro && r.action == .None, "...and so does a triple's third")
+
+				fmt.println("-- the drag continues across frames --")
+				// The press is over by now (pressed=false) but the button is still
+				// down and a drag is live. This is the case §6bu's bug killed one
+				// surface over: the swallow zeroes mouse_down every frame, so the
+				// extend has to be decided here or the drag dies the frame after it
+				// starts.
+				r = press(.Preview, 400, 300, pressed = false, sel_drag = true)
+				pr_chk(&bad, r.action == .Sel_Extend, fmt.tprintf("a live drag extends on a frame with no fresh press (%v)", r.action))
+				r = press(.Preview, 400, 300, pressed = false, down = false, sel_drag = true)
+				pr_chk(&bad, r.action == .None, "...but not once the button is released")
+				r = press(.Preview, 400, 300, pressed = false, sel_drag = false)
+				pr_chk(&bad, r.action == .None, "...and not without a drag in progress")
+
+				fmt.println("-- every drag latch stands the surface down --")
+				// Each latch owns the pointer across frames, so the read-only swallow
+				// must not consume its events. ro=false is what keeps the drag alive;
+				// the §6bu bug was one missing member of this struct.
+				latches := []struct {
+					what: string,
+					d:    Drag_Latches,
+				} {
+					{"the editor scrollbar", {vscroll = true}},
+					{"the h-scrollbar", {hscroll = true}},
+					{"the preview scrollbar", {preview = true}},
+					{"the split divider", {divider = true}},
+					{"a column resize", {col_resize = true}},
+					{"a dropdown's scrollbar", {menu_scroll = true}},
+				}
+				for l in latches {
+					rl := press(.Preview, 300, 200, d = l.d)
+					pr_chk(&bad, !rl.ro && rl.action == .None, fmt.tprintf("while %s is dragging, the preview stands down", l.what))
+				}
+				// ...and with NOTHING latched it does not, or the six rows above pass
+				// against a routine that always stands down.
+				r = press(.Preview, 300, 200, d = none)
+				pr_chk(&bad, r.ro && r.action == .Sel_Start, "...and with nothing latched it does not")
+
+				fmt.println("-- the grid is read-only too, but has no preview --")
+				r = press(.Off, 300, 200, table = true)
+				pr_chk(&bad, r.ro && r.action == .None, "a table grid swallows its press and starts no selection")
+				return bad
+			}
+			fmt.println("pressroutetest:")
+			return mode_done("pressroutetest", pr_run())
+		}
+
 		if os.args[1] == "mdjointest" {
 			para_join_test_run()
 			return true

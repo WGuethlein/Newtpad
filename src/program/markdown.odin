@@ -22,6 +22,7 @@ import "core:strings"
 import "core:unicode/utf8"
 import base "src:base"
 import plat "src:platform"
+import "src:ui"
 
 // Self-test for the pure parsing (block classifiers + inline runs); the rendering
 // itself needs a live eye. Returns the failure count. Driven by `newtpad mdtest`.
@@ -1723,10 +1724,53 @@ Md_Run :: struct {
 //
 // So: nothing in the preview may multiply S by a ratio at a draw site. It reads
 // a field of this struct, which was rounded when the struct was built.
+// Where the preview's readable column sits in its pane, and whether there is one.
+//
+// FULL IS THE DEFAULT because it is what Obsidian does as Wyatt runs it: his
+// vault's app.json sets `readableLineLength: false`, so the reading view he put
+// beside ours has no 700px column and no centring -- text fills the pane with
+// only the file margins. A default of .Centre would have made our preview
+// narrower than the thing it is supposed to look like, on first launch, for the
+// one person who reported the problem.
+//
+// FULL AND LEFT SHARE AN ORIGIN AND DIFFER IN WIDTH. Full stretches the column to
+// the pane; Left caps it at `measure` and pins it to the left. They are not the
+// same state, and any test that distinguishes them has to compare the WIDTH --
+// comparing origins alone cannot tell them apart.
+//
+// Named Md_Column, not Md_Align: Md_Align is taken, by a table cell's text
+// alignment, and one of the two would have had to be read in context forever.
+Md_Column :: enum u8 {
+	Full, // no readable-width cap: the column IS the pane
+	Left,
+	Centre,
+	Right,
+}
+
+// The preview's column state, sampled by md_metrics the way UI_SCALE and the
+// theme are. A global for the same reason those are: md_metrics is the single
+// point at which a pass samples the world, and threading a setting through every
+// caller of every layout entry point to reach it would be a parameter on a dozen
+// signatures that only one line reads.
+g_md_column: Md_Column = .Full
+
 Md_Metrics :: struct {
 	s:            f32, // the base document size S, as handed in
 	// Sizes, round(k * S). head[0] is unused so head[level] indexes directly.
 	head:         [7]f32,
+	// Per-level heading leading, from Obsidian's --h1-line-height … --h6-line-height
+	// (1.2 / 1.2 / 1.3 / 1.4 / 1.5 / 1.5). Indexed like `head`, head_lead[0] unused.
+	//
+	// NOT line_height(). That is LINE_SPACING -- the editor GRID's 1.5 (doc.odin:43),
+	// shared by every row of the document surface -- and a heading is not on that
+	// grid. Using it gave every heading one leading, which is most of why our
+	// headings read as loose beside Obsidian's: a 1.618 S h1 wants 1.2, not 1.5.
+	//
+	// Rounded through the same int() the grid's is, for the reason doc.odin:224
+	// states: an unrounded fractional leading drifts half a pixel per line. A
+	// heading is rarely tall enough for that to show as text, but the block HEIGHT
+	// feeds the scroll anchor, so a fractional one drifts the anchor instead.
+	head_lead:    [7]f32,
 	body:         f32, // 1.00 S
 	code:         f32, // 0.92 S -- inline and fenced
 	table:        f32, // 0.95 S
@@ -1750,26 +1794,91 @@ Md_Metrics :: struct {
 	// an h2's 1.6 S above are not meant to sum to 2.4 S.
 	head_above:   [7]f32,
 	head_below:   [7]f32,
+	// 2.5 S -- Obsidian's --heading-spacing, the space above a heading that FOLLOWS
+	// CONTENT. A pair rule, not a block's own property, so it is applied by the
+	// walk's collapse and never by md_layout_build: a cached entry cannot see its
+	// predecessor, and baking a neighbour into one is how a cache serves the wrong
+	// geometry after an edit above it. A heading after another heading, and the
+	// document's first block, do not get it.
+	head_pair:    f32,
 	para_below:   f32, // 0.8 S
 	list_gap:     f32, // 0.25 S between items
 	quote_above:  f32, // 0.8 S
 	quote_below:  f32, // 0.8 S
 	fence_above:  f32, // 1.0 S
 	fence_below:  f32, // 1.0 S
-	// Fixed pixel quantities from 9.2/9.3, DPI-scaled rather than S-scaled: they
-	// are decorations, not type.
+	// Fixed pixel quantities, DPI-scaled rather than S-scaled: they are
+	// decorations, not type. Values from Obsidian's own tokens under C7, with
+	// what §9.2/9.3 asked for noted where the two differ.
 	rule_gap:     f32, // 24px above and below a thematic break (9.2 item 10)
-	fence_pad:    f32, // 12px inside a fenced block
-	code_radius:  f32, // 3px behind an inline code span
-	fence_radius: f32, // 6px on the fenced block
-	quote_inset:  f32, // 16px per blockquote level (9.2 item 7)
-	list_indent:  f32, // 24px per list level (9.2 item 5)
+	rule_h:       f32, // 2px -- --hr-thickness. Was a bare hairline() at the draw.
+	fence_pad:    f32, // 12px VERTICAL inside a fenced block -- --size-4-3
+	fence_pad_x:  f32, // 16px HORIZONTAL -- --size-4-4. Obsidian's fence padding
+	// is not square (`padding: var(--size-4-3) var(--size-4-4)`) and ours used one
+	// number for both axes.
+	code_radius:  f32, // 4px behind an inline code span -- --radius-s. Was 3.
+	// 0.3 em of the CODE size, from `code { padding: 0.15em 0.3em }`. S-derived
+	// rather than DPI-derived because it is a property of the TEXT it sits behind:
+	// a code span at 0.8 S wants proportionally less air than one at 2 S.
+	code_pad_x:   f32,
+	fence_radius: f32, // 4px on the fenced block -- the SAME --radius-s token. Was
+	// 6, which read as the rounder, softer corner of the two and is most of why a
+	// fence looked unlike Obsidian's at a glance.
+	quote_inset:  f32, // 24px per blockquote level -- --size-4-6. Was 16 (9.2 item 7).
+	quote_bar_w:  f32, // 2px -- --blockquote-border-thickness. Was max(sx(2), 2)
+	// spelled at the draw, which is the same number with no name.
 	task_box:     f32, // 14px checkbox (9.2 item 9)
-	pad_left:     f32, // 40px left padding (9.3 measure line)
-	// 72ch, where a `ch` is the body face's advance for '0' at body size -- CSS's
-	// own definition, and the only one that makes "72ch" mean a column of 72
-	// characters in a proportional face.
+	// 20px HORIZONTALLY, both sides -- Obsidian's --file-margins (--size-4-5).
+	// §9.3's measure line gave 40px on the left and nothing on the right, so the
+	// preview's text ran into the scrollbar.
+	//
+	// The vertical margins are NOT this and are not owed: `ytop` comes from
+	// doc_content_box, which already insets by TEXT_MARGIN_Y. This field's first
+	// comment claimed "every side" and gave the top margin as its motivation, which
+	// was wrong twice over -- three readers, all horizontal, and a top inset that
+	// already existed. Fixed after the whole-branch review; CLAUDE.md's standing
+	// complaint is that audits cite comments as though they describe the code, and
+	// this was a fresh instance of exactly that.
+	pad:          f32,
+	// LIST INDENTATION IS S-DERIVED, NOT DPI-DERIVED, and that is a fix rather
+	// than a port. §9.2 item 5 said "24px per list level" and sx(24) scales with
+	// the MONITOR, so a reader who raised the preview font size got the same 24px
+	// indent under twice the text -- the marker crowded the prose it belongs to.
+	// Obsidian denominates both in text: `ul > li { margin-inline-start: 3ch }`
+	// for the first level and --list-indent (--indent-unit 0.5625em x
+	// --indent-size 4 = 2.25em) for each level under it.
+	list_indent:  f32, // FIRST level: 3ch of the body face
+	list_step:    f32, // each level below the first: 2.25 S
+	// 0.8 em, the bullet's hang: `.list-bullet { margin-inline-start: -0.8em }`.
+	// The marker sits this far LEFT of its item's prose, rather than the prose
+	// sitting a whole indent step right of the marker, which is what put a
+	// bullet's text almost a tab away from it.
+	list_hang:    f32,
+	// THE READABLE COLUMN WIDTH, when one is asked for: 43.75 S.
+	//
+	// Obsidian's --file-line-width is 700px at its own 16px base, and 700/16 is
+	// 43.75 -- so this is that number expressed as a RATIO rather than as a pixel
+	// constant, which is what keeps it right when the reader changes the preview
+	// font size. A hardcoded 700px would be a narrower column in characters at
+	// every size but 16.
+	//
+	// It replaces §9.3's "72ch". Two reasons, and the second is the real one: 72ch
+	// is 72 advances of `0` in a PROPORTIONAL face, which is not 72 characters of
+	// anything anyone reads; and C7 measures this preview against Obsidian, whose
+	// own answer is this one.
+	//
+	// Whether it BINDS is `column` below. Under .Full it is not consulted at all.
 	measure:      f32,
+	// Where the readable column sits in the pane, and whether there is one.
+	//
+	// .Full is the default and means NO column: the text runs the whole pane, which
+	// is what Wyatt's Obsidian does (his app.json has readableLineLength false) and
+	// so is the thing the preview is being compared against. The other three apply
+	// `measure` and place it.
+	//
+	// It reaches here through a global, the same way ui_scale and the theme do,
+	// because md_metrics is the one place that samples the world for a pass.
+	column:       Md_Column,
 	// Not type at all: the state OUTSIDE this struct that a block's layout also
 	// depends on, sampled ONCE per pass here because this struct is already the
 	// thing md_pass builds once and hands to every block. All three are cache-key
@@ -1829,34 +1938,90 @@ md_scale :: #force_inline proc(s, k: f32) -> f32 {return max(1, f32(int(s * k + 
 // `t` is needed only for the `ch` measure, which is a property of the body face.
 md_metrics :: proc(t: ^plat.Text, s: f32) -> (m: Md_Metrics) {
 	m.s = s
-	m.head = {0, md_scale(s, 1.85), md_scale(s, 1.50), md_scale(s, 1.25), md_scale(s, 1.10), md_scale(s, 1.00), md_scale(s, 1.00)}
+	// THE SCALE IS OBSIDIAN'S, and that is decision C7 rather than a tweak: the
+	// preview is measured against Obsidian and Obsidian wins where it and §9
+	// conflict (docs/ui-spec-gaps/README.md). Read out of its own app.css --
+	// --h1-size: 1.618em and so down -- not eyeballed from a screenshot. Ours was
+	// far more contrasty: 1.85 at the top and 1.00 by h5, against a near-geometric
+	// ladder where each step is about 1.10x the next.
+	m.head = {0, md_scale(s, 1.618), md_scale(s, 1.462), md_scale(s, 1.318), md_scale(s, 1.188), md_scale(s, 1.076), md_scale(s, 1.000)}
+	m.head_lead = {0,
+		f32(int(m.head[1] * 1.2 + 0.5)),
+		f32(int(m.head[2] * 1.2 + 0.5)),
+		f32(int(m.head[3] * 1.3 + 0.5)),
+		f32(int(m.head[4] * 1.4 + 0.5)),
+		f32(int(m.head[5] * 1.5 + 0.5)),
+		f32(int(m.head[6] * 1.5 + 0.5)),
+	}
 	m.body = md_scale(s, 1.00)
-	m.code = md_scale(s, 0.92)
-	m.table = md_scale(s, 0.95)
+	m.code = md_scale(s, 0.80) // --code-size -> --font-smallest: 0.8em. Was 0.92.
+	m.table = md_scale(s, 1.00) // --table-text-size IS --font-text-size. Was 0.95.
 	m.caption = md_scale(s, 0.88)
-	m.body_lead = md_scale(s, 1.65)
-	m.head_above = {0, 0, md_scale(s, 1.60), md_scale(s, 1.40), md_scale(s, 1.20), md_scale(s, 1.00), md_scale(s, 1.00)}
-	m.head_below = {0, md_scale(s, 0.60), md_scale(s, 0.50), md_scale(s, 0.40), md_scale(s, 0.30), md_scale(s, 0.30), md_scale(s, 0.30)}
-	m.para_below = md_scale(s, 0.80)
-	m.list_gap = md_scale(s, 0.25)
-	m.quote_above, m.quote_below = md_scale(s, 0.80), md_scale(s, 0.80)
+	m.body_lead = md_scale(s, 1.50) // --line-height-normal. Was 1.65, 10% looser.
+	// OBSIDIAN'S RHYTHM DOES NOT VARY BY LEVEL, and ours did. Its two rules are
+	//   h1..h6 { margin-block-start: 1rem; margin-block-end: 1rem }
+	//   :is(p,pre,table,ul,ol) + :is(h1..h6) { margin-top: 2.5rem }
+	// so what a heading carries ON ITS OWN is 1.0 S either side, and the 2.5 S is a
+	// property of the PAIR (content, then heading). The pair half is applied in
+	// md_walk's collapse, where the previous block is known -- a cached layout must
+	// not bake in a neighbour it cannot see.
+	//
+	// h1's space-above used to be 0 here, commented "it is the document's opening
+	// element". That intent is right and is now expressed properly: Obsidian's
+	// `.markdown-rendered > :first-child { margin-top: 0 }` zeroes the FIRST BLOCK
+	// whatever its kind, which md_walk applies. A document opening with a paragraph
+	// got no such treatment before, and an h1 in the MIDDLE of a document -- where
+	// it wants the full gap -- was given none.
+	m.head_above = {0, md_scale(s, 1.00), md_scale(s, 1.00), md_scale(s, 1.00), md_scale(s, 1.00), md_scale(s, 1.00), md_scale(s, 1.00)}
+	m.head_below = {0, md_scale(s, 1.00), md_scale(s, 1.00), md_scale(s, 1.00), md_scale(s, 1.00), md_scale(s, 1.00), md_scale(s, 1.00)}
+	m.head_pair = md_scale(s, 2.50) // --heading-spacing: calc(--p-spacing * 2.5)
+	m.para_below = md_scale(s, 1.00) // --p-spacing: 1rem. Was 0.80.
+	m.list_gap = md_scale(s, 0.15) // --list-spacing 0.075em, applied top AND bottom.
+	m.quote_above, m.quote_below = md_scale(s, 1.00), md_scale(s, 1.00)
 	m.fence_above, m.fence_below = md_scale(s, 1.00), md_scale(s, 1.00)
 	m.rule_gap = sx(24)
+	m.rule_h = sx(2)
 	m.fence_pad = sx(12)
-	m.code_radius = sx(3)
-	m.fence_radius = sx(6)
-	m.quote_inset = sx(16)
-	m.list_indent = sx(24)
+	m.fence_pad_x = sx(16)
+	m.code_radius = sx(4)
+	m.code_pad_x = md_scale(m.code, 0.30)
+	m.fence_radius = sx(4)
+	m.quote_inset = sx(24)
+	m.quote_bar_w = sx(2)
 	m.task_box = sx(14)
-	m.pad_left = sx(40)
-	m.measure = 72 * plat.text_advance(nil, t, '0', m.body, .Body)
+	m.pad = sx(20) // --file-margins: var(--size-4-5), all four sides
+	m.column = g_md_column
+	// A `ch` is the body face's advance for '0' -- CSS's own definition, and the
+	// same one m.measure below uses. Read once: text_advance is a cache lookup,
+	// but two call sites for one quantity is the thing the one-producer rule is
+	// about, not the cost.
+	ch := plat.text_advance(nil, t, '0', m.body, .Body)
+	m.list_indent = 3 * ch // `ul > li { margin-inline-start: 3ch }`
+	m.list_step = md_scale(s, 2.25) // --indent-unit 0.5625em * --indent-size 4
+	m.list_hang = md_scale(s, 0.80) // .list-bullet's -0.8em
+	m.measure = md_scale(s, 43.75) // --file-line-width: 700px at a 16px base
 	m.ui_scale, m.theme, m.faces = UI_SCALE, md_theme_gen(), plat.text_face_gen(t)
 	return
 }
 
-// h1 and h2 carry a rule under them (9.2 item 1, 9.3's "+ md_rule").
+// NO HEADING CARRIES A RULE UNDER IT. C7 (docs/ui-spec-gaps/README.md) measures
+// the preview against Obsidian, and Obsidian's reading view draws no heading
+// border at all -- `.code-block-flair` aside, there is no border-bottom on any
+// h1..h6 rule in its app.css. 9.2 item 1 and 9.3's "+ md_rule" asked for one on
+// h1 and h2; Obsidian wins where they conflict, and Wyatt chose it directly
+// (2026-09-03) with the two put side by side.
+//
+// The PROCEDURE stays, returning false, rather than the two call sites losing
+// their branch. It is the single producer of "does this heading have a rule",
+// read by the height (md_layout_build) and by the draw (md_block_draw), and
+// those two must never be able to disagree -- which is exactly what deleting it
+// and hand-editing both sites invites. It also keeps the decision in one place
+// to reverse if the rule ever comes back.
+//
+// The 2.5 S above a heading that follows content (m.head_pair) is what separates
+// sections now, which is what Obsidian uses and is why the rule is not missed.
 @(private = "file")
-md_head_rules :: #force_inline proc(level: int) -> bool {return level == 1 || level == 2}
+md_head_rules :: #force_inline proc(level: int) -> bool {return false}
 
 @(private = "file")
 is_space :: proc(b: u8) -> bool {return b == ' ' || b == '\t'}
@@ -2028,6 +2193,15 @@ md_fence_lexer :: proc(fence_line: string) -> Lexer_Proc {
 		tag = "c" // close enough for braces, strings and // comments
 	case "shell", "console", "bash", "zsh":
 		tag = "sh"
+	// POWERSHELL, and it is the one that mattered most in practice: EXT_LEXERS has
+	// carried a real PowerShell lexer at .ps1 (lex_shell_ps1_adapt, stateful, `#>`
+	// resync) the whole time, and with no alias here every ```powershell fence
+	// resolved nothing -- so it got neither the mono face nor the colours that were
+	// already implemented and already tested. Most of Wyatt's deploy notes are
+	// PowerShell, which is why his screenshots of our preview looked worst exactly
+	// where ours should have looked best.
+	case "powershell", "pwsh", "posh":
+		tag = "ps1"
 	case "yml":
 		tag = "yaml"
 	case "csharp", "c#":
@@ -2540,6 +2714,33 @@ Md_Kind :: enum u8 {
 	List,
 	Table,
 	Front_Matter,
+}
+
+// Is this kind CONTENT, for the purpose of the heading pair rule?
+//
+// Obsidian's selector is `:is(p,pre,table,ul,ol) + :is(h1..h6)`, and this is that
+// set: a paragraph, a fence, a table, a list, a quote, a rule. `pre` is our three
+// Fence_* kinds, since a fence is one CSS element and three blocks to us.
+//
+// What is NOT content, and each for its own reason:
+//   .Blank        -- has no height and the source did not mean it as a block; a
+//                    blank between a paragraph and a heading must not break the
+//                    pair, which is why the walk latches this kind SKIPPING blanks.
+//   .Heading      -- deliberately outside Obsidian's set. Stacked headings are a
+//                    title and its subtitle; 2.5 S between them reads as two
+//                    sections rather than one.
+//   .Front_Matter -- not prose the reader is reading past, and it opens the file,
+//                    where the first-block rule applies anyway.
+//
+// A procedure rather than a bit_set literal at the call site because the set IS
+// the rule, and a rule spelled at its one call site is a rule the next call site
+// copies.
+md_kind_is_content :: #force_inline proc(k: Md_Kind) -> bool {
+	#partial switch k {
+	case .Para, .Fence_Open, .Fence_Body, .Fence_Close, .Table, .List, .Quote, .Rule:
+		return true
+	}
+	return false
 }
 
 // One styled span of a block's inline content, parallel to the plat.Shape_Span
@@ -3366,16 +3567,24 @@ md_layout_build :: proc(
 
 	trimmed := strings.trim_left(e.src, " \t")
 	e.cls = md_classify(e.src, trimmed, in_fence)
-	// §9.3's "measure 72ch max" is a PROSE rule, applied here because this is the
-	// first point that knows what kind of block it is. Tables and fenced code get
-	// the whole pane: neither is continuous prose, and a table punished for extra
-	// columns is what sent this here (see md_content_span).
+	// EVERY KIND WRAPS AT THE PANE IT WAS GIVEN, and that pane is already the
+	// reader's chosen column (md_content_span). There is no per-kind cap here any
+	// more.
+	//
+	// There used to be: §9.3's "measure 72ch max" is a PROSE rule, so this switch
+	// exempted tables and fenced code, because squeezing a four-column table into
+	// 72ch makes every cell wrap MORE, which is the opposite of what a measure is
+	// for (Wyatt, live use 2026-08-05). C7 dissolves the problem rather than
+	// solving it again: under .Full there is no column, so a table gets the whole
+	// pane exactly as that fix intended, and under .Left/.Centre/.Right the reader
+	// asked for a column and everything in it belongs inside it -- which is what a
+	// browser does with a max-width container and what Obsidian does with
+	// `.is-readable-line-width`.
+	//
+	// Keeping the exemption would now be actively wrong: a table would break out of
+	// a column the reader deliberately narrowed, and paint over the scrollbar,
+	// since there is no scissor rect here.
 	measure := pane
-	#partial switch e.cls.kind {
-		case .Table, .Fence_Body, .Fence_Open, .Fence_Close, .Rule:
-		case:
-			measure = max(1, min(pane, m.measure))
-	}
 	e.wrap_w = measure
 
 	// Front matter is a BLOCK, not a pre-loop special case. Its height comes
@@ -3460,7 +3669,10 @@ md_layout_build :: proc(
 		}
 		return
 	case .Rule:
-		e.h = hairline()
+		// --hr-thickness: 2px. A hairline before, which at 100% is one physical
+		// pixel and reads as a scratch rather than a divider. The DRAW reads lay.h
+		// for its own height, so this is still the one producer of both.
+		e.h = m.rule_h
 		e.above, e.below = m.rule_gap, m.rule_gap
 		return
 	case .Fence_Open:
@@ -3521,16 +3733,37 @@ md_layout_build :: proc(
 	case .Fence_Body:
 		px, lead = m.code, line_height(m.code)
 		base_col = g_theme[.Md_Code]
+		// THE MONO FACE, and its absence was a real bug rather than an omission.
+		// `fallback_set` defaults to .Body at the top of this proc and only .Table
+		// overrode it, so a fence body fell back to the PROPORTIONAL body face. The
+		// mono, syntax-coloured path below is gated on `fence_lex != nil`, so the
+		// split was:
+		//
+		//   a fence whose language HAS a lexer -> mono, coloured, correct;
+		//   a fence whose language does not    -> proportional, one flat colour.
+		//
+		// Inline code was unaffected (correctly mono), which is why the two
+		// disagreed inside the same paragraph. Code set in a proportional face is
+		// the single loudest way a rendered document says "this was not done
+		// carefully", and after C7 moved the body face to a sans it would have been
+		// proportional SANS instead -- no better, and harder to notice.
+		//
+		// It is the FALLBACK, so it changes only the blocks that were reaching the
+		// wrong face: a resolved lexer still sets .Doc per token below.
+		fallback_set = .Doc
 		// 9.3's 12px fenced-code padding, as the block's INDENT rather than as a
 		// number the draw adds on its own. The glyph origin has exactly one
 		// producer (md_block_origin) and the link rects are built from it, so an
 		// inset applied at the draw and not at the layout would put the underline
 		// and the hit-test 12px apart -- which is the whole failure this task
 		// exists to make impossible.
-		e.indent = m.fence_pad
+		e.indent = m.fence_pad_x
 	case .Heading:
 		px = m.head[clamp(e.cls.level, 1, 6)]
-		lead = line_height(px)
+		// Per-level, from m.head_lead -- NOT line_height(), which is the editor
+		// grid's LINE_SPACING and gave all six headings the same 1.5. See the
+		// head_lead comment in Md_Metrics.
+		lead = m.head_lead[clamp(e.cls.level, 1, 6)]
 		base_col = g_theme[.Md_Heading]
 		e.above = m.head_above[clamp(e.cls.level, 1, 6)]
 		e.below = m.head_below[clamp(e.cls.level, 1, 6)]
@@ -3553,16 +3786,31 @@ md_layout_build :: proc(
 		// re-derives them.
 		md_join_run(doc, &e, p, line_end, buf[:])
 	case .List:
-		e.indent = f32(e.cls.level) * m.list_indent
-		// The bullet / checkbox sits at the item's nesting depth; the PROSE is
-		// indented one step further. Both come out of here, so md_block_draw has
-		// no expression of its own to keep in step (2026-07-29 review, L2).
-		e.marker = e.indent
+		// THE PROSE IS THE ANCHOR AND THE MARKER HANGS OFF IT, which is the reverse
+		// of what this did. Obsidian positions the item's CONTENT -- `ul > li
+		// { margin-inline-start: 3ch }`, then --list-indent (2.25em) per level
+		// below -- and floats the bullet back out of it by 0.8em
+		// (`.list-bullet { margin-inline-start: -0.8em }`).
+		//
+		// Ours put the MARKER at the nesting depth and pushed the prose a whole
+		// further indent step right, so a bullet sat almost a tab from the words it
+		// belongs to, and every nested level compounded it. Same two numbers, one
+		// producer, opposite sense.
+		// LEVEL IS 0-BASED -- md_list returns `depth = leading spaces / 2`, so a
+		// top-level item is 0. Hence `list_indent + level * list_step` and not
+		// `level * list_indent`: EVERY item gets Obsidian's 3ch, and each nesting
+		// level adds --list-indent (2.25em) on top, which is how the cumulative CSS
+		// indent of a `ul` inside an `li` comes out.
+		e.indent = m.list_indent + f32(e.cls.level) * m.list_step
+		// Both come out of here, so md_block_draw has no expression of its own to
+		// keep in step (2026-07-29 review, L2).
 		e.below = m.list_gap
 		if e.cls.task {
-			e.indent += m.task_box + m.list_indent * 0.25
+			// The checkbox is wider than a bullet glyph, so it hangs by its own
+			// width plus the same 0.8em gap the bullet leaves between mark and text.
+			e.marker = max(0, e.indent - m.task_box - m.list_hang * 0.5)
 		} else {
-			e.indent += m.list_indent
+			e.marker = max(0, e.indent - m.list_hang)
 		}
 		if e.cls.task_done {base_col, mute = md_task_prose_style(true)}
 		// A lazily continued list item, on exactly the same terms as .Quote above:
@@ -3658,6 +3906,35 @@ md_layout_build :: proc(
 			cut = hi
 		}
 		if cut < len(e.src) {emit(&sb, &draft, e.src[cut:], base_col, px)}
+	} else if e.cls.kind == .Fence_Body {
+		// A FENCE BODY WITH NO LEXER: one raw span, on the mono face, with no
+		// inline parsing at all.
+		//
+		// Without this it fell through to the general branch below, which does two
+		// wrong things to code. It runs md_inline over it, so `**x**` inside a code
+		// block rendered as emphasis and its asterisks disappeared -- markdown does
+		// not apply inside a fence, and the whole point of one is that the bytes are
+		// shown as written. And it takes its face from md_run_set, which answers
+		// .Body for a run with no .Code style, so the text came out in the
+		// PROPORTIONAL body face. Inline code was unaffected (md_run_set answers
+		// .Doc for .Code), which is why the two disagreed inside one document.
+		//
+		// So the split was: a fence whose language HAS a lexer -> mono and coloured,
+		// because the branch above emits .Doc per token; a fence whose language does
+		// not -> proportional, and quietly re-parsed as prose.
+		//
+		// NOTE FOR THE SWEEP'S DIAGNOSIS, which named `fallback_set`: that variable
+		// is real and it did default to .Body, but it is read at exactly one place
+		// (the empty-block height fallback), so setting it does NOT fix this. It is
+		// set correctly in the .Fence_Body case now and this is the change that
+		// makes code look like code. Reading the symptom off the source found the
+		// right block and the wrong line.
+		//
+		// e.src, not e.cls.content, matching the lexer branch above: both want the
+		// raw line exactly as written, including its leading whitespace.
+		off := strings.builder_len(sb)
+		strings.write_string(&sb, e.src)
+		append(&draft, Md_Draft_Span{off = off, len = len(e.src), color = base_col, px = px, set = .Doc})
 	} else {
 		content := e.cls.content
 		// UI spec §9.3: h6 is CAPS. It is the one level with no size of its own --
@@ -3851,6 +4128,49 @@ md_layout_build_for_test :: proc(gfx: ^plat.Gfx, t: ^plat.Text, doc: ^Document, 
 	return md_layout_build(gfx, t, doc, m, p, lend, line, false, nil, {}, measure)
 }
 
+// The same, but with the fence state THREADED FROM BYTE 0 the way md_walk
+// threads it, so a block inside a fence classifies as `.Fence_Body` and carries
+// the opening fence's lexer.
+//
+// A separate procedure rather than a change to the one above, which hands
+// `in_fence = false` unconditionally: every existing caller builds a block that
+// is not in a fence, and quietly making them all thread would change what those
+// tests are testing. This one exists because a test that wanted a fence body got
+// a `.Para` and asserted happily about it.
+//
+// THREADED, not md_fence_seed'd, and the difference is the whole point. The seed
+// is for entering a document partway down: it recovers `in_fence` from the lexer
+// state, then asks lex_index_fence_open for the opening line so it can recover
+// the LEXER too -- and that index is built by a background pass which a
+// freshly-made test document does not have, so the seed answers
+// `(true, nil)`. A test built on it therefore exercises the no-lexer path
+// whatever language the fence names, and a "control" case meant to prove the
+// lexer path still works passes for the wrong reason. md_walk itself never has
+// this problem: it takes `out_lex` from the `.Fence_Open` block it just built.
+md_layout_build_fenced_for_test :: proc(gfx: ^plat.Gfx, t: ^plat.Text, doc: ^Document, m: ^Md_Metrics, p: int, measure: f32) -> Md_Layout {
+	buf: [RENDER_LINE_CAP]u8
+	in_fence, fence_lex := false, Lexer_Proc(nil)
+	fence_state := base.Lex_State{}
+	q := 0
+	for q < p && q <= doc.pt.length {
+		line, lend, _ := md_line_at(doc, q, buf[:])
+		lay := md_layout_build(gfx, t, doc, m, q, lend, line, in_fence, fence_lex, fence_state, measure)
+		// EVERY field is read before the free. md_layout_free ends with `e^ = {}`,
+		// so `lay.next` afterwards is 0 and this loop never advances -- which is a
+		// hang, not a wrong answer, and cost one 7-minute timeout to notice.
+		next := lay.next
+		in_fence, fence_lex, fence_state = lay.out_fence, lay.out_lex, lay.out_state
+		md_layout_free(&lay)
+		// A block that does not advance would hang the loop just as surely; blocks
+		// tile the document, so this is belt and braces over a bound that already
+		// holds.
+		if next <= q {break}
+		q = next
+	}
+	line, lend, _ := md_line_at(doc, p, buf[:])
+	return md_layout_build(gfx, t, doc, m, p, lend, line, in_fence, fence_lex, fence_state, measure)
+}
+
 // The cached layout for the block at `p`, building it if no slot holds one.
 // Round-robin replacement, like md_table_ensure's four slots and for the same
 // reason: a viewport walk touches its blocks top to bottom, so anything that
@@ -3989,30 +4309,121 @@ md_pane_owns :: proc(doc: ^Document, winw, winh, split_frac, mx: f32) -> bool {
 	return mx >= x0 - TEXT_MARGIN_X && mx < x1 + SCROLLBAR_W
 }
 
-// The content origin and the measure inside a pane spanning [x0, x1].
+// THE SINGLE PRODUCER of the preview's content origin and content width, inside a
+// pane spanning [x0, x1]. The draw, the hit-test, the link rects, the scroll
+// context and the selection all read this and nothing re-derives either number.
 //
-// 9.3: "measure 72ch max, left-aligned, 40px left padding". The padding is
-// measured from the PANE's own left edge, which is x0 - TEXT_MARGIN_X (both
-// call sites hand this the margin already added), so the preview gets its 40px
-// without either of them having to know that.
-// Returns the PANE's usable width, not §9.3's 72ch measure.
+// The padding is measured from the PANE's own left edge, which is
+// `x0 - TEXT_MARGIN_X` (both call sites hand this the margin already added), so
+// the preview gets its inset without either of them having to know that.
 //
-// The 72ch cap moved into md_layout_build, where the block's KIND is known,
-// because it is a PROSE rule and does not transfer to everything. Wyatt, live use
-// 2026-08-05, with a four-column table as the evidence: squeezing more columns
-// into a fixed 72ch makes each one narrower, so every cell wraps more -- his
-// screenshot broke `docs/01-specification.md` across two lines mid-filename. A
-// measure exists so the eye can find the next line of continuous prose; a table
-// cell is a short independent phrase and the eye never travels the row. Capping
-// it produced more eye travel, not less, which is the opposite of the rule's
-// purpose.
+// C7 changed both halves of what this returns.
 //
-// This also has to be the LAYOUT CACHE KEY, which is the other reason the cap
-// cannot live here: keyed on the capped value, a table's layout would not
-// invalidate when the pane grew from 100ch to 140ch, because the key never moved.
+// THE WIDTH IS NOW THE COLUMN, NOT THE PANE, and the per-kind 72ch cap that used
+// to live in md_layout_build is gone with it. That cap existed because §9.3's
+// measure was a PROSE rule that could not be applied to tables -- Wyatt, live use
+// 2026-08-05: squeezing a four-column table into 72ch makes every cell wrap more,
+// which is the opposite of what a measure is for. Under .Full there is no cap at
+// all, so a table gets the whole pane exactly as that fix intended; under the
+// other three the reader has ASKED for a column, and a table inside it belongs
+// inside it, which is what a browser does with a max-width container and what
+// Obsidian does with `.is-readable-line-width`.
+//
+// That also disposes of the cache-key hazard the old comment here warned about --
+// "keyed on the capped value, a table's layout would not invalidate when the pane
+// grew from 100ch to 140ch". It could not, because the width the layout USED
+// (capped) was not the width the key HELD (the pane). They are the same number
+// now. Under .Full the column tracks the pane, so growing it moves the key;
+// under a bound column the layout genuinely should not change, because the
+// reader's chosen column did not.
+//
+// So no new cache-key term is needed, and that is worth stating because it looks
+// like one would be: .Full and .Left at a pane narrower than `measure` produce
+// the same origin AND the same width, which means they are the same layout and
+// SHOULD share an entry. .Left and .Centre at a wide pane produce the same width
+// and different origins -- also the same layout, since an origin cannot change
+// where text wraps, and the origin is not baked into one.
+// THE COLUMN CONTROL'S GEOMETRY -- one producer, read by the draw, the hover and
+// the click (CLAUDE.md's one-layout rule).
+//
+// Four square cells in the pane's top-right corner. Obsidian puts its own
+// in-content controls there, and it is the corner that does not move when the
+// pane's left edge does -- which is exactly what happens in Split as the divider
+// is dragged, and why ui.segmented_layout places from its RIGHT edge.
+//
+// It is drawn only while the pointer is over the pane (see md_column_control_shown)
+// and hit-tested unconditionally. A control that becomes clickable only after a
+// hover has registered loses the first click of every interaction; one that is
+// always painted is chrome over the content, which principle 2 spends the screen
+// on the document instead. Obsidian makes the same trade with its copy button
+// (`pre:not(:hover) > button.copy-code-button { display: none }`).
+MD_COL_CELL_96 :: f32(20)
+MD_COL_GAP_96 :: f32(2)
+MD_COL_INSET_96 :: f32(6) // from the pane's top-right corner
+
+// The four glyphs, in Md_Column order, so `tag` indexes this directly and the
+// mapping from a cell to a state is a cast rather than a switch.
+//
+// BLOCK ELEMENTS, not letters or arrows, because the thing being chosen is WHERE
+// A COLUMN SITS IN A PANE and these draw exactly that: a full-width block, a
+// block against the left edge, a narrow one in the middle, one against the right.
+// The glyph is a picture of the result rather than a label for it, which is what
+// lets four 20px cells say something without a word between them.
+//
+// Three are Block Elements (U+2588, U+258C, U+2590) and U+25AE is Geometric
+// Shapes; all four are present in
+// Consolas and Cascadia Mono -- the two faces the chrome ever uses. `≡` for all
+// three alignments was the first draft and made Left, Centre and Right
+// indistinguishable, which is a control that cannot be used without trying it.
+md_column_glyphs := [4]string{"█", "▌", "▮", "▐"}
+
+md_column_control :: proc(m: ^Md_Metrics, text: ^plat.Text, x0, x1, ytop: f32, out: []ui.Button) -> ui.Segmented {
+	um := ui.Metrics {
+		h        = sx(MD_COL_CELL_96),
+		pad      = 0,
+		gap      = 0,
+		label_cw = plat.text_char_width(text, UI_SMALL_PX),
+		chord_cw = plat.text_char_width(text, UI_SMALL_PX),
+		baseline = sx(MD_COL_CELL_96) - sx(6),
+		snap     = true,
+	}
+	// Flush to the same right margin the content uses, so the control lines up
+	// with the text under it rather than with the scrollbar.
+	right := x1 - m.pad
+	return ui.segmented_layout(right, ytop + sx(MD_COL_INSET_96), sx(MD_COL_CELL_96), sx(MD_COL_GAP_96), md_column_glyphs[:], um, out)
+}
+
 md_content_span :: proc(m: ^Md_Metrics, x0, x1: f32) -> (cx, pane: f32) {
-	cx = max(x0, x0 - TEXT_MARGIN_X + m.pad_left)
-	return cx, max(1, x1 - cx)
+	// THE CONTENT BOX NEVER LEAVES [x0, x1], and that bound is not cosmetic:
+	// md_preview_pos_at refuses any press with `mx < x0` (its own first line), so
+	// content drawn left of x0 is drawn and NOT clickable. §9.3's 40px left padding
+	// hid this -- 40 > TEXT_MARGIN_X's 24, so the origin was always right of x0
+	// anyway. Obsidian's margin is 20px, which is less, and taking it from the
+	// pane's true edge put the first 4px of every line outside the hit region.
+	// The four-state seam check in mdhittest is what caught it.
+	//
+	// So the left margin is `max(x0, pane_edge + pad)` -- 24px here rather than
+	// Obsidian's 20 -- while the right is a true `pad`. Four pixels of asymmetry,
+	// against a hit-test gate that would otherwise have to move for every consumer
+	// of the pane box. If the two ever need to be exactly equal, the gate is the
+	// thing to change, and md_pane_hit (which already widens to `x0 -
+	// TEXT_MARGIN_X`) is the shape to change it to.
+	pane_l := x0 - TEXT_MARGIN_X // the pane's own left edge, inside x0
+	inner_l := max(x0, pane_l + m.pad)
+	inner_r := max(inner_l + 1, x1 - m.pad)
+	avail := inner_r - inner_l
+	column := avail if m.column == .Full else max(1, min(avail, m.measure))
+	slack := max(0, avail - column)
+	off := f32(0)
+	switch m.column {
+	case .Full, .Left:
+	case .Centre:
+		off = slack * 0.5
+	case .Right:
+		off = slack
+	}
+	cx = inner_l + off
+	return cx, column
 }
 
 // UI spec 9.1 item 4: "a scroll offset in PIXELS, not lines".
@@ -4151,6 +4562,16 @@ md_sel_range :: proc(doc: ^Document) -> (lo, hi: Md_Pos, ok: bool) {
 	return a, b, true
 }
 
+// Does the preview hold a selection with any WIDTH? `doc.md_sel_on` alone does
+// not answer that: a bare click sets it with both ends equal, which md_sel_range
+// then refuses. Exposed because the context menu has to grey Copy out for exactly
+// that state, and asking md_sel_range for its `ok` is asking the one producer
+// rather than re-deriving the emptiness test beside it.
+md_sel_ok :: proc(doc: ^Document) -> bool {
+	_, _, ok := md_sel_range(doc)
+	return ok
+}
+
 md_sel_clear :: proc(doc: ^Document) {
 	if doc == nil {return}
 	doc.md_sel_on = false
@@ -4250,6 +4671,19 @@ md_walk :: proc(
 	// walk keeps besides prev_below, and both exist for the same reason -- a gap is
 	// a property of a pair, not of a block.
 	after_list := false
+	// The last CONTENT kind the walk passed, for the heading pair rule above.
+	// Blanks do not overwrite it, so `paragraph / blank line / heading` still reads
+	// as the pair Obsidian's `+` combinator matches -- a blank line is how markdown
+	// separates blocks, not a block the reader sees.
+	//
+	// Seeded to .Blank, exactly as prev_below is seeded to 0 and for the same
+	// reason: a walk enters the document at the scroll anchor, so the first block
+	// it sees has a predecessor it did not look at. MD_RUNUP_LINES is what makes
+	// that safe -- md_anchor_walk starts the walk above the anchor so this is
+	// latched from real blocks by the time the anchor is reached. A walk with no
+	// run-up gets the same answer the collapsed gap gets, which is to say the
+	// document's own, only at byte 0.
+	last_kind := Md_Kind.Blank
 	empties := 0
 	reached = p > doc.pt.length || p >= stop_at
 	for p <= doc.pt.length && p < stop_at && n < len(out) && empties < MD_MAX_EMPTY_BLOCKS {
@@ -4259,6 +4693,39 @@ md_walk :: proc(
 		if nb > 0 && buf[nb - 1] == '\r' {nb -= 1}
 		lay := md_layout_ensure(gfx, text, doc, m, p, end, string(buf[:nb]), in_fence, fence_lex, fence_state, measure)
 		gap := max(prev_below, lay.above)
+		// OBSIDIAN'S PAIR RULE: `:is(p,pre,table,ul,ol) + :is(h1..h6)` gets
+		// --heading-spacing (2.5 S) rather than the 1.0 S a heading carries alone.
+		//
+		// HERE and not in md_layout_build for the same reason after_list below is
+		// here: a gap is a property of a PAIR, and md_layout_build sees one block.
+		// A cached entry that baked in its predecessor would serve the wrong space
+		// the moment the block above it changed kind.
+		//
+		// last_kind, not the raw previous block, so a blank line between a paragraph
+		// and a heading does not break the pair -- the blank has no height and the
+		// source did not mean it as content. That is the same skip after_list makes,
+		// and for the same reason.
+		//
+		// A heading after a HEADING is deliberately not in Obsidian's `:is(...)`
+		// set and so keeps 1.0 S: stacked headings are a title and its subtitle,
+		// and 2.5 S between them reads as two sections rather than one.
+		if lay.cls.kind == .Heading && md_kind_is_content(last_kind) {
+			gap = max(gap, m.head_pair)
+		}
+		// `.markdown-rendered > :first-child { margin-top: 0 }` -- the document's
+		// FIRST block has no space above it, whatever kind it is. The top inset is
+		// the pane's padding's job, not a block's.
+		//
+		// This generalises what m.head_above[1] used to hardcode as 0 for h1 alone,
+		// commented "it is the document's opening element". It was right about the
+		// intent and wrong about the mechanism: a document opening with a paragraph
+		// or a fence got no such treatment, and an h1 in the MIDDLE of a document,
+		// where it wants the full gap, was given none.
+		//
+		// lay.start rather than a loop counter: `p` may enter this walk anywhere
+		// (the walk starts at the scroll anchor, not at byte 0), so "is this the
+		// first block" is a fact about the DOCUMENT and only byte 0 answers it.
+		if lay.start <= 0 {gap = 0}
 		// THE GAP AFTER A LIST RUN IS A PARAGRAPH'S, NOT AN ITEM'S. §9.3 gives a
 		// list item "0.25 S between items" -- between ITEMS -- and the layout
 		// applied it as the `below` of every item including the last, so the prose
@@ -4294,14 +4761,18 @@ md_walk :: proc(
 		// immediately, so nothing fires.
 		//
 		// PROSE AND BLANKS ONLY, not every block that can follow a list. Every
-		// other kind carries its own space-above from §9.3 -- an h2's 1.6 S, a
-		// fence's 1.0 S, a quote's 0.8 S -- and those are already at least a
-		// paragraph's worth, so raising them would change nothing. The one
-		// exception is an h1, whose §9.3 space-above is 0 ON PURPOSE (it is the
-		// document's opening element), and overriding that would be this fix
-		// second-guessing the spec on a case nobody reported. A paragraph's
-		// space-above is 0 for the same stated reason and is exactly the case that
-		// WAS reported, which is why the gap has to come from the list's side.
+		// other kind carries its own space-above -- 1.0 S for a heading, a fence or
+		// a quote, and 24px for a rule -- and those are already at least a
+		// paragraph's worth, so raising them would change nothing.
+		//
+		// The old text here named "an h2's 1.6 S, a quote's 0.8 S" and made an
+		// exception of h1, "whose space-above is 0 ON PURPOSE (it is the document's
+		// opening element)". C7 replaced the graduated per-level rhythm with
+		// Obsidian's flat one, so those three numbers are gone; the h1 exception is
+		// gone with them, generalised into the first-block rule above, which is what
+		// it was always trying to say. A paragraph's space-above is still 0, which
+		// is still exactly the reported case, which is still why the gap has to come
+		// from the list's side.
 		if after_list && lay.cls.kind != .List {
 			if lay.cls.kind == .Para || lay.cls.kind == .Blank {
 				gap = max(gap, m.para_below)
@@ -4309,6 +4780,10 @@ md_walk :: proc(
 			after_list = false
 		}
 		if lay.cls.kind == .List {after_list = true}
+		// Latched AFTER this block's own gap is decided, and skipping .Blank -- see
+		// the declaration. A heading updates it too, so heading-after-heading is
+		// correctly not a content pair.
+		if lay.cls.kind != .Blank {last_kind = lay.cls.kind}
 		out[n] = {start = p, end = lay.end, next = lay.next, slot_top = total, gap = gap, h = lay.h, lay = lay}
 		n += 1
 		total += gap + lay.h
@@ -4525,7 +5000,9 @@ md_pass :: proc(
 		} else {
 			zebra_tbl = -1 // a non-table block ends the run
 		}
-		if qp != nil {md_block_draw(gfx, qp, text, doc, &m, p.blk.lay, cx, x1, p.y, p.admit, p.blk.start, trow)}
+		// cx + measure, NOT x1: everything md_block_draw stretches rightwards must
+		// stop at the reader's column, not at the pane. See its own comment.
+		if qp != nil {md_block_draw(gfx, qp, text, doc, &m, p.blk.lay, cx, cx + measure, p.y, p.admit, p.blk.start, trow)}
 		if links != nil {md_block_links(doc, p.blk.lay, cx, p.y, p.admit, links)}
 		if sel_at != nil && !sel_at.ok {
 			// First block whose admitted band contains the point wins. `>= p.y` and
@@ -4595,6 +5072,51 @@ markdown_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text,
 	bottom, s = md_pass(gfx, qp, text, doc, px, x0, x1, ytop, ybot, at, nil)
 	if shown != nil {shown^ = s}
 	return
+}
+
+// Is the column control visible? Only while the pointer is inside the pane.
+//
+// The PANE, not the strip. Revealing on the strip alone would mean the control
+// appears only once the pointer is already on top of it, which nobody would ever
+// discover; revealing on the pane is how Obsidian's copy button behaves (its
+// selector is `pre:hover`, the block, not the button).
+md_column_control_shown :: proc(doc: ^Document, winw, winh, split_frac, mx, my: f32) -> bool {
+	if doc == nil || doc.md_mode == .Off {return false}
+	x0, x1, ytop, ybot, ok := md_pane_box(doc, winw, winh, split_frac)
+	if !ok {return false}
+	return mx >= x0 && mx < x1 && my >= ytop && my < ybot
+}
+
+// Draw it. Appearance only -- every coordinate comes from md_column_control, the
+// same call the click reads, so what is painted and what is clickable cannot
+// disagree (CLAUDE.md's one-layout rule).
+md_column_control_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text, doc: ^Document, px, winw, winh, split_frac, mx, my: f32) {
+	if !md_column_control_shown(doc, winw, winh, split_frac, mx, my) {return}
+	x0, x1, ytop, _, ok := md_pane_box(doc, winw, winh, split_frac)
+	if !ok {return}
+	m := md_metrics(text, px)
+	cells: [4]ui.Button
+	seg := md_column_control(&m, text, x0, x1, ytop, cells[:])
+	// A ground under the whole strip, so the glyphs read against the document
+	// rather than on top of whatever line happens to be behind them.
+	r := m.code_radius
+	plat.quads_draw(gfx, qp, []plat.Quad{{pos = {seg.x - sx(3), seg.y - sx(3)}, size = {seg.w + sx(6), seg.h + sx(6)}, color = g_theme[.Bg_Raised], radius = {r, r, r, r}}})
+	for i in 0 ..< seg.n {
+		c := cells[i]
+		on := int(m.column) == i
+		if on {
+			plat.quads_draw(gfx, qp, []plat.Quad{{pos = {c.x, c.y}, size = {c.w, c.h}, color = g_theme[.Accent], radius = {r, r, r, r}}})
+		}
+		// The CURRENT cell reads against its accent fill; the rest are dim until
+		// the pointer is on them, which is the same three-state treatment every
+		// other control in the product uses.
+		// Text_MUTED, not Text_Dim. themetest forbids Text_Dim in live text and this
+		// broke that guard -- the role is "DISABLED ONLY" and measures 2.9:1 in Dark,
+		// under the AA floor. An idle cell here is live information, not a disabled
+		// control, so it does not qualify for the one exemption that exists.
+		col := g_theme[.Bg_Base] if on else (g_theme[.Text_Primary] if ui.button_hit(c, mx, my) else g_theme[.Text_Muted])
+		plat.text_draw(gfx, text, c.label, c.tx, c.ty, UI_SMALL_PX, col)
+	}
 }
 
 // The links the preview would draw, in absolute client coordinates. The same
@@ -5506,12 +6028,52 @@ md_anchor_from_top :: proc(c: ^Md_Scroll_Ctx, top: int) -> Md_Anchor {
 }
 
 // The other direction of 9.4's sync: the source line the editor should put at
-// its top when the preview is at `a`. A block start is a line start, so this is
-// the block's own byte -- the mapping is by BLOCK, which is the point: mapping
-// by line drifts the moment a heading or a fence changes height.
+// its top when the preview is at `a`.
+//
+// THE MAPPING IS STILL BY BLOCK, AND NOW IT INTERPOLATES INSIDE ONE. Wyatt, live
+// use 2026-09-03: *"the scroll is weird, it's blocky… it should be smooth"*. This
+// returned the block's own first line and threw `a.px` away, so scrolling the
+// preview left the editor STILL until the anchor crossed into the next block and
+// then jumped it a whole paragraph or fence at once. The preview moved smoothly
+// and the pane beside it lurched, which is what "blocky" describes.
+//
+// §9.4's rule survives intact, because it is a rule about IDENTITY: *"scroll sync
+// by block, not by line. Line-based sync drifts the moment a heading or a code
+// fence changes height."* The anchor is still a block -- nothing here counts
+// lines from the top of the document, so nothing can drift -- and the pixels are
+// resolved only WITHIN that block, where the two views describe the same bytes.
+// Recorded as C9 in the gap register: the effect is overruled, the reason is kept.
+//
+// The interpolation matches **`md_scroll_to_fraction`** (:5989), which maps the
+// other way — a scalar position to `{block, px}` — by the same proportion of the
+// same `md_block_at_byte` slot. They are deliberately the same arithmetic so the
+// two cannot disagree about what "half way through this block" means.
+//
+// NOT an exact inverse, and the comment here used to claim one under a procedure
+// name (`md_anchor_from_frac`) that does not exist — the whole-branch review
+// caught both. `px` is lossy through the round trip, because this collapses to a
+// LINE start below. That is harmless in the only direction it runs: the sync
+// re-anchors the preview from the editor only when the EDITOR moved, and
+// md_anchor_from_top (the procedure that actually sits directly above) discards
+// `px` outright when it does. A future reader should not look here for an
+// invariant no code provides.
+//
+// A LINE START, not the interpolated byte itself: doc.top is the byte of a
+// visible ROW, so an arbitrary interior byte is not a legal value for it. With
+// wrap on (Split forces it) a logical line start is still a valid visual row
+// start -- the first one of that line -- so this is coarser than per-visual-row
+// and never invalid, which is the right way round for a value the editor's whole
+// coordinate system reads.
 md_anchor_top_byte :: proc(c: ^Md_Scroll_Ctx, a: Md_Anchor) -> int {
 	if c.doc == nil {return 0}
-	return base.pt_line_start(&c.doc.pt, clamp(a.block, 0, c.doc.pt.length))
+	blk := clamp(a.block, 0, c.doc.pt.length)
+	if a.px <= 0 {return base.pt_line_start(&c.doc.pt, blk)}
+	start, next, slot := md_block_at_byte(c, blk)
+	// A zero-height or empty block has no interior to be part way through.
+	if slot <= 0 || next <= start {return base.pt_line_start(&c.doc.pt, blk)}
+	frac := clamp(a.px / slot, 0, 1)
+	target := start + int(frac * f32(next - start))
+	return base.pt_line_start(&c.doc.pt, clamp(target, start, max(start, next - 1)))
 }
 
 // 9.1's one surviving pixel -> content mapping: "click-to-sync-scroll, which
@@ -5631,6 +6193,20 @@ md_block_links :: proc(doc: ^Document, lay: ^Md_Layout, cx, ytop: f32, ad: Md_Ad
 // glyphs and for every rectangle in lay.boxes. A band drawn to lay.h under a
 // partial admit is exactly the overhang the admit test exists to prevent.
 @(private = "file")
+// `x1` here is THE COLUMN'S RIGHT EDGE (cx + the width md_content_span returned),
+// not the pane's. The caller resolves it; everything in this procedure that
+// stretches to "the right" -- the fence bands, the rule, the front-matter card,
+// the table extent clamp and its column rules -- therefore stops where the
+// reader's column stops.
+//
+// It used to be the pane's own x1, which was harmless while the column was always
+// the pane. C7 made the column a choice, and under .Centre at a wide window the
+// difference is 222px: a fenced block's background, a thematic break and a
+// front-matter card all painted a fifth of the pane past the text they belong to,
+// and past the right margin as well. The whole-branch review caught it; the seam
+// assertion that should have caught it compared md_content_span's own output
+// against md_content_span's own output for another state, which is the producer
+// agreeing with itself.
 md_block_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text, doc: ^Document, m: ^Md_Metrics, lay: ^Md_Layout, cx, x1, ytop: f32, ad: Md_Admit, blk_start := -1, trow := -1) {
 	x := md_block_origin(lay, cx)
 	// The selection, UNDER everything this block draws (UI spec §9.4: "Selection
@@ -5790,7 +6366,7 @@ md_block_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text,
 			// it read as decoration in the muted quote colour, which is the TEXT's
 			// role. The text stays Md_Quote; only the bar moves, the same split the
 			// bullet glyph already uses (accent mark, ordinary body text).
-			plat.quads_draw(gfx, qp, []plat.Quad{{pos = {cx + f32(d) * step, ytop}, size = {max(sx(2), 2), ad.h}, color = g_theme[.Accent]}})
+			plat.quads_draw(gfx, qp, []plat.Quad{{pos = {cx + f32(d) * step, ytop}, size = {max(m.quote_bar_w, 2), ad.h}, color = g_theme[.Accent]}})
 		}
 	case .List:
 		lx := cx + lay.marker // md_layout_build's own number, not a second copy
@@ -5845,7 +6421,11 @@ md_block_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text,
 		bx, by := x + b.x, ytop + b.y
 		if .Code in sp.style && .Link not_in sp.style {
 			r := m.code_radius
-			pad := max(1, m.code_radius * 0.5)
+			// 0.3 em of the CODE size -- Obsidian's `code { padding: 0.15em 0.3em }`.
+			// It used to be half the corner radius, which is a coincidence rather than
+			// a reason: the two moved together whenever the radius was tuned, and at
+			// radius 3 that left 1.5px, so a code span touched the words either side.
+			pad := max(1, m.code_pad_x)
 			plat.quads_draw(gfx, qp, []plat.Quad{{pos = {bx - pad, by}, size = {b.w + pad * 2, b.h}, color = g_theme[.Md_Code_Bg], radius = {r, r, r, r}}})
 		}
 	}

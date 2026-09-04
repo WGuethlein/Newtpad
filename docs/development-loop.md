@@ -366,6 +366,23 @@ Each of these cost real time at least once.
   no terminal to open.
 - Commit in logical, incremental units. The history should read like a person building the project.
 
+**Editing Odin source from a shell**
+
+Both of these cost several failed builds in one session (2026-09-03) and neither is guessable.
+
+- **A `\n` inside a bash heredoc does not survive.** Writing an Odin string literal such as
+  `src := "***\n"` through a `python - <<'PY'` heredoc — even a quoted one — arrives as a REAL
+  newline, which is a `Syntax Error: Invalid string literal` and an unterminated string. It happened
+  four times before the pattern was recognised, twice producing a broken file that then had to be
+  found by eye. **Anything containing a backslash escape goes through the Edit/Write tool, not a
+  heredoc.** The failure is silent at write time and only shows up at the compiler.
+- **The tree has MIXED line endings.** `src/program/markdown.odin` and `test_modes.odin` are CRLF;
+  `src/program/settings.odin` is LF. A script that matches on `"...\n"` therefore finds nothing in
+  half the files and reports a missing anchor, which reads as "the code moved" rather than "the
+  newline is wrong". `cat -A` in Git Bash normalises the endings and will tell you the file is LF
+  when it is not — read the bytes in Python if it matters. Detect per file
+  (`NL = '\r\n' if '\r\n' in s else '\n'`) or, better, use the Edit tool, which handles it.
+
 **Signing**
 
 - **Never handle a code-signing certificate password.** Signing is blocked on Wyatt purchasing a

@@ -54,9 +54,12 @@ MAX_FACES :: 8
 // keyed by its set (Glyph_Key.set), so sharing a chain would mean sharing the
 // cell_cache and the atlas entries of a face with completely different metrics.
 //
-// STYLE IS A MEMBER, NOT A PARAMETER. §9.3 gives weight 700 to every heading
-// row, so the preview needs a real Georgia Bold rather than the synthetic
-// hairline-offset double-draw (at 1.85 S that is a smear, not weight 700). The
+// STYLE IS A MEMBER, NOT A PARAMETER. Every heading row is drawn at weight 700,
+// so the preview needs a real BOLD FACE rather than the synthetic
+// hairline-offset double-draw (at a heading size that is a smear, not weight
+// 700). Named Georgia Bold and §9.3's 1.85 S when this was written; C7 moved the
+// body face to Segoe UI and the scale to Obsidian's 1.618, and the argument is
+// unchanged -- it was never about which family. The
 // two shapes considered were (a) a `style` parameter alongside every existing
 // `set` parameter, making Text.chains two-dimensional, and (b) more members.
 //
@@ -231,15 +234,28 @@ FONT_FAMILIES := [?]Font_Family {
 // it would appear as a choice for the editor grid, where its varying advances
 // would wreck column arithmetic. Same struct, same loader, different menu.
 //
-// Georgia first because §9.3 names it: "fall back to Georgia, which is on every
-// Windows install". The rest are stock Windows serifs, then Segoe UI as a
-// last-ditch proportional face -- Newtpad embeds no fonts until batch 20, so
-// everything here has to already be on the machine.
+// SEGOE UI FIRST, AND THAT OVERRULES §9.3's SERIF. Decision C7
+// (docs/ui-spec-gaps/README.md): the preview is measured against Obsidian, and
+// Obsidian wins where it and §9 conflict, with §9.3's serif named explicitly in
+// scope. This is the largest single reason a screenshot of ours did not look
+// like a screenshot of theirs.
+//
+// Not "a sans" chosen for being sans. Obsidian's --font-default is
+// `ui-sans-serif, -apple-system, …, "Segoe UI", …`, and on Windows that
+// resolves to Segoe UI -- so this is literally the face Wyatt's Obsidian is
+// drawing the document he compared us against. His vault sets no font override
+// (.obsidian/appearance.json names only a theme), so the default is what he saw.
+//
+// The serifs stay, in order, as the fallbacks: Settings > Preview font still
+// offers them, and §9.3's argument for Georgia -- "on every Windows install" --
+// is exactly why it remains the first fallback rather than being deleted.
+// Newtpad embeds no fonts until batch 20, so everything here has to already be
+// on the machine.
 BODY_FAMILIES := [?]Font_Family {
+	{"Segoe UI", "segoeui.ttf", "segoeuib.ttf", "segoeuii.ttf", "segoeuiz.ttf", {}},
 	{"Georgia", "georgia.ttf", "georgiab.ttf", "georgiai.ttf", "georgiaz.ttf", {}},
 	{"Constantia", "constan.ttf", "constanb.ttf", "constani.ttf", "constanz.ttf", {}},
 	{"Times New Roman", "times.ttf", "timesbd.ttf", "timesi.ttf", "timesbi.ttf", {}},
-	{"Segoe UI", "segoeui.ttf", "segoeuib.ttf", "segoeuii.ttf", "segoeuiz.ttf", {}},
 }
 
 // The Windows font directory. Read from the environment rather than hardcoded:

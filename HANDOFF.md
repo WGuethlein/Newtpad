@@ -9197,6 +9197,152 @@ text stays muted, the same split the bullet glyph already uses.
 - A four-space-indented paragraph still cannot be reflowed — it reads as an indented code block.
 - Nobody has seen any of this session's visual work at 1:1.
 
+## 6de. The markdown preview, rebuilt against Obsidian (2026-09-03, v0.91.0, branch `feat/preview-obsidian`)
+
+C7 made the preview a pre-release blocker and did not size it. Wyatt's brief, in his words:
+
+> it should look like we ripped the viewport out of obsidian and dropped it into newtpad respecting
+> the colors/etc of the theme
+
+and, on Split:
+
+> the scroll is weird, it's blocky… it should be smooth. overall its like a 5 year olds rendition of
+> the feature
+
+Spec: `docs/superpowers/specs/2026-09-03-preview-obsidian-design.md`. Plan:
+`docs/superpowers/plans/2026-09-03-preview-obsidian.md`.
+
+### The target stopped being a matter of taste
+
+Obsidian is installed on this machine, so `app.css` comes out of `obsidian.asar` (a four-`u32`
+header, then a JSON directory; the extraction is eight lines of Python and is in the spec). Every
+constant below was read from the stylesheet that draws the thing we are compared against.
+
+**And the target is WYATT's Obsidian, not stock.** His vault's `app.json` has
+**`readableLineLength: false`**, so the reading view he put beside ours has no 700px column and no
+centring — text fills the pane. A spec written against stock defaults would have specced a narrow
+centred column as "matching Obsidian" while the thing being matched was full-bleed. His theme is
+`"obsidian"` (dark, stock, no snippets, no font override), so `--font-default` resolves to **Segoe
+UI** and the comparison is like-for-like against our own Dark.
+
+### What changed
+
+| | |
+|---|---|
+| Type scale | Obsidian's 1.618 / 1.462 / 1.318 / 1.188 / 1.076 / 1.0. Ours was 1.85 at the top and 1.0 by h5 — far more contrasty. |
+| Heading leading | **Per level** (1.2 → 1.5). It was `line_height()`, the editor GRID's 1.5, so all six sat at one ratio. Tight headings over loose body is most of Obsidian's texture. |
+| Rhythm | **Flat**, with one pair rule: 1.0 S either side of every heading, 2.5 S only when it FOLLOWS content. Ours was a graduated ladder per level. |
+| First block | No space above it, whatever kind. That generalises what `head_above[1]` hardcoded for h1 alone. |
+| Body face | **Segoe UI.** §9.3's serif overruled — C7's named exception. |
+| Code | 0.80 S, tables at full body size, both from Obsidian's tokens. |
+| Block geometry | One `--radius-s` for both radii (ours were 3 and 6), 24px quote inset, 2px bar and rule, non-square fence padding, real inline-code padding. |
+| Lists | The **content** is the anchor and the marker hangs 0.8em off it, which is the reverse of what we did — and the indent moved from the monitor to the text (3ch, then 2.25em). |
+| Column | Four states, **Full by default**. §9.3's 72ch is gone. |
+| Heading rules | **Dropped.** Obsidian draws none; Wyatt chose it with the two side by side. |
+| Fences | Mono face for a lexer-less fence, and ` ```powershell ` resolves at last. |
+| Split sync | Interpolates **inside** a block instead of jumping between them. |
+
+### Four things worth keeping
+
+**The sweep's fence diagnosis named the wrong line.** It blamed `fallback_set`, which is real and did
+default to `.Body` — and is read at exactly one place, the empty-block height fallback, so setting it
+fixes nothing. The face comes from `md_run_set`. The same fall-through also ran `md_inline` over code,
+so `**x**` inside a fence rendered as emphasis and lost its asterisks. *Reading a symptom off the
+source found the right block and the wrong line.*
+
+**The seam check caught a bug before it shipped.** Taking Obsidian's 20px margin from the pane's true
+edge put the content origin 4px left of `x0`, and `md_preview_pos_at` refuses any press with
+`mx < x0` — so the first four pixels of every line would have been drawn and not clickable. §9.3's
+40px padding had hidden that gate the whole time by being wider than `TEXT_MARGIN_X`.
+
+**`press_route` exists, and it PASSES.** Three preview bugs in a row hid in the frame loop, and each
+time the answer was another headless test of a procedure the loop *calls* rather than of the loop's
+own decision. The decision is now a pure function with a truth table over every gate — and it is
+green at every combination, so the inert preview is **not** in the routing. That is the finding.
+`NEWTPAD_PREVIEW_DIAG` is still owed a run and is now looking upstream of the gates.
+
+**Right-click was never built, not broken.** `window_clear_oneshot_presses` takes the right press
+whether or not anything read it, and the table header's branch was its only reader in the whole
+frame — while the preview's press handling sits fifty lines below the clear.
+
+### The sabotage pass earned most of this batch
+
+Twenty-five defects reintroduced. **Three shipped-looking changes had no assertion at all** and were
+found only this way: the fixed-pixel decorations had no value checks (the scale table covers only the
+S-derived rows, and the UI_SCALE case asserts they *move* without saying what they are), the list
+marker's hang is an `Md_Layout` field `md_metrics` cannot see, and the font reorder would have had no
+test at all — every existing font check asks whether the face is *proportional*, which both orders
+satisfy.
+
+**Slack hid three more, each the exact size of the defect.** The gap table compares with ±1px and the
+thematic break's change is 2px against 1; the same table added `+ hairline()` to its h1 and h2
+heights, so removing the heading rule moved them by exactly the tolerance; and it named `hairline()`
+as the break's expected height, which is *the test agreeing with the bug*. All three now assert values.
+
+**Five fixtures went quiet rather than red**, which is worse: `mdjointest`'s descent clamped at the
+ceiling and saw two blocks instead of three; `mdhittest`'s fixed-offset probes fell into gaps a
+shorter h1 opened, so its selection copied `""`; the faces fixture stopped diverging between families
+**twice** (inline code shrank, then `.Full` widened the pane) and was fixed by *binding its column*
+rather than raising its span count a third time; and the `ui_scale` cache-key case was watching the
+list indent, which stopped moving with DPI. Each was fixed by strengthening the fixture, not the bound.
+
+**Two test-harness bugs passed for the wrong reason.** `md_layout_build_for_test` hands
+`in_fence = false` unconditionally, so a test asking for a fence body got a paragraph; and
+`mdfencetest` never set `g_theme`, so eight tokens counted as "one colour" — which read as broken
+highlighting and was an unpainted palette.
+
+### The whole-branch review found three blockers, and all three were mine
+
+An independent reviewer, given the diff and the named risks. It is the reason this shipped correct
+rather than nearly correct, and each finding names a failure of my own process rather than an
+oversight in the design.
+
+**A fenced block's background painted 222px past the column.** The origin moved to a single producer;
+the WIDTH did not follow. Five draws (`.Rule`, both fence caps, `.Fence_Body`, the front-matter card)
+still measured from the pane's right edge, plus the table extent clamp. Fixed by handing
+`md_block_draw` the column's right edge rather than the pane's, so every one of them follows at once.
+
+**The seam assertion that should have caught it was the producer agreeing with itself.** It compared
+`md_content_span`'s output for one state against its output for another — never against anything
+DRAWN. The replacement measures the painted band's own pixels and misses by 222px against the defect.
+*A seam test has to have the draw on one side of it.*
+
+**The hover control never appeared.** `WM_MOUSEMOVE` updates `window.mouse_x/y` only while a button
+is held, so the reveal would have fired on PRESS and then stayed forever — leaving an invisible
+86x20 target that silently changed the reader's column on first contact. The comment saying exactly
+this sits **twelve lines above** the call site I wrote.
+
+**And `themetest` was red the whole time.** The control used `Text_Dim`, which that mode forbids in
+live text at 2.9:1. It was not in the list I swept — which is the trap the register already names, in
+those words: *sweep the modes the CHANGE can reach, not the list your batch wrote down.* I wrote a
+list in the plan and then swept the list.
+
+Six smaller findings came with them: Copy offered after a bare click (the predicate read the
+`md_sel_on` flag rather than asking whether the selection had any WIDTH, then failed with "too large
+for the clipboard"); Select All taking the editor from a Split preview's own menu; a missing overlay
+guard at the control's click site; a snapped strip box rounded independently of its own cells, on a
+path no test reached because every `ui` case used `snap = false` while the product sets it true; a
+comment naming a procedure that does not exist; and one claiming "20px on every side" with three
+horizontal readers.
+
+**The lesson worth keeping is not any of the six.** It is that twenty-five sabotages, forty green
+modes and a spec derived from primary sources still shipped a control that could not be seen and a
+band a fifth of a pane too wide — and that the reviewer found all of it from the diff in one pass.
+The sabotage step proves an assertion can fail; it cannot tell you the assertion is pointed at the
+wrong thing.
+
+### Owed
+
+- **The `NEWTPAD_PREVIEW_DIAG` run.** Still the only evidence that can name the inert-preview bug, and
+  now pointed upstream of the gates rather than among them.
+- **`W7b`, eased scrolling.** Deferred, not refused. It needs §17's `scroll → 0ms` row amended (C8)
+  and §11's Reduce motion setting (`SPI_GETCLIENTAREAANIMATION`) built first, and it should be costed
+  only if Wyatt says the pixel sync is still blocky.
+- `window.odin` hardcodes three lines per wheel notch rather than reading `SPI_GETWHEELSCROLLLINES`.
+  `scroll_delta` is shared with the editor, so it is wider than this batch.
+- Images and footnotes remain §9.2 gaps, as `preview-compare.md` §8 says.
+- **Nobody has seen any of this at 1:1.** `docs/preview-compare.md` in both applications is the pass
+  that decides whether §3's numbers produced the thing they describe.
 ## 7. Build environment (Windows, this machine)
 
 - **`build.bat` is the one build script.** `build.bat` = debug, **console subsystem** so the
@@ -9236,7 +9382,7 @@ text stays muted, the same split the bullet glyph already uses.
     `mdtest`, `mdviewtest`, `splittest`, `replacetest`, `findtest`, `regextest <mb>`, `metricstest`,
     `quadsdftest`, `scrollgrabtest`, `tabseamtest`, `lineidxtest [file]`, `selalltest`,
     `tablesorttest`, `mdjointest`, `mdfencetest`, `mdperftest`, `mdtabletest`, `blocktest`,
-    `statusbartest`, `reflowtest`,
+    `statusbartest`, `reflowtest`, `mdhittest`, `pressroutetest`,
     `teartest`, `surfacetest`, `jsontest`
   - Files / session: `savepathtest <dir>`, `savestreamtest`, `savefailtest <dir>`, `resavetest [file]`,
     `diskstamptest`, `sessiontest`, `sessionlosstest <file> [old]`, `watchtest [dir]`,

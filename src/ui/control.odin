@@ -207,3 +207,91 @@ pack :: proc(items: []Item, avail, gap: f32, keep: []bool) -> (used: f32) {
 	}
 	return used
 }
+
+// A SEGMENTED CONTROL: N equal square cells in a row, one of them current.
+//
+// Built for the markdown preview's column control (Full / Left / Centre /
+// Right), which is the first control in the product that sits OVER the content
+// rather than in the chrome. That is why it is square-celled and label-driven
+// rather than another `pack` group: the cells are glyphs, they are all the same
+// width by construction, and the whole strip has to be placeable from its RIGHT
+// edge, since it hangs off the top-right corner of a pane whose left edge moves.
+//
+// Returns the cells into `out` and the strip's own box, so the caller can draw a
+// background behind the group and hit-test the group as a whole (for the hover
+// that reveals it) without re-deriving either from the cells.
+//
+// `tag` is the cell's index, which is what makes the caller's mapping to its own
+// enum a single cast at one site rather than a switch here. ui does not know what
+// a column state is.
+Segmented :: struct {
+	x, y, w, h: f32, // the whole strip
+	n:          int,
+}
+
+// The strip's width for `n` cells, before placing it. A caller that positions
+// from the right edge needs this before it can choose an x.
+segmented_width :: proc(n: int, size, gap: f32) -> f32 {
+	if n <= 0 {return 0}
+	return f32(n) * size + f32(n - 1) * gap
+}
+
+// THE ONE PRODUCER. `right, y` is the strip's top-RIGHT corner, because that is
+// how the caller places it: flush to a pane's right margin, whatever the pane's
+// width. Placing from the left would make every caller compute
+// `right - segmented_width(..)` itself, which is this arithmetic copied out.
+//
+// `out` must hold at least `n` entries; the count actually written is returned in
+// the strip's `n`, so a short slice truncates rather than overruns.
+segmented_layout :: proc(right, y, size, gap: f32, labels: []string, m: Metrics, out: []Button) -> (s: Segmented) {
+	n := min(len(labels), len(out))
+	if n <= 0 {return}
+	w := segmented_width(n, size, gap)
+	x := right - w
+	s = Segmented {
+		x = x,
+		y = y,
+		w = w,
+		h = size,
+		n = n,
+	}
+	for i in 0 ..< n {
+		// From the UNSNAPPED x, then snapped per cell by button_square. Accumulating
+		// from a snapped origin would let each cell's rounding compound into the
+		// next, so the last cell of a four-cell strip could sit two pixels from
+		// where the strip's own right edge says it ends.
+		out[i] = button_square(x + f32(i) * (size + gap), y, size, labels[i], m, i)
+	}
+	// THE STRIP'S BOX IS DERIVED FROM ITS CELLS under snap, not rounded on its own.
+	// Rounding the two independently let `s.x + s.w` differ from the last cell's
+	// right edge -- the strip's background quad and the thing it sits behind
+	// disagreeing by a pixel, which is a one-producer routine producing two
+	// answers. Caught by the whole-branch review, which also noted the snapped path
+	// had no test: every case in control_test.odin used a Metrics with snap false
+	// while the product sets it true.
+	if m.snap && n > 0 {
+		s.x = out[0].x
+		s.w = (out[n - 1].x + out[n - 1].w) - s.x
+		s.y, s.h = rnd(s.y, true), rnd(s.h, true)
+	}
+	return
+}
+
+// Which cell is at (mx, my), or -1. The STRIP's own hit, not a loop over the
+// cells, is `segmented_hit_strip` below -- the two answer different questions and
+// the preview needs both: the strip decides whether the control is hovered (and
+// so drawn at all), a cell decides what a click does.
+segmented_cell_at :: proc(cells: []Button, n: int, mx, my: f32) -> int {
+	for i in 0 ..< min(n, len(cells)) {
+		if button_hit(cells[i], mx, my) {return i}
+	}
+	return -1
+}
+
+// Is the pointer over the strip as a whole? Deliberately NOT "over any cell":
+// with a gap between cells there are pixels inside the strip that belong to no
+// cell, and a control that flickers out when the pointer crosses a one-pixel gap
+// between its own buttons is worse than one that never appears.
+segmented_hit_strip :: proc(s: Segmented, mx, my: f32) -> bool {
+	return mx >= s.x && mx < s.x + s.w && my >= s.y && my < s.y + s.h
+}
