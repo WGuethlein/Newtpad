@@ -9197,100 +9197,6 @@ text stays muted, the same split the bullet glyph already uses.
 - A four-space-indented paragraph still cannot be reflowed — it reads as an indented code block.
 - Nobody has seen any of this session's visual work at 1:1.
 
-## 7. Build environment (Windows, this machine)
-
-- **`build.bat` is the one build script.** `build.bat` = debug, **console subsystem** so the
-  headless modes can print. `build.bat release` = `-o:speed -subsystem:windows`, the shipped exe.
-  Append `run` to launch. Both embed `newtpad.res` (the per-monitor-v2 DPI manifest) and link
-  `guarded.obj` (the SEH shim). **A bare `odin build` omits both.** If you edit `guarded_copy.c` or
-  `newtpad.manifest`, delete the matching file in `build\` to force a rebuild.
-- Sizes as of 2026-07-19: **debug ~1.3 MB, release 0.90 MB** (target 2-3 MB). Release grew from
-  0.69 MB when the headless harness expanded — `test_modes.odin` is `package main`, so every test
-  mode ships inside the customer's binary. Tracked in §5.
-  **Re-measured 2026-08-04 at v0.66.0: debug 6,614,016 bytes (6.31 MB), release 1,445,376 bytes
-  (1.38 MB).** Release is up 54% on the 0.90 MB figure above and still comfortably inside the 2-3 MB
-  target, so this is drift worth knowing rather than a problem. The §5 entry that explains it is
-  resolved — `NEWTPAD_TESTS` gates the harness out of release — so the growth since is real product
-  code (markdown, tables, sort/filter), not the harness coming back.
-- Tests: `odin test src\base -collection:src=src` (20 cases: encoding, line-nav, piece tree,
-  lossy-encoding detection).
-- **Headless test modes** (debug exe). **Set `NEWTPAD_SESSION_DIR` to a temp dir first** or the
-  session modes write to, and reset, the real store under `%APPDATA%\Newtpad`:
-  - The harness itself: `modeguardtest [path]` — run it first; it is the check that the rest of
-    this list can fail at all.
-  - Grid:  — what the grid draws as a link against what it treats as clickable.
-  - Editor surface: `gutterseamtest` — the line-number gutter, tested where the draw and the
-    hit-test meet rather than at the width formula.
-  - Grid: `gridlinktest` — what the grid *draws* as a link against what it treats as *clickable*,
-    plus whether those links resolve. Written for the still-open "links do not open in table view"
-    report; green, which is what eliminated the geometry hypothesis (see `reported-bugs.md`).
-  - Rendering / platform: `sehtest`, `dpitest`, `atlastest`, `atlasgrowtest`, `devicelosttest`,
-    `celltest`, `blurtest`, `drawcount <file>`
-  - Logging / crash: `logtest`, `crashtest <null|panic|assert|oob>` (triggers a real fault; set
-    `NEWTPAD_SESSION_DIR` first — writes .dmp/.txt to its crashes dir, then exits with the fault)
-  - UI surfaces: `menutest`, `menuseam`, `palettetest`, `settingstest`, `fonttest`, `historytest`,
-    `linktest`, `tabreordertest`
-  - Document / editing: `vnavtest`, `wraptest`, `wraplongtest`, `colperftest <mb>`,
-    `scrollperftest <mb>`, `hscrolltest`, `csvtest`, `tablecellstest`, `tablereadonlytest`,
-    `tablegridtest`,
-    `mdtest`, `mdviewtest`, `splittest`, `replacetest`, `findtest`, `regextest <mb>`, `metricstest`,
-    `quadsdftest`, `scrollgrabtest`, `tabseamtest`, `lineidxtest [file]`, `selalltest`,
-    `tablesorttest`, `mdjointest`, `mdfencetest`, `mdperftest`, `mdtabletest`, `blocktest`,
-    `statusbartest`, `reflowtest`, `mdhittest`, `pressroutetest`,
-    `teartest`, `surfacetest`, `jsontest`
-  - Files / session: `savepathtest <dir>`, `savestreamtest`, `savefailtest <dir>`, `resavetest [file]`,
-    `diskstamptest`, `sessiontest`, `sessionlosstest <file> [old]`, `watchtest [dir]`,
-    `bookmarktest`
-  - **Exit codes are now load-bearing (2026-08-02, §6bv).** Every mode that reports a verdict ends at
-    `mode_done` / `mode_done_flag`, which prints the summary and exits 1 on any failure, so
-    `newtpad <mode>; echo $LASTEXITCODE` is a real check. **Run `modeguardtest` in every sweep** — it
-    reads `src/program/test_modes.odin` and fails if a mode returns without routing through the
-    shared exit, if a name handed to `mode_done` matches no dispatch arm, or if an exemption has gone
-    stale. It needs the repo root as the working directory, or a path argument.
-  - **Grepping `FAIL` is still correct and still worth doing**, because the three exempt modes report
-    nothing to an exit code: `menuseam` and `drawcount` are falsifiers and `jsonperf` is a
-    measurement. **`WARN` is the other string to grep** — it marks the wall-clock gates that are
-    deliberately outside the exit code (`colperftest`, `scrollperftest`, `regextest`), because a
-    bare ms threshold on a debug build reddens on machine load and a sweep that cries wolf is one
-    people stop reading. `mdperftest` and `rulestest` keep their gates in the exit code: both carry
-    a *measured* debug multiplier rather than a bare number, and both exist to be that gate.
-  - File-argument modes: `<file> count|keytest|findtest|filtertest|repltest|edittest|seltest|savetest`
-  - **Four of those eight need a THIRD argument and open the GUI without it** — their `case` arms
-    carry `&& len(os.args) > 3` (`> 4` for `repltest`), so a short invocation misses the arm, hits
-    `case:` and falls through to the real window, where it hangs until something kills it.
-    `findtest <file> <query> [rx]`, `filtertest <file> <query>`, `repltest <file> <query> <repl>`,
-    `savetest <file> <outpath>`. Cost three separate timeouts in one sweep on 2026-08-05 — the trap
-    development-loop.md §6 already names, from a list that named the modes and not their arity.
-    `count`, `edittest`, `seltest` and `keytest` take the path alone.
-  - `jsonperf <file.json>` is a **measurement**, not a test: it prints input/output size, format
-    time and peak bytes for one file and always exits 0. It exists because `JSON_FORMAT_MAX` was
-    first picked by reasoning and the reasoning was wrong (§6bl). Re-measure with it before moving
-    that constant.
-  - Two are **falsifiers**, not regression tests — they measure a claim rather than guard a
-    behaviour: `menuseam` (does resolving scroll twice in one frame diverge? yes, in every case
-    where the dropdown does not fit) and `drawcount` (what does a frame actually cost? 26 rows,
-    38 `text_draw`, 4 `quads_draw`).
-- **Odin** `dev-2026-07a` at `C:\Users\Wyatt\odin\dist`, on user PATH. **MSVC** from VS Community
-  2026 (v18). **Windows SDK** `10.0.28000.0` (had to be added via the VS Installer — VS shipped
-  without the C++ desktop SDK; Odin needs the import libs, else "Windows SDK not found").
-- `src/{base,platform,renderer,ui,program}` — one Odin package per dir (Odin compiles a package
-  at once → free "unity build"). `program` is `package main`. `renderer` and `ui` are still stubs.
-- **This environment cannot inject GUI keyboard or mouse input.** Interactive behaviour is verified
-  by headless modes plus screenshots, and every claim about what happens when you click something
-  is an inference from source. A live pass by Wyatt is still worth it per feature. Two fixes
-  currently rest on reasoning rather than an executed test: non-BMP input (`WM_CHAR` surrogate
-  pairing) and the 4 GB `SetFilePointerEx` boundary.
-
-## 8. Working agreements
-
-- **Ask the 2-4 outcome-changing questions first; never rubber-stamp.** Surface locked-decision
-  impacts explicitly.
-- Distill Wyatt's source material into `research/`; keep the report the single source of truth.
-- Flag verified vs judgment; run devil's-advocate on significant designs before recommending.
-- **Git identity:** every commit/push/merge under Wyatt Guethlein's account only — no third-party
-  attribution anywhere. History reads like a human engineer's: incremental logical commits, plain
-  imperative messages.
-
 ## 6de. The markdown preview, rebuilt against Obsidian (2026-09-03, v0.91.0, branch `feat/preview-obsidian`)
 
 C7 made the preview a pre-release blocker and did not size it. Wyatt's brief, in his words:
@@ -9385,6 +9291,46 @@ list indent, which stopped moving with DPI. Each was fixed by strengthening the 
 `mdfencetest` never set `g_theme`, so eight tokens counted as "one colour" — which read as broken
 highlighting and was an unpainted palette.
 
+### The whole-branch review found three blockers, and all three were mine
+
+An independent reviewer, given the diff and the named risks. It is the reason this shipped correct
+rather than nearly correct, and each finding names a failure of my own process rather than an
+oversight in the design.
+
+**A fenced block's background painted 222px past the column.** The origin moved to a single producer;
+the WIDTH did not follow. Five draws (`.Rule`, both fence caps, `.Fence_Body`, the front-matter card)
+still measured from the pane's right edge, plus the table extent clamp. Fixed by handing
+`md_block_draw` the column's right edge rather than the pane's, so every one of them follows at once.
+
+**The seam assertion that should have caught it was the producer agreeing with itself.** It compared
+`md_content_span`'s output for one state against its output for another — never against anything
+DRAWN. The replacement measures the painted band's own pixels and misses by 222px against the defect.
+*A seam test has to have the draw on one side of it.*
+
+**The hover control never appeared.** `WM_MOUSEMOVE` updates `window.mouse_x/y` only while a button
+is held, so the reveal would have fired on PRESS and then stayed forever — leaving an invisible
+86x20 target that silently changed the reader's column on first contact. The comment saying exactly
+this sits **twelve lines above** the call site I wrote.
+
+**And `themetest` was red the whole time.** The control used `Text_Dim`, which that mode forbids in
+live text at 2.9:1. It was not in the list I swept — which is the trap the register already names, in
+those words: *sweep the modes the CHANGE can reach, not the list your batch wrote down.* I wrote a
+list in the plan and then swept the list.
+
+Six smaller findings came with them: Copy offered after a bare click (the predicate read the
+`md_sel_on` flag rather than asking whether the selection had any WIDTH, then failed with "too large
+for the clipboard"); Select All taking the editor from a Split preview's own menu; a missing overlay
+guard at the control's click site; a snapped strip box rounded independently of its own cells, on a
+path no test reached because every `ui` case used `snap = false` while the product sets it true; a
+comment naming a procedure that does not exist; and one claiming "20px on every side" with three
+horizontal readers.
+
+**The lesson worth keeping is not any of the six.** It is that twenty-five sabotages, forty green
+modes and a spec derived from primary sources still shipped a control that could not be seen and a
+band a fifth of a pane too wide — and that the reviewer found all of it from the diff in one pass.
+The sabotage step proves an assertion can fail; it cannot tell you the assertion is pointed at the
+wrong thing.
+
 ### Owed
 
 - **The `NEWTPAD_PREVIEW_DIAG` run.** Still the only evidence that can name the inert-preview bug, and
@@ -9397,3 +9343,96 @@ highlighting and was an unpainted palette.
 - Images and footnotes remain §9.2 gaps, as `preview-compare.md` §8 says.
 - **Nobody has seen any of this at 1:1.** `docs/preview-compare.md` in both applications is the pass
   that decides whether §3's numbers produced the thing they describe.
+## 7. Build environment (Windows, this machine)
+
+- **`build.bat` is the one build script.** `build.bat` = debug, **console subsystem** so the
+  headless modes can print. `build.bat release` = `-o:speed -subsystem:windows`, the shipped exe.
+  Append `run` to launch. Both embed `newtpad.res` (the per-monitor-v2 DPI manifest) and link
+  `guarded.obj` (the SEH shim). **A bare `odin build` omits both.** If you edit `guarded_copy.c` or
+  `newtpad.manifest`, delete the matching file in `build\` to force a rebuild.
+- Sizes as of 2026-07-19: **debug ~1.3 MB, release 0.90 MB** (target 2-3 MB). Release grew from
+  0.69 MB when the headless harness expanded — `test_modes.odin` is `package main`, so every test
+  mode ships inside the customer's binary. Tracked in §5.
+  **Re-measured 2026-08-04 at v0.66.0: debug 6,614,016 bytes (6.31 MB), release 1,445,376 bytes
+  (1.38 MB).** Release is up 54% on the 0.90 MB figure above and still comfortably inside the 2-3 MB
+  target, so this is drift worth knowing rather than a problem. The §5 entry that explains it is
+  resolved — `NEWTPAD_TESTS` gates the harness out of release — so the growth since is real product
+  code (markdown, tables, sort/filter), not the harness coming back.
+- Tests: `odin test src\base -collection:src=src` (20 cases: encoding, line-nav, piece tree,
+  lossy-encoding detection).
+- **Headless test modes** (debug exe). **Set `NEWTPAD_SESSION_DIR` to a temp dir first** or the
+  session modes write to, and reset, the real store under `%APPDATA%\Newtpad`:
+  - The harness itself: `modeguardtest [path]` — run it first; it is the check that the rest of
+    this list can fail at all.
+  - Grid:  — what the grid draws as a link against what it treats as clickable.
+  - Editor surface: `gutterseamtest` — the line-number gutter, tested where the draw and the
+    hit-test meet rather than at the width formula.
+  - Grid: `gridlinktest` — what the grid *draws* as a link against what it treats as *clickable*,
+    plus whether those links resolve. Written for the still-open "links do not open in table view"
+    report; green, which is what eliminated the geometry hypothesis (see `reported-bugs.md`).
+  - Rendering / platform: `sehtest`, `dpitest`, `atlastest`, `atlasgrowtest`, `devicelosttest`,
+    `celltest`, `blurtest`, `drawcount <file>`
+  - Logging / crash: `logtest`, `crashtest <null|panic|assert|oob>` (triggers a real fault; set
+    `NEWTPAD_SESSION_DIR` first — writes .dmp/.txt to its crashes dir, then exits with the fault)
+  - UI surfaces: `menutest`, `menuseam`, `palettetest`, `settingstest`, `fonttest`, `historytest`,
+    `linktest`, `tabreordertest`
+  - Document / editing: `vnavtest`, `wraptest`, `wraplongtest`, `colperftest <mb>`,
+    `scrollperftest <mb>`, `hscrolltest`, `csvtest`, `tablecellstest`, `tablereadonlytest`,
+    `tablegridtest`,
+    `mdtest`, `mdviewtest`, `splittest`, `replacetest`, `findtest`, `regextest <mb>`, `metricstest`,
+    `quadsdftest`, `scrollgrabtest`, `tabseamtest`, `lineidxtest [file]`, `selalltest`,
+    `tablesorttest`, `mdjointest`, `mdfencetest`, `mdperftest`, `mdtabletest`, `blocktest`,
+    `statusbartest`, `reflowtest`, `mdhittest`, `pressroutetest`,
+    `teartest`, `surfacetest`, `jsontest`
+  - Files / session: `savepathtest <dir>`, `savestreamtest`, `savefailtest <dir>`, `resavetest [file]`,
+    `diskstamptest`, `sessiontest`, `sessionlosstest <file> [old]`, `watchtest [dir]`,
+    `bookmarktest`
+  - **Exit codes are now load-bearing (2026-08-02, §6bv).** Every mode that reports a verdict ends at
+    `mode_done` / `mode_done_flag`, which prints the summary and exits 1 on any failure, so
+    `newtpad <mode>; echo $LASTEXITCODE` is a real check. **Run `modeguardtest` in every sweep** — it
+    reads `src/program/test_modes.odin` and fails if a mode returns without routing through the
+    shared exit, if a name handed to `mode_done` matches no dispatch arm, or if an exemption has gone
+    stale. It needs the repo root as the working directory, or a path argument.
+  - **Grepping `FAIL` is still correct and still worth doing**, because the three exempt modes report
+    nothing to an exit code: `menuseam` and `drawcount` are falsifiers and `jsonperf` is a
+    measurement. **`WARN` is the other string to grep** — it marks the wall-clock gates that are
+    deliberately outside the exit code (`colperftest`, `scrollperftest`, `regextest`), because a
+    bare ms threshold on a debug build reddens on machine load and a sweep that cries wolf is one
+    people stop reading. `mdperftest` and `rulestest` keep their gates in the exit code: both carry
+    a *measured* debug multiplier rather than a bare number, and both exist to be that gate.
+  - File-argument modes: `<file> count|keytest|findtest|filtertest|repltest|edittest|seltest|savetest`
+  - **Four of those eight need a THIRD argument and open the GUI without it** — their `case` arms
+    carry `&& len(os.args) > 3` (`> 4` for `repltest`), so a short invocation misses the arm, hits
+    `case:` and falls through to the real window, where it hangs until something kills it.
+    `findtest <file> <query> [rx]`, `filtertest <file> <query>`, `repltest <file> <query> <repl>`,
+    `savetest <file> <outpath>`. Cost three separate timeouts in one sweep on 2026-08-05 — the trap
+    development-loop.md §6 already names, from a list that named the modes and not their arity.
+    `count`, `edittest`, `seltest` and `keytest` take the path alone.
+  - `jsonperf <file.json>` is a **measurement**, not a test: it prints input/output size, format
+    time and peak bytes for one file and always exits 0. It exists because `JSON_FORMAT_MAX` was
+    first picked by reasoning and the reasoning was wrong (§6bl). Re-measure with it before moving
+    that constant.
+  - Two are **falsifiers**, not regression tests — they measure a claim rather than guard a
+    behaviour: `menuseam` (does resolving scroll twice in one frame diverge? yes, in every case
+    where the dropdown does not fit) and `drawcount` (what does a frame actually cost? 26 rows,
+    38 `text_draw`, 4 `quads_draw`).
+- **Odin** `dev-2026-07a` at `C:\Users\Wyatt\odin\dist`, on user PATH. **MSVC** from VS Community
+  2026 (v18). **Windows SDK** `10.0.28000.0` (had to be added via the VS Installer — VS shipped
+  without the C++ desktop SDK; Odin needs the import libs, else "Windows SDK not found").
+- `src/{base,platform,renderer,ui,program}` — one Odin package per dir (Odin compiles a package
+  at once → free "unity build"). `program` is `package main`. `renderer` and `ui` are still stubs.
+- **This environment cannot inject GUI keyboard or mouse input.** Interactive behaviour is verified
+  by headless modes plus screenshots, and every claim about what happens when you click something
+  is an inference from source. A live pass by Wyatt is still worth it per feature. Two fixes
+  currently rest on reasoning rather than an executed test: non-BMP input (`WM_CHAR` surrogate
+  pairing) and the 4 GB `SetFilePointerEx` boundary.
+
+## 8. Working agreements
+
+- **Ask the 2-4 outcome-changing questions first; never rubber-stamp.** Surface locked-decision
+  impacts explicitly.
+- Distill Wyatt's source material into `research/`; keep the report the single source of truth.
+- Flag verified vs judgment; run devil's-advocate on significant designs before recommending.
+- **Git identity:** every commit/push/merge under Wyatt Guethlein's account only — no third-party
+  attribution anywhere. History reads like a human engineer's: incremental logical commits, plain
+  imperative messages.
